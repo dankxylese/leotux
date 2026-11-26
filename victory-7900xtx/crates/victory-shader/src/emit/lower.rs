@@ -567,6 +567,89 @@ pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<(Vec<u
     Some((out, unsafe_loop))
 }
 
+/// Diagnostics (`VICTORY_WAVE_WHY`): whether a block lies in a loop, whether every branch
+/// that leaves that loop is taken wave-wide, and whether their wave-wide meaning is known.
+fn barrier_loop_state(st: &Structured, b: usize) -> (bool, bool, bool) {
+    let n = st.exits.len();
+    if b >= n {
+        return (false, true, true);
+    }
+    let succ = |x: usize| -> Vec<usize> {
+        match st.exits[x] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for x in 0..n {
+        let mut stack = succ(x);
+        reach[x][x] = true;
+        while let Some(t) = stack.pop() {
+            if t >= n || reach[x][t] {
+                continue;
+            }
+            reach[x][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let same = |t: usize| t < n && reach[t][b] && reach[b][t];
+    let (mut in_loop, mut exits_wide, mut exits_known) = (false, true, true);
+    for t in 0..n {
+        if t == b || !same(t) {
+            continue;
+        }
+        in_loop = true;
+        let leaves = succ(t).into_iter().any(|u| u < n && !same(u));
+        if leaves {
+            if !st.wide.contains(&t) {
+                exits_wide = false;
+            }
+            if st.wave_any.get(t).copied().flatten().is_none() {
+                exits_known = false;
+            }
+        }
+    }
+    (in_loop, exits_wide, exits_known)
+}
+
+/// Diagnostics (`VICTORY_WAVE_WHY`): whether the loop holding `b` is entered under a branch
+/// that is taken wave-wide (every block outside it that jumps into it).
+fn loop_entry_wide(st: &Structured, b: usize) -> bool {
+    let n = st.exits.len();
+    if b >= n {
+        return true;
+    }
+    let succ = |x: usize| -> Vec<usize> {
+        match st.exits[x] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for x in 0..n {
+        let mut stack = succ(x);
+        reach[x][x] = true;
+        while let Some(t) = stack.pop() {
+            if t >= n || reach[x][t] {
+                continue;
+            }
+            reach[x][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let same = |t: usize| t < n && reach[t][b] && reach[b][t];
+    for from in 0..n {
+        for to in succ(from) {
+            if to < n && same(to) && !same(from) && !st.wide.contains(&from) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The branches (by block) that leave the loops holding a block of `needs`, in the order
 /// found: the blocks that are in the same cycle as one of them and have an edge out of it.
 ///
@@ -4987,6 +5070,23 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        if !self.all_lanes(block) {
+            // A group barrier is run by every thread of the group or the group hangs. Where
+            // the block holding this one is a block not every lane runs, the widening has to
+            // take the branches around it wave-wide (`need`), and the program is refused if
+            // that cannot be done - which is what `widen` decides from these needs.
+            need(block);
+        }
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            let st = self.x.st;
+            let (in_loop, exits_wide, exits_known) = barrier_loop_state(st, block);
+            let entries = loop_entry_wide(st, block);
+            eprintln!(
+                "BARRIER block={block} all_lanes={} in_loop={in_loop} exits_wide={exits_wide} exits_known={exits_known} entry_wide={entries} wide_block={}",
+                self.all_lanes(block),
+                st.wide.contains(&block)
+            );
+        }
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);

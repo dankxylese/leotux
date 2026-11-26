@@ -777,7 +777,7 @@ fn widen(
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+            || r.is_ok() && !needs.is_empty();
         if !stuck {
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
@@ -803,7 +803,13 @@ fn widen(
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
-            return r;
+            // Nothing is left to widen and a barrier still stands where not every lane runs:
+            // the program is refused rather than emitted, because such a barrier hangs the
+            // group (0x887A0006, measured 2026-11-26).
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier where not every lane runs, and no branch left to widen",
+            });
         }
         wide.extend(more);
     }
