@@ -784,11 +784,21 @@ fn widen(
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| !wide.contains(b))
-            .collect();
+        let Some((around, unsafe_loop)) = lower::branches_around(&st, &needs) else {
+            // Not followed (an indirect exit): emitting the program as it stands could put a
+            // barrier where one of the two host waves never comes.
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier in a loop the two host waves cannot leave together",
+            });
+        };
+        if unsafe_loop {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier in a loop the two host waves cannot leave together",
+            });
+        }
+        let more: Vec<usize> = around.into_iter().filter(|b| !wide.contains(b)).collect();
         if more.is_empty() {
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());

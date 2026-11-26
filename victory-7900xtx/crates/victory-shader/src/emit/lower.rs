@@ -537,14 +537,84 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
-/// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
-/// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
-pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+/// ([`crate::structure::structure_wide`]) so that every lane runs those blocks; and the
+/// branches that leave the loops holding one, because two host waves keep a barrier only if
+/// they leave those loops together. None if one of them is a branch whose wave-wide meaning
+/// is not known ([`Structured::wave_any`]).
+pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<(Vec<usize>, bool)> {
     let mut out = Vec::new();
     for (d, region) in lane_regions(st)? {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
+        }
+    }
+    // A branch that leaves a loop holding a need: where its test is scalar (`wave_any`
+    // None) both host waves already take it the same way, so nothing is needed; where it is
+    // a lane's own bits (`Some`), the wave-wide form is what keeps the halves leaving
+    // together, and it is added to be widened.
+    let mut unsafe_loop = false;
+    for d in loop_exits_around(st, needs)? {
+        match st.wave_any.get(d).copied().flatten() {
+            None => {}
+            Some(_) => {
+                if !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    Some((out, unsafe_loop))
+}
+
+/// The branches (by block) that leave the loops holding a block of `needs`, in the order
+/// found: the blocks that are in the same cycle as one of them and have an edge out of it.
+///
+/// A console wave runs its lanes in step, so a loop's lanes leave it together however their
+/// tests differ. Two host waves keep that only where the test that leaves the loop is the
+/// wave's own ([`crate::structure::structure_wide`]); a barrier inside a loop whose halves
+/// leave on different iterations waits for threads that are not there, which is what lost
+/// the card when `VICTORY_WAVE_WIDE=1` was turned on (`devices removed` after 21-253 frames,
+/// measured 2026-11-26). None with an indirect exit (not followed).
+fn loop_exits_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+    let n = st.exits.len();
+    if needs.iter().all(|&b| b >= n) {
+        return Some(Vec::new());
+    }
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End => Vec::new(),
+            LaneExit::Indirect => Vec::new(),
+        }
+    };
+    if st.exits.iter().any(|e| matches!(e, LaneExit::Indirect)) {
+        return None;
+    }
+    // Who reaches whom: a block is in the same cycle as another when each reaches the other.
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for b in 0..n {
+        let mut stack = succ(b);
+        reach[b][b] = true;
+        while let Some(t) = stack.pop() {
+            if reach[b][t] {
+                continue;
+            }
+            reach[b][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let mut out: Vec<usize> = Vec::new();
+    for &need in needs.iter().filter(|&&b| b < n) {
+        for b in 0..n {
+            if b == need || !reach[b][need] || !reach[need][b] {
+                continue;
+            }
+            let leaves = succ(b).into_iter().any(|t| t < n && !(reach[t][need] && reach[need][t]));
+            if leaves && !out.contains(&b) {
+                out.push(b);
+            }
         }
     }
     Some(out)
