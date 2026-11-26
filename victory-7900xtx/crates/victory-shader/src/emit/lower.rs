@@ -5271,7 +5271,12 @@ impl<'a> Lower<'a> {
 
     /// Whether every lane runs IR block `b` (always true without `exchange`).
     fn all_lanes(&self, b: usize) -> bool {
-        self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
+        // A block index the structure does not know is not a block some lanes leave out:
+        // `false` here said "not every lane runs it" about blocks the analysis never saw, and
+        // the widening was then asked for branches around a block no region holds
+        // ("WAVE64-WIDE stopped ... a branch around it cannot be", measured on
+        // water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly 2026-11-26).
+        self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(true))
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
