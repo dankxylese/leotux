@@ -756,13 +756,10 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
-        crate::native::StageIo::Cs(cs) => {
-            if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
-            }
-            return Err(NOT);
-        }
+        // Any group of console waves: a wave-wide decision covers the whole group now
+        // (`Lower::wave_wide` ORs every console wave's exchange pair), so the branches taken
+        // this way are entered by every thread and the barriers inside them are reached.
+        crate::native::StageIo::Cs(_) => {}
         _ => return Err(NOT),
     }
     let mut wide = std::collections::HashSet::new();

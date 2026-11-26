@@ -5238,7 +5238,33 @@ impl<'a> Lower<'a> {
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
         let (lo, hi) = self.exchange_halves(c, some);
         let c = self.cur;
-        let both = self.s.m.bin(c, Bin::Or, lo, hi);
+        let mut both = self.s.m.bin(c, Bin::Or, lo, hi);
+        // A thread group of several console waves: each of them wrote its own pair of dwords
+        // into this program's exchange slots (`exchange_pair`: `slot + 2 * (thread >> 6)`), and
+        // the barrier at the end of `exchange_halves` has every one of them in place. ORing the
+        // other waves' pairs in makes the decision the whole group's, so the branch is taken by
+        // every thread and the barriers inside it are reached by all of them - which is what a
+        // group of several console waves needs to be widened at all (`widen`).
+        let slot = self.exchange.as_ref().map(|(s, _, _)| *s);
+        if let Some(slot) = slot {
+            let waves = match &self.x.native.io {
+                crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>().div_ceil(64),
+                _ => 1,
+            };
+            if waves > 1 {
+                let lds = self.s.lds();
+                for w in 0..waves {
+                    let a = self.s.m.i32(slot + 2 * w);
+                    let b = self.s.m.i32(slot + 2 * w + 1);
+                    let pa = self.s.m.element(c, lds, a);
+                    let pb = self.s.m.element(c, lds, b);
+                    let va = self.s.m.load(c, pa);
+                    let vb = self.s.m.load(c, pb);
+                    let pair = self.s.m.bin(c, Bin::Or, va, vb);
+                    both = self.s.m.bin(c, Bin::Or, both, pair);
+                }
+            }
+        }
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
     }
