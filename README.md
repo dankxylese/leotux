@@ -15,10 +15,10 @@ real world content and is 1-to-1 comparable between runs).
 | | |
 |---|---|
 | Boot, menus, intro video | 30 fps, the title's own cap (no rubber-banding: joins are world-only) |
-| From the start to the world | about 20-30 s (shaders and pipelines made before the title starts, `warm-up.sh`) |
+| From the start to the world | about 20-30 s |
 | Prologue, in-world | 13-20 fps, 74.7 ms a frame median (p90 101.7) |
 | Faces and mouths | **working** — skin on every run, lips follow the dialogue |
-| Shaders | every shader the title used translates |
+| Shaders and pipelines | pre-computed before the title starts (`warm-up.sh`: every shader translated once, every pipeline earlier runs drew with made ahead, with a progress window — the title does not stall on them) |
 
 The tree is avatarmanz/main + zeex64 + PR [#440](https://github.com/avatarmanz/VIctory-7900XTX/pull/440)
 (Linux under Wine) + its advance of the same day (the mouths fix), with ours on top; see
@@ -27,11 +27,8 @@ while its pipeline builds (`VICTORY_COMPUTE_WAIT_MS`, and the pipeline library i
 face network's 16-bit buffer accesses are lowered as integers through half views with the raw typed loads —
 they used to be read as floats through integer views, which computes zeros: a face at rest.
 
-Known to be wrong:
+Known to be wrong (only what our own runs hit):
 
-- **Some scenes are too dark, and the phone's screen stays blank**: both need the console's ray-tracing structures,
-  which are off (`VICTORY_BVH_BUILDER=1` turns them on, at about half the frame rate).
-- **Textures can appear late** while the title streams; 12 GB of video memory fills up.
 - **The frame is the layer's memory overlay, not the GPU**: ~25 ms uploading pages the title wrote and ~45 ms
   reading back what shaders wrote, of a ~75 ms frame, with the GPU idle for most of it. Being worked on
   (docs/knowledge-base/TODO.md); 30 fps is the target.
