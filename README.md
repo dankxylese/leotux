@@ -8,13 +8,13 @@ from [Leonida](https://github.com/ItsNotRexed/Leonida), whose own runtime is sti
 
 ## Where it stands (2026-11-26)
 
-Tested on one machine: Ryzen 7 7700, 32 GB RAM, Radeon RX 7700 XT 12 GB, CachyOS, Mesa RADV, the Series X profile.
+Tested on one machine: Ryzen 7 5800x3d, 32 GB RAM, Radeon RX 7800 XT 12 GB, Arch Linux.
 
 | | |
 |---|---|
 | Boot, menus, intro video | 30 fps, the title's own cap |
-| From the start to the world | about 30-50 s once the caches are warm |
-| Open world, first mission | 6-10 fps (`victory-7900xtx`; `victory-dexnom` ran 1-4) |
+| From the start to the world | about 20-30s |
+| Open world, first mission | 10-20 fps (`victory-7900xtx`) |
 | Shaders | every shader the title used translates |
 
 Known to be wrong:
