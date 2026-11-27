@@ -8,8 +8,9 @@ distro Wine — **no Proton build**.
 
 ## Where it stands (2026-11-27)
 
-Tested on one machine: Ryzen 7 5800X3D, 32 GB RAM, Radeon RX 7800 XT 16 GB (RADV), CachyOS. The reference
-scene is the prologue (it renders real world content and is 1-to-1 comparable between runs).
+Tested on one machine: Ryzen 7 5800X3D, 32 GB RAM, Radeon RX 7800 XT 16 GB (RADV, Mesa 26.2.6),
+EndeavourOS (Arch) with the CachyOS kernel 7.3.3. The reference scene is the prologue (it renders
+real world content and is 1-to-1 comparable between runs).
 
 | | |
 |---|---|
