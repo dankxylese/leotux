@@ -38,7 +38,12 @@ defaults "VICTORY_CACHE_DIR=C:\\users\\manse\\AppData\\Local\\$VICTORY_TREE\\cac
          "VKD3D_SHADER_CACHE_PATH=Z:${CACHE_DIR//\//\\\\}\\vkd3d"
 
 # VIctory settings (same defaults as run_victory_proton.sh)
+# VICTORY_WINE_MAP (mmap title memory, on-by-default under Wine since the PR merge) is
+# POISON here: the kernel's by-address write tracking misses writes through the mmap
+# views, so 10+ GB/frame reads as changed (run14/15: 0.2-0.5 fps, 793 slow kernel
+# askings/frame). The rbtree server already covers the map/unmap cost it exists for.
 defaults VICTORY_LOG=info "VICTORY_LOG_FILE=Z:\\home\\manse\\A.Projects\\GTA6-Emulation\\LeoTux-logs\\victory-trace.log" \
+         VICTORY_WINE_MAP=0 \
          VICTORY_NO_WATCHDOG=1 \
          VICTORY_SKIP_INT3=1 \
          VICTORY_HAIR=1 \
