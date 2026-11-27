@@ -184,3 +184,33 @@ mouth motion once the merge lands.
   creation is 52% of samples in the first long stall.
 - Slaktarn700/SlaktarnVI scout dispatched (its nuget shader-compiler claim vs our
   winetricks d3dcompiler_47; cherry-pick list pending).
+
+## Night: WC_NO_BACK and the relay saga (run22-24)
+
+- WC_NO_BACK merged (`1a25109`, 7 commits from Belobug#477 via born/linux-wine).
+  In the wedged session it read "0 declarations" (inert); on the clean box it
+  engages fully (2,700-3,400 declarations/frame, 8 MB write-combined in the census).
+  run23 (WC only, relay off): copy-back 49.1 ms / 35.7 MB -> 20.2 ms / 0.3 MB,
+  median 74.7 -> 53.6 ms (18.6 fps). DEFAULT CANDIDATE (set =1 in the launcher
+  once the guards interplay gets a longer soak).
+- Relay merge GPU-faulted 3x (gfxhub READ fault, thread vkd3d_queue, SAME address
+  0x800f7b57d/e000 twice; RELAY_RUN=0 faulted identically). Root cause (agent,
+  1e5be21): the fetch recorded CopyBufferRegions from pieces' TITLE ADDRESSES
+  instead of offsets in the shadow copy — every region read past the copy's mapped
+  end; runs() is used in every config, hence deterministic. Fixed: record from copy
+  offsets + a hard guard ("a fetch of N bytes at X reads past the copy's S" — fail
+  loudly, no device removal). Re-merged fixed (`432f94f`); run24 clean: 0 guard
+  fires, 0 faults; p90 151.7 -> 100.7 vs run23 (median +6 = scene noise).
+- Lessons: (1) a wedged GPU makes follow-on runs measure collateral — reset +
+  verify Xwayland's cookie (the launcher now follows the newest /run/user cookie
+  itself); (2) "VRAM is lost due to GPU reset" makes Xwayland crash-happy — after
+  3 wedgings a reboot is the trustworthy baseline; (3) the box's RTC was ~5.5 h
+  slow until the reboot — log timestamps before/after differ by that jump.
+- Guards agent finished honestly: sharding works (8 shards by 64 MiB region hash,
+  locks for lookups only, protections coalesced) but a multi-view write-loss window
+  under Wine (1-in-3 runs lose a write in many_askers_tests) => committed OFF by
+  default; coalescing + queries-outside-lock active in both modes. Branch
+  leotux-guards-shard (50b50e4) NOT merged — decide after the window is closed.
+- State: median 59.6 ms / 16.8 fps in the prologue with mouths+faces, p90 ~101,
+  GPU stable. Next: guards merge decision, lazy read-back (P5), SlaktarnVI picks
+  (CARD_STEPS_LEARN first), #446, then the copies-up side (3 GB/frame inspected).
