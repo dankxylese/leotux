@@ -124,13 +124,20 @@ progress_update() { # <translate|warm> <line>
   case $kind in
     translate)
       if [[ $line =~ ^([0-9]+)\ shaders\ in\ the\ cache,\ ([0-9]+)\ do\ not\ translate,\ ([0-9]+)\ s$ ]]; then
-        # The final summary: the pass is over.
+        # The final summary: the pass is over; keep its count as the next pass's target.
+        [[ -n ${TRANSLATE_LAST_OUT:-} ]] && printf '%s\n' "${BASH_REMATCH[1]}" > "$TRANSLATE_LAST_OUT" 2>/dev/null || true
         if [[ $BAR == 1 ]]; then
           bar_text "translated ${BASH_REMATCH[1]} shaders (${BASH_REMATCH[2]} do not translate), ${BASH_REMATCH[3]} s"
           bar_set 100
         fi
       elif [[ $line =~ ^([0-9]+)\ shaders\ in\ the\ cache,\ ([0-9]+)\ s$ ]]; then
-        [[ $BAR == 1 ]] && bar_text "${BASH_REMATCH[1]} shaders translated, ${BASH_REMATCH[2]} s so far"
+        if [[ $BAR == 1 ]]; then
+          if [[ -n ${TRANSLATE_TARGET:-} ]]; then
+            bar_text "${BASH_REMATCH[1]} of ~${TRANSLATE_TARGET} shaders translated, ${BASH_REMATCH[2]} s so far"
+          else
+            bar_text "${BASH_REMATCH[1]} shaders translated, ${BASH_REMATCH[2]} s so far"
+          fi
+        fi
       fi
       ;;
     warm)
@@ -229,6 +236,11 @@ translate_stage() {
   local -a args=("$VICTORY_EXE" shaders)
   local p
   local -a wanted=()
+  # The target shown in the window: the last full pass's count, if we have one
+  # (the tool itself learns no total before the scan).
+  TRANSLATE_TARGET=
+  [[ -f $CACHE_DIR/translate.last ]] && TRANSLATE_TARGET=$(cat "$CACHE_DIR/translate.last" 2>/dev/null) || true
+  TRANSLATE_LAST_OUT="$CACHE_DIR/translate.last.tmp"
   while IFS= read -r p; do
     [[ -n $p ]] || continue
     if [[ ! -e $p ]]; then
@@ -320,7 +332,9 @@ main() {
   else
     if translate_stage; then
       build_stamp > "$STAMP_FILE"
+      [[ -f $CACHE_DIR/translate.last.tmp ]] && mv "$CACHE_DIR/translate.last.tmp" "$CACHE_DIR/translate.last"
     else
+      rm -f "$CACHE_DIR/translate.last.tmp"
       warn "translate: failed; carrying on with the pipelines (the run translates what it needs)"
     fi
   fi
