@@ -6,9 +6,6 @@
 #
 # Trees (VICTORY_TREE):
 #   victory-7900xtx (default)  avatarmanz's RDNA 3 fork + zeex64's Linux work + our Wine pieces
-#   victory-belobug            the same merged with Belobug's AMD fork (experimental: slower under
-#                              Wine, its renderer patches black the picture; see its UPSTREAM.md)
-#   victory-dexnom             DexNom Runtime + our Wine pieces (the previous default)
 #   victory                    Belobug's fork as of 2026-11-25 + Scarlight's Wine fixes
 #
 # Every setting below is a default: a variable already set in the environment wins.
@@ -102,7 +99,7 @@ VICTORY_CONSOLE="${VICTORY_CONSOLE:-series-x}"
 #   VICTORY_PIPELINE_BOOK=1   every pipeline written down, for `warm`
 #   VICTORY_BVH_BUILDER=1     not set: ray tracing (the phone's screen, indirect light), much slower
 case "$VICTORY_TREE" in
-  victory-7900xtx | victory-belobug) NEWER=1 ;;
+  victory-7900xtx) NEWER=1 ;;
   *) NEWER=0 ;;
 esac
 if [[ "$NEWER" == 1 && "${VICTORY_FORK_SETTINGS:-1}" != 0 ]]; then

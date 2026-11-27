@@ -80,9 +80,12 @@ from, what was merged and how conflicts were resolved is in its `UPSTREAM.md`.
 | Tree | What it is | State here |
 |---|---|---|
 | `victory-7900xtx` (default) | [avatarmanz's RDNA 3 fork](https://github.com/avatarmanz/VIctory-7900XTX) + [zeex64's Linux work](https://github.com/zeex64/VIctory-7900XTX) + ours | the fastest under Wine: 6-10 fps in the world |
-| `victory-belobug` | the above merged with [Belobug's AMD fork](https://github.com/Belobug/VIctory-Belobug-AMD) | experimental: about 5 fps, its renderer patches black the picture under Wine |
-| `victory-dexnom` | [DexNom Runtime](https://github.com/DexNom/VIctory) + ours | the previous default: 1-4 fps |
 | `victory`, `scarlight` | older Belobug and [Scarlight](https://github.com/pablogonz12/Scarlight) trees | kept for reference |
+
+`victory-belobug` and `victory-dexnom` were dropped here (2026-11-27): both were far behind
+`victory-7900xtx` (about 5 and 1-4 fps in the world against its 6-10, and the belobug merge's
+renderer patches blacked the picture under Wine). Their history is in the git history and in
+the GTA6-btw clone.
 
 "Ours" is: the title's watchdog hooks (`VICTORY_NO_WATCHDOG`), the log in a file under Proton (`VICTORY_LOG_FILE`),
 crash reports and stack dumps in that log, the 1.0.2.1 int3 assert stepped over (`VICTORY_SKIP_INT3`), copy-back into
