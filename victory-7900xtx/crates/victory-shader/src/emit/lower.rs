@@ -1757,6 +1757,12 @@ pub(super) fn wave_wide_on() -> bool {
     THREAD_WAVE_WIDE.get() || std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
 }
 
+/// `VICTORY_SCALAR_SPLITS=0`: no branch is taken wave-wide for the scalars it writes
+/// ([`scalar_splits`]), in no caller of `widen`.
+pub(super) fn scalar_splits_on() -> bool {
+    std::env::var_os("VICTORY_SCALAR_SPLITS").is_none_or(|v| v != "0")
+}
+
 thread_local! {
     pub(super) static THREAD_WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

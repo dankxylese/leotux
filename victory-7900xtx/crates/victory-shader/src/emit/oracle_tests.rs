@@ -1949,3 +1949,31 @@ fn oracle_scalars_written_in_lane_branches_reach_every_lane() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// `VICTORY_SCALAR_SPLITS=0` reaches every caller of `widen`, the fallbacks included, which
+/// start from no branch: with the switch off a scalar written in a lane branch keeps the
+/// per-lane form there, with it on that branch is taken wave-wide. (No GPU: translation only.)
+#[test]
+fn widen_takes_scalar_splits_only_when_asked() {
+    let p = Prog {
+        wave64: false,
+        seeds: [9, 3, 0x1234, 0x5678],
+        body: vec![lane_split(vec![mov_s(21, -3)], None)],
+        raw_masks: false,
+    };
+    let (words, _) = encode(&p);
+    let native = native_of(&p, &words);
+    let container = dxbc::build(&[]);
+    let c = dxbc::Container::parse(&container).unwrap();
+    let ir = spill::build(&native).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let off = super::widen(&c, &native, &ir, &[], false, false).map(|(s, _)| s.dxil);
+    let on = super::widen(&c, &native, &ir, &[], true, false).map(|(s, _)| s.dxil);
+    let plain = structure::structure(&ir).map(|st| lower::scalar_splits(&ir, &st));
+    lower::TEST_HOST_WAVE.set(was);
+    assert!(matches!(plain, Ok(Some(ref s)) if !s.is_empty()), "the program has a scalar split: {plain:?}");
+    let on = on.expect("with the switch on, the branch is taken wave-wide and translates");
+    // (with it off this program stays per lane, which `widen` alone refuses: a lane mask read as
+    // data, retried later on the full path)
+    assert!(!matches!(&off, Ok(d) if *d == on), "with the switch off the branch is not taken for its scalar: {off:?}");
+}
