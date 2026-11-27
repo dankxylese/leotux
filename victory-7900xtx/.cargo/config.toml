@@ -3,9 +3,9 @@ xtask = "run --quiet --package xtask --"
 [target.x86_64-pc-windows-msvc]
 linker = "lld-link"
 rustflags = [
-  "-Lnative=/home/joki/.local/share/xwin-sdk/VC/Tools/MSVC/14.44.17.14/lib/x64",
-  "-Lnative=/home/joki/.local/share/xwin-sdk/Windows Kits/10/Lib/10.0.26100/ucrt/x64",
-  "-Lnative=/home/joki/.local/share/xwin-sdk/Windows Kits/10/Lib/10.0.26100/um/x64",
+  "-Lnative=/home/manse/.local/share/xwin-sdk/VC/Tools/MSVC/14.44.17.14/lib/x64",
+  "-Lnative=/home/manse/.local/share/xwin-sdk/Windows Kits/10/Lib/10.0.26100/ucrt/x64",
+  "-Lnative=/home/manse/.local/share/xwin-sdk/Windows Kits/10/Lib/10.0.26100/um/x64",
 ]
 
 # C sources (victory-gpu's SEH shim) for the Windows target, built from Linux
@@ -13,4 +13,4 @@ rustflags = [
 [env]
 CC_x86_64_pc_windows_msvc = "clang-cl"
 AR_x86_64_pc_windows_msvc = "llvm-lib"
-INCLUDE = "/home/joki/.local/share/xwin-sdk/VC/Tools/MSVC/14.44.17.14/include;/home/joki/.local/share/xwin-sdk/Windows Kits/10/Include/10.0.26100/ucrt;/home/joki/.local/share/xwin-sdk/Windows Kits/10/Include/10.0.26100/um;/home/joki/.local/share/xwin-sdk/Windows Kits/10/Include/10.0.26100/shared"
+INCLUDE = "/home/manse/.local/share/xwin-sdk/VC/Tools/MSVC/14.44.17.14/include;/home/manse/.local/share/xwin-sdk/Windows Kits/10/Include/10.0.26100/ucrt;/home/manse/.local/share/xwin-sdk/Windows Kits/10/Include/10.0.26100/um;/home/manse/.local/share/xwin-sdk/Windows Kits/10/Include/10.0.26100/shared"
