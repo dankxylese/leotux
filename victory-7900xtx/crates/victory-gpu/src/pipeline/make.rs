@@ -976,7 +976,24 @@ fn spawn_worker(screens_only: bool, stack: Option<usize>) -> std::io::Result<(us
 /// 271 ms a frame (run 13), and the six workers were gone. Given up, its
 /// draws and dispatches are dropped at once, as those of a pipeline the host
 /// refuses are.
-fn watch_ended(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: Option<usize>) {
+fn watch_ended(workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: Option<usize>) {
+    for_each_watch_group(workers, |group| watch_worker_group(group, stack));
+}
+
+fn for_each_watch_group<T>(mut workers: Vec<T>, mut watch: impl FnMut(Vec<T>)) {
+    // WaitForMultipleObjects takes at most MAXIMUM_WAIT_OBJECTS handles.
+    // The highest setting can start 64 general workers and 2 priority ones.
+    const MAX_WAIT_HANDLES: usize = 64;
+    while workers.len() > MAX_WAIT_HANDLES {
+        let split = workers.len() - MAX_WAIT_HANDLES;
+        watch(workers.split_off(split));
+    }
+    if !workers.is_empty() {
+        watch(workers);
+    }
+}
+
+fn watch_worker_group(mut workers: Vec<(usize, bool, std::thread::JoinHandle<()>)>, stack: Option<usize>) {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
@@ -1076,6 +1093,31 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_workers_have_a_valid_wait_at_the_maximum_setting() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::WaitForMultipleObjects;
+
+        let workers: Vec<_> = (0..64 + SCREEN_WORKERS).map(|i| (i, std::thread::spawn(|| {}))).collect();
+        let handles: Vec<_> = workers.iter().map(|(_, thread)| HANDLE(thread.as_raw_handle())).collect();
+        // SAFETY: The join handles outlive each wait.
+        assert_eq!(unsafe { WaitForMultipleObjects(&handles, false, 0) }, WAIT_FAILED);
+        let mut watched = Vec::new();
+        for_each_watch_group(workers, |group| {
+            let handles: Vec<_> = group.iter().map(|(_, thread)| HANDLE(thread.as_raw_handle())).collect();
+            // SAFETY: The join handles are still owned by this group.
+            let ready = unsafe { WaitForMultipleObjects(&handles, false, 2000) };
+            assert!(ready.0.wrapping_sub(WAIT_OBJECT_0.0) < group.len() as u32);
+            for (index, thread) in group {
+                watched.push(index);
+                thread.join().unwrap();
+            }
+        });
+        watched.sort_unstable();
+        assert_eq!(watched, (0..64 + SCREEN_WORKERS).collect::<Vec<_>>());
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

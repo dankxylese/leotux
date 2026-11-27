@@ -872,11 +872,34 @@ lock for a third of a millisecond at a time, 2,000 times a second.
 10. Everything of 2026-11-27 was measured in the title's first scene, a cutscene at night.
     Not in play, not by day, not in traffic.
 
-11. Lips do not move when people speak: the heroine's mouth is shut in 21 frames in a row of
-    three of her lines, eyes and head moving (run h02). In the frame recorded in run 68 the
-    face deformer's shared input (`title buffer 0xda62c8580+0x104000`, 1 MiB) is all zeros on
-    the card and in the copy of title memory, and nothing writes it in the frame. Not the
-    heads' cause (there the card and title memory differed). Not looked into.
+11. Lips did not move when people spoke: the heroine's mouth was shut in 21 frames in a row
+    of three of her lines, eyes and head moving (run h02). In the frame recorded in run 68 the
+    face deformer's shared input (`title buffer 0xda62c8580+0x104000`, 1 MiB) was all zeros on
+    the card and in the copy of title memory, and nothing wrote it in the frame. Not the
+    heads' cause (there the card and title memory differed).
+
+    Put right on 2026-11-27 with three changes of others, taken together from
+    bordersky/victory-linux (its tree at 2294b83 against avatarmanz main 9576c45, the
+    translator's and the descriptors' files only): avatarmanz pull request 114 (secure-silicon:
+    d16 accesses ask for the kind of a view in a table too), fxceless/victory-fork pull
+    request 927 (tippythetaidum: halves moved through a 16-bit buffer view keep their bits),
+    and the raw typed loads (`VICTORY_RAW_TYPED_LOADS`, on; `0` off). With them the lips follow
+    the lines and close between them, and eyes blink (run 117, one run of 100 s, the frames
+    of three lines looked at); the frame is as long as before, 28.9 ms against 28.8 over the
+    same stretch (runs 117 and 108). The translations change (`TRANSLATOR_VERSION`, the shader
+    cache's format): every shader is translated again at the first start, or with
+    `scripts/play.sh --cmd translate --warm all`.
+
+    What was tried before, each one run, on this card (RX 7900 GRE, RADV 26.3.1):
+    - pull request 114 alone: faces deform, mouths wide open and the same in every frame
+      (run 103); with avatarmanz pull request 329's shader commit as well: mouths change but
+      stay agape, with specks by the nose (run 104).
+    - with those two: d16 typed loads and stores of an integer view through a handle of
+      integers (run 105), every shader translated for waves of 32 (`VICTORY_HOST_WAVE=32`,
+      run 106), none of the float shortcuts for RDNA (`VICTORY_RDNA_FLOAT=0`, run 108): the
+      same picture each time.
+    - not the driver's compiler: a recorded frame's network replayed with RADV's ACO and with
+      its LLVM backend (`RADV_DEBUG=llvm`) gives the same result word for word.
 
 ## Tools
 

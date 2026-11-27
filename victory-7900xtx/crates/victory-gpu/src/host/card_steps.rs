@@ -541,6 +541,45 @@ enum To {
     Buffer(ID3D12Resource),
 }
 
+fn copy_range_fits(width: u64, offset: u64, at: u64, len: u64) -> bool {
+    len != 0
+        && offset.checked_add(len).is_some_and(|end| end <= width)
+        && at.checked_add(len).is_some_and(|end| end <= BETWEEN)
+}
+
+/// Preflight the whole batch before reserving a list, refreshing shadows or
+/// changing descriptor slots. When one half of a copy cannot be recorded,
+/// the submission must use the existing deferred steps after its wait.
+fn check_copy_ranges(ops: &[Op]) -> Result<(), &'static str> {
+    let mut widths = HashMap::default();
+    let mut check = |buffer: &ID3D12Resource, offset, at, len| {
+        let width = *widths.entry(buffer.as_raw() as usize).or_insert_with(|| {
+            // SAFETY: a plain query of a live buffer.
+            unsafe { buffer.GetDesc() }.Width
+        });
+        if copy_range_fits(width, offset, at, len) {
+            return Ok(());
+        }
+        static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::warn!(offset, at, len, width, refused = n, "card steps: a copy is outside its buffer; waiting for ordinary submission");
+        }
+        Err("a copy is outside its buffer")
+    };
+    for op in ops {
+        let len = op.len as u64;
+        let (source, address) = &op.from;
+        check(&source.buffer, source.offset(*address as u64), op.at, len)?;
+        match &op.to {
+            To::Copy(dest, address) => check(&dest.buffer, dest.offset(*address as u64), op.at, len)?,
+            To::Buffer(dest) => check(dest, 0, op.at, len)?,
+            To::Slot(..) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
 /// are copied into `between` (source, offset in it, offset in `between`,
 /// bytes), then `writes` out of it (destination, offset in it, offset in
@@ -554,30 +593,6 @@ fn record(
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
 ) {
-    // Every range is checked against its buffer and the staging buffer before
-    // it is recorded: vkd3d-proton does not validate CopyBufferRegion, and on
-    // RADV a range past a buffer's end is a write by the card's command
-    // processor to an address of no allocation — a GPU page fault and, when the
-    // queue reset fails, a whole-GPU reset that takes the desktop with it
-    // (2026-11-26: CPC write at 0xfffffffff000 on vkd3d's compute queue).
-    let fits = |&&(buffer, offset, at, len): &&(&ID3D12Resource, u64, u64, u64)| {
-        // SAFETY: a plain query of a live buffer.
-        let width = unsafe { buffer.GetDesc() }.Width;
-        let ok = len != 0
-            && offset.checked_add(len).is_some_and(|end| end <= width)
-            && at.checked_add(len).is_some_and(|end| end <= BETWEEN);
-        if !ok {
-            static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 16 || n.is_power_of_two() {
-                tracing::warn!(offset, at, len, width, skipped = n + 1, "card step: a copy out of its buffer's range left out");
-            }
-        }
-        ok
-    };
-    let reads: Vec<_> = reads.iter().filter(fits).copied().collect();
-    let writes: Vec<_> = writes.iter().filter(fits).copied().collect();
-    let (reads, writes) = (&reads[..], &writes[..]);
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();
@@ -822,6 +837,7 @@ impl Host {
                 to,
             });
         }
+        check_copy_ranges(&ops)?;
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
@@ -993,6 +1009,16 @@ pub(super) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planned_copy_ranges_must_fit_both_buffers() {
+        assert!(copy_range_fits(512, 256, BETWEEN - 256, 256));
+        assert!(!copy_range_fits(511, 256, BETWEEN - 256, 256));
+        assert!(!copy_range_fits(512, 256, BETWEEN - 255, 256));
+        assert!(!copy_range_fits(u64::MAX, u64::MAX - 1, 0, 2));
+        assert!(!copy_range_fits(512, 0, u64::MAX - 1, 2));
+        assert!(!copy_range_fits(512, 0, 0, 0));
+    }
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }
@@ -1311,6 +1337,26 @@ mod tests {
         crate::shadow::register(0x1111, start as u64, HALF as u64);
         crate::shadow::register(0x2222, (start + HALF) as u64, HALF as u64);
         let first = crate::shadow::find(start as u64, 64).unwrap();
+        let narrow = host.uav_buffer(256).unwrap();
+        // SAFETY: querying the live fixture buffer, before any commands.
+        let width = unsafe { narrow.GetDesc() }.Width as usize;
+        assert!(width < HALF);
+        let mut batch = vec![Op {
+            from: (first.clone(), start),
+            len: width,
+            at: 0,
+            level: 0,
+            to: To::Buffer(narrow.clone()),
+        }];
+        assert!(check_copy_ranges(&batch).is_ok());
+        batch.push(Op {
+            from: (first.clone(), start),
+            len: width + 1,
+            at: width as u64,
+            level: 1,
+            to: To::Buffer(narrow),
+        });
+        assert_eq!(check_copy_ranges(&batch), Err("a copy is outside its buffer"));
         let (slow_from, slow_to) = (host.uav_buffer(64 << 20).unwrap(), host.uav_buffer(64 << 20).unwrap());
         let before = DONE[1].load(Ordering::Relaxed);
         let mut lists = Vec::new();

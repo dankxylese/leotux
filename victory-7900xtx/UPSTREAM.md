@@ -145,3 +145,36 @@ ignored), and the Windows test binaries of `victory-gpu` (with `tests/replay*.rs
 `victory-hle` (`tests/fidelityfx.rs`, `tests/no_dll_planting.rs`) and `victory-loader`
 (`tests/title_dlls.rs`, `tests/load_probe.rs`) compile; none of them was run (a Linux host, no
 Wine here), and nothing in the title was measured.
+
+## PR #440's advance, `deebee8..3721030` (2026-11-27)
+
+Five commits merged on top, `git merge born/linux-wine-pr` at `3721030`: `5b9babf`+`377e9a1`
+(UwUCammie: a card-step batch is refused whole before a list is reserved, `check_copy_ranges`
+in `host/card_steps.rs`, where it used to drop a copy out of its buffer and record the rest);
+`bd71120`+`3f9ac64` (UwUCammie: the Wine pipeline watcher waits in groups of at most 64
+handles — 64 workers plus the 2 screen ones made `WaitForMultipleObjects` fail and the watch
+stop for good; this tree starts `(processors * 2 / 3).clamp(2, 16)` unless
+`VICTORY_PIPELINE_WORKERS` asks for up to 64, so the grouping only bites with a large pool);
+`542d441` (the mouths: PR 114's d16 view kinds in a table, fxceless #927's half views — a
+buffer view written and read 16 bits a channel through a typed uint view keeps its bits
+(`HostShader::half_views`, `descriptor::host::half_view`/`half_format`/`half_inexact`,
+`draw::tables`) — and the raw typed loads, `VICTORY_RAW_TYPED_LOADS`, on, now the fifth word
+of `host_settings`); `3721030` (the raw-view dispatch test builds its `HostShader` with the
+new field).
+
+One conflict, `emit/lower.rs`, typed buffer stores: halves are pushed as their raw integers
+(the view is typed uint there; converting them to floats was what lost the bits) and the
+float path keeps this tree's `nan_guard` (`VICTORY_NAN_GUARD=stores`, off at the default).
+`watch.rs`, `xmem.rs` and `wine_map.rs` were not touched: `VICTORY_WINE_MAP=0` and the
+null-vtable guard in `victory-loader/src/crash.rs` (`VICTORY_SKIP_NULL_VTABLE`) are as they
+were, and the loader's 55 native tests pass.
+
+The translator moved: `victory_shader::TRANSLATOR_VERSION` `1` → `0x4c00_0002`,
+`shader_cache::FORMAT` `2` → `0x4c00_0003`, its file `MAGIC` `VSH2` → `VSL3`, and
+`host_settings()` from four words to five (`raw_typed_loads_on()`). Every cached translation
+is a miss once, and the host pipeline library (named by the translated code) is made again.
+Checked: the build above, `cargo test --release -p victory-shader --lib` (215 passed, 2
+ignored — the new `valu_tests` are `#[cfg(all(test, windows))]`, so the native count does not
+move), `victory-loader --lib` under Wine (55 passed), and the Windows test binaries: the
+shader's 315 tests give 273 passed, 38 failed, 4 ignored, every failure a test that needs an
+SM 6.6 D3D12 device ("no SM 6.6 device available": a scratch prefix has no card).

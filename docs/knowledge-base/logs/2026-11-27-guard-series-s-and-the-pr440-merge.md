@@ -139,3 +139,48 @@ mouth motion once the merge lands.
   `victory warm --used` BEFORE the title launches, so cold starts don't play out
   on screen. Lands before the next run.
 - run17 (the judgment run) waits for the user's ready: texture verdict + warmup in.
+
+## Late-evening: mouths root-caused (upstream fix landed), perf levers measured
+
+- **Mouths = fork B** (title DID evaluate facial clips; delivery died in translation):
+  the face network's 16-bit accesses were lowered as f32 through INTEGER views
+  (table views never got their format-kind word; d16 loads/stores lowered as
+  bufferLoad.f32 — UB through an integer view — plus a RADV post-barrier texel-load
+  hazard read through the raw view). Network output = zeros = face at rest.
+  Upstream fix 542d441 (+3721030 test fix; = e47cce0 on born/linux-wine): pull 114 +
+  fxceless 927's half views + raw typed loads. Translator version bumped
+  (VSH2 -> VSL3 cache magic) -> ONE full re-translation; known-pipelines stay valid.
+  VICTORY_RAW_TYPED_LOADS must stay on (default); new default VICTORY_FIRSTLANE_OWN=1
+  for spilled user-data programs (=0 if regressions). warm --used before the
+  judgment run or dropped boot compute fakes the old static face.
+- **Perf levers, measured from our own logs** (in-world ~72-77 ms/frame, GPU ~0-10 ms):
+  1. STRUCTURAL: relay's per-landing BLOCKING PCIe fetch (64 KiB pieces, own copy
+     queue, SetEventOnCompletion+wait; 26.7 ms of the 48.6 ms copy-back). Fix:
+     fetch landing N while merging N-1; join pieces across 64 KiB blocks.
+     ~12-16 ms/frame.
+  2. SMALL CODE: one global guards mutex held across VirtualProtect (13.6 ms
+     protections + 17 ms lock-waits per frame; 388 blocks ~35 us each, Wine server
+     round trips). Fix: shard by the 64 MiB region index, lock for set-lookups only,
+     coalesce protections. ~6-10 ms/frame.
+  3. PORT #1 IS INERT FOR US: home_on() = port_on && wine_map::on && PORT_HOME!=0 —
+     our VICTORY_WINE_MAP=0 kills the 174 MB constant heap's in-place use (it placed
+     in run14 with mmap on: "1 regions (185 MB), 1 title buffers placed"). Fix:
+     decouple the 32-bit graphics stretch's home from the global mmap switch.
+     ~13-15 ms preparing + ~2 ms copy-back. That heap: 3 GB/frame inspected,
+     16.6x/frame refreshed, 45% of the up-bus, ~4,667 small CBV fills/frame.
+  4. Cheap switches (evidence-backed, set for the next run): VICTORY_WIDE_MORE=1
+     (refresh threads, 35 -> 13 ms measured once), VICTORY_TAKE_FINE=1. ~4-6 ms.
+  Ruled out by measurement: LAND_SKIP, ASK_EARLY, ASK_NORESET, WIDE_MERGE, CARD_FINE.
+  Copy-back answers the title's CPU reads of GPU-written buffers (union of UAV view
+  extents, compare-narrowed; ~16.6 MB/frame fetched and never read = pure waste —
+  lazy read-fault copy-back is the documented ceiling-remover).
+  Combined expectation: ~75 -> ~45-52 ms/frame (19-22 fps), port#1 on top -> 22-28.
+- PR #440 thread (25 comments) read in full: YaBulochka 8 GB data (PORT_CONSTANTS
+  int3+ring-timeout on small cards; #446 "clear stale constant-buffer descriptors"
+  stabilises it), VICTORY_PC_FSR=1 + FSR4.x acceptance (RDNA3 FSR4 under Wine),
+  COMPUTE_WAIT_MS default now 500 ms (1bf01b5; 10 s costs ~60 s of 5 s frames COLD —
+  ours is warm so =10 is inert), UwUCammie's worker-watch handle-group fix (bd71120,
+  >64-handle waits rejected by Wine — our pools are big), RADV driver-side pipeline
+  creation is 52% of samples in the first long stall.
+- Slaktarn700/SlaktarnVI scout dispatched (its nuget shader-compiler claim vs our
+  winetricks d3dcompiler_47; cherry-pick list pending).

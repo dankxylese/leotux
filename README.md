@@ -2,11 +2,7 @@
 
 Running the Xbox Series build of GTA VI on Linux with [VIctory](https://github.com/Marvisak/VIctory)
 (a compatibility layer that runs the console executable on a PC and translates its GPU work), on a stock
-distro Wine — **no Proton build**. This repository is [GTA6-btw](https://github.com/JokiiiBoy/GTA6-btw)
-with our own work on top; GTA6-btw started from [Leonida](https://github.com/ItsNotRexed/Leonida), whose
-own runtime is still here (see [Leonida path](#leonida-path)). Upstream fixes come in from the GTA6-btw
-clone, which keeps tracking its author; they are merged here by hand (see
-[The trees](#the-trees) and docs/knowledge-base).
+distro Wine — **no Proton build**.
 
 **No game files are in this repository.** You need your own copy of the game.
 
