@@ -111,3 +111,31 @@ mouth motion once the merge lands.
 3. Mouths: check the facial-clip -> deform-table path against the dropped-compute class;
    the track_id_hash mapping is the data-side dig if runtime is clean.
 4. Guard live validation (no pressure: 0 skips in two runs is the race being rare).
+
+## Merge landed + runs 14-16 (evening update)
+
+- Merge committed as `dcc6c64` (reviewed: 215 shader + 55 loader tests verified
+  independently, guard intact; resolution notes in the commit and pr440-merge.md).
+- **VICTORY_WINE_MAP is poison on this stack** (runs 14/15): the mmap path's kernel
+  write-tracking misses writes through the views, so 10-13 GB/frame of title memory
+  read as changed — 0.2-0.5 fps, 793 slow kernel askings at 6161 ms/frame, 21.6 min
+  CPU in 4.5 min wall. `VICTORY_WINE_MAP=0` is now the launcher default (`5645d54`+);
+  the rbtree server already covers the map/unmap cost it exists for. run16 with it
+  off: back to 10-20 fps, intro rubberband gone (VICTORY_JOIN_PARTS_DRAWS=500).
+- **series-s broken** (above) and **run14's big UI/subtitles** were just 1080p-native
+  layout, not a bug.
+- **Muddy textures: SOLVED — the merge imported main's over_cap()** (resource.rs:1303,
+  after vitesse 7ada43b6): with VICTORY_TEXTURE_MAX unset, every streamed placed
+  texture's top mips are capped at 1024 px (512 at ≥92% of the DXGI budget, 256 at
+  ≥97%) — base_level() forces first = max(first, over_cap) and views are re-based so
+  sampling stays correct but the top mips are never on the card. The texstore can't
+  rescue them (staging refuses first != 0). Verified in-tree + absent pre-merge.
+  Launcher default now VICTORY_TEXTURE_MAX=0 (16 GB card; revisit if VRAM stalls).
+  Caveat: the PR's 27 ms numbers were measured WITH the cap — not comparable to
+  our pre-merge frames. Two minor merge defects noted by the agent (duplicate
+  aliasing barrier in PreludeUpload::record; claim_upload flag race on a failed
+  prelude list) — filed, harmless, unfixed.
+- Warmup-with-progress (zenity) being built by a subagent: pre-translation +
+  `victory warm --used` BEFORE the title launches, so cold starts don't play out
+  on screen. Lands before the next run.
+- run17 (the judgment run) waits for the user's ready: texture verdict + warmup in.

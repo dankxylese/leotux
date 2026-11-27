@@ -44,6 +44,7 @@ defaults "VICTORY_CACHE_DIR=C:\\users\\manse\\AppData\\Local\\$VICTORY_TREE\\cac
 # askings/frame). The rbtree server already covers the map/unmap cost it exists for.
 defaults VICTORY_LOG=info "VICTORY_LOG_FILE=Z:\\home\\manse\\A.Projects\\GTA6-Emulation\\LeoTux-logs\\victory-trace.log" \
          VICTORY_WINE_MAP=0 \
+         VICTORY_TEXTURE_MAX=0 \
          VICTORY_NO_WATCHDOG=1 \
          VICTORY_SKIP_INT3=1 \
          VICTORY_HAIR=1 \
