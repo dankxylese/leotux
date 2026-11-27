@@ -8,7 +8,7 @@ from [Leonida](https://github.com/ItsNotRexed/Leonida), whose own runtime is sti
 
 ## Where it stands (2026-11-26)
 
-Tested on one machine: Ryzen 7 5800x3d, 32 GB RAM, Radeon RX 7800 XT 12 GB, Arch Linux.
+Tested on one machine: Ryzen 7 5800x3d, 32 GB RAM, Radeon RX 7800 XT 16 GB, Arch Linux.
 
 | | |
 |---|---|
