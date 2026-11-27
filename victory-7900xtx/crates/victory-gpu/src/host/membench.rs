@@ -713,7 +713,8 @@ fn memory_bench_steady_state() {
 
 /// Pressure: what idles while the PC has room is kept (five minutes with
 /// 12 GiB free); told that only 1 GiB is free, the same idle memory is let
-/// go within a few seconds. Then what pressure does not reach is listed
+/// go within a few seconds, and so do idle scratch chunks and pooled lists
+/// (the RAM band of the sweep). Then what pressure does not reach is listed
 /// (and with `VICTORY_MEMBENCH_STRICT=1` asserted to come down).
 #[test]
 #[ignore = "on the card; a process of its own: cargo test -p victory-gpu --lib memory_bench_pressure_lets_idle_go -- --ignored --nocapture"]
@@ -782,10 +783,20 @@ fn memory_bench_pressure_lets_idle_go() {
         "idle windows are let go under pressure: {} alive",
         windows(&short)
     );
+    // The RAM band of the sweep (`host::trim_band`; `VICTORY_PRESSURE_TRIM=0`: not):
+    // idle scratch chunks and lists idle in the pool go too.
+    if std::env::var_os("VICTORY_PRESSURE_TRIM").is_none_or(|v| v != "0") {
+        for (class, what) in [("list scratch", "spare bytes"), ("host lists", "idle in the pool")] {
+            assert!(
+                value(&short, class, what) < value(&spiked, class, what),
+                "pressure lets go of {class} {what}: {} after the spike, {} under pressure",
+                value(&spiked, class, what),
+                value(&short, class, what)
+            );
+        }
+    }
     // What pressure does not reach.
     let kept: Vec<(&str, &str)> = [
-        ("host lists", "idle in the pool"),
-        ("list scratch", "spare bytes"),
         ("card copies", "fetch buffer (no relay)"),
         ("card copies", "fetch buffer (relay)"),
         ("process", "private bytes"),

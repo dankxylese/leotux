@@ -678,6 +678,10 @@ pub(crate) fn ram_sample() -> Option<(u64, u64, u64, u64, u64, u64)> {
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return None;
     }
+    #[cfg(test)]
+    if let Some(said) = FREE_RAM_SAID.load(Ordering::Relaxed).checked_sub(1) {
+        m.ullAvailPhys = said;
+    }
     let mut c = PROCESS_MEMORY_COUNTERS {
         cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
         ..Default::default()
@@ -694,6 +698,28 @@ pub(crate) fn ram_sample() -> Option<(u64, u64, u64, u64, u64, u64)> {
         m.ullTotalPhys,
         m.ullTotalPageFile,
     ))
+}
+
+/// The RAM band of the once-a-second sweep ([`sweep`]), kept between sweeps.
+static TRIM_BAND: std::sync::Mutex<RamBand> = std::sync::Mutex::new(RamBand::Calm);
+
+/// Whether the sweep lets idle caches go by the RAM band ([`ram_band`]: free RAM,
+/// commit headroom, this process's private bytes and working set): idle scratch
+/// chunks down to [`SPARE_MOST`] and host lists idle in the pool for 10 s
+/// (`Watch`), all idle chunks and lists idle for 2 s (`High`). Before, idle
+/// scratch was let go only with `VICTORY_RESIDENCY=1` and pooled lists never.
+/// On by default; `VICTORY_PRESSURE_TRIM=0`: as before.
+fn trim_band() -> RamBand {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PRESSURE_TRIM").is_none_or(|v| v != "0")) {
+        return RamBand::Calm;
+    }
+    let mut band = TRIM_BAND.lock().unwrap_or_else(|e| e.into_inner());
+    // (a failed sample keeps the last band)
+    if let Some((working, private, free, commit, total, limit)) = ram_sample() {
+        *band = ram_band(*band, working, private, free, commit, total, limit);
+    }
+    *band
 }
 
 /// How many references are held on a host object (its COM count): ours
@@ -737,8 +763,16 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    let band = trim_band();
+    if crate::residency::pressured() || band == RamBand::High {
         trim_spare_chunks();
+    } else if band == RamBand::Watch {
+        trim_spare_chunks_to(SPARE_MOST);
+    }
+    match band {
+        RamBand::Calm => {}
+        RamBand::Watch => crate::list::let_go_idle(10_000),
+        RamBand::High => crate::list::let_go_idle(2_000),
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -2341,13 +2375,23 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 /// Lets go of the scratch chunks kept idle, when the system is short of
 /// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
 fn trim_spare_chunks() {
+    trim_spare_chunks_to(0);
+}
+
+/// [`trim_spare_chunks`] down to `limit` bytes: those kept longest go first.
+fn trim_spare_chunks_to(limit: u64) {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
+        let (mut n, mut bytes) = (0, spare.bytes);
+        while bytes > limit && n < spare.kept.len() {
+            bytes -= spare.kept[n].1;
+            n += 1;
+        }
+        if n == 0 {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        spare.bytes = bytes;
+        spare.kept.drain(..n).collect()
     };
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
