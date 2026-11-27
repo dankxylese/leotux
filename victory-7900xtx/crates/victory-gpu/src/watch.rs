@@ -502,6 +502,37 @@ fn views_asked_line() {
     );
 }
 
+/// Whether an asking walks the pages without the kernel's reset, and resets
+/// only the pages it found written after (`VICTORY_ASK_NORESET=1`; off by
+/// default). What is answered is the same: a page found written is reset
+/// before the caller copies it, so a write after the walk is in the copy or
+/// seen by the next asking; a page not found is not reset.
+fn no_reset() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ASK_NORESET") {
+        return on;
+    }
+    // Read here: askings that reset only what they found.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_NORESET").is_some_and(|v| v == "1"))
+}
+
+/// Resets the write watch of the 4 KiB pages at `found` (in order), a run of
+/// neighbours at a time.
+fn reset_found(found: &[usize]) {
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    let mut i = 0;
+    while i < found.len() {
+        let mut k = i + 1;
+        while k < found.len() && found[k] == found[k - 1] + KERNEL_PAGE {
+            k += 1;
+        }
+        // SAFETY: pages the kernel just reported write-watched.
+        unsafe { ResetWriteWatch(found[i] as *const _, (k - i) * KERNEL_PAGE) };
+        i = k;
+    }
+}
+
 /// [`kernel_written`], with `flags` beside the reset ([`SPAN`]).
 fn kernel_written_as(first: usize, last: usize, flags: u32) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
@@ -521,10 +552,11 @@ fn kernel_written_as(first: usize, last: usize, flags: u32) -> Option<Vec<(usize
         let mut granularity = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let keep = no_reset();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET | flags,
+                if keep { flags } else { WRITE_WATCH_FLAG_RESET | flags },
                 (first * PAGE) as *const _,
                 (last - first) * PAGE,
                 found.as_mut_ptr().cast(),
@@ -541,6 +573,9 @@ fn kernel_written_as(first: usize, last: usize, flags: u32) -> Option<Vec<(usize
             // (On the timeline: how many askings the kernel refuses.)
             crate::timeline::span("asking refused").end();
             return None;
+        }
+        if keep {
+            reset_found(&found[..count]);
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -738,7 +773,7 @@ fn ask_early(every: std::time::Duration) {
                 idle = 0;
             }
             round += 1;
-            if round % 64 == 0 {
+            if round.is_multiple_of(64) {
                 hot.retain(|_, n| {
                     *n /= 2;
                     *n > 0
@@ -1765,6 +1800,11 @@ fn placeholder(block: usize) -> bool {
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
     const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
     const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003_u32 as i32;
+    // (Under Wine, a reservation that stands for one: the GPU side knows it
+    // by [`title_view_space`] and its pieces.)
+    if in_view_space(block * BLOCK) {
+        return true;
+    }
     // A host that does not know the class (Wine) is not asked again: there
     // the runtime's word stands in ([`told_hole_end`]).
     if PLACEHOLDERS_UNKNOWN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2834,7 +2874,9 @@ fn is_view(start: usize, end: usize) -> bool {
         if n == 0 {
             return false;
         }
-        if info.Type == MEM_MAPPED {
+        // (Under Wine, pages shown as memory of their own are private memory
+        // to the guards too, never read-only by our hand: `inplace::HOMES`.)
+        if info.Type == MEM_MAPPED || (info.State == MEM_COMMIT && in_view_space(at) && !crate::inplace::at_home(at, 1)) {
             return true;
         }
         // Committed memory that is no view (the title's heaps, ours), or
@@ -3560,7 +3602,7 @@ fn readable_view(at: usize) -> bool {
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0
         && info.State == MEM_COMMIT
-        && info.Type == MEM_MAPPED
+        && (info.Type == MEM_MAPPED || in_view_space(at))
         && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
 }
 
@@ -3956,6 +3998,11 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        // (Renderer port #6's fallback: who wrote the block last, for the
+        // marks it keeps, if it keeps any.)
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the context the system passes.
+        crate::port_descriptors::faulted(at, unsafe { (*context).Rip } as usize);
         // (Under the guards' lock, and not a block of theirs: nothing here
         // may wait for the lock.)
         if held {
@@ -4073,6 +4120,109 @@ mod parts_tests {
         assert_eq!(j.parts_since(9, 5), 0b100);
     }
 }
+
+/// Reservations of the title's in which memory comes to be only as its
+/// physical pages shown there, and which the host does not call views: under
+/// Wine the runtime shows those pages with the host kernel's `mmap` in plain
+/// reservations (`victory-hle`'s `wine_map`), and a query says "private" of
+/// them. Start and end, in order; none on Windows.
+static VIEW_SPACE: std::sync::RwLock<Vec<(usize, usize)>> = std::sync::RwLock::new(Vec::new());
+static VIEW_SPACE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The runtime made (`there`) or gave up such a reservation, or part of one,
+/// at `[at, at + len)` ([`VIEW_SPACE`]).
+pub fn title_view_space(at: usize, len: usize, there: bool) {
+    let (start, end) = (at, at.saturating_add(len));
+    let mut spaces = VIEW_SPACE.write().unwrap_or_else(|e| e.into_inner());
+    // What was known of the range goes; what lies beside it stays.
+    let mut now: Vec<(usize, usize)> = Vec::with_capacity(spaces.len() + 2);
+    for &(a, b) in spaces.iter() {
+        if a < start.min(b) {
+            now.push((a, start.min(b)));
+        }
+        if end.max(a) < b {
+            now.push((end.max(a), b));
+        }
+    }
+    if there && start < end {
+        now.push((start, end));
+    }
+    now.sort_unstable();
+    *spaces = now;
+    VIEW_SPACE_ANY.store(!spaces.is_empty(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `at` lies in a reservation of [`VIEW_SPACE`]: what is committed
+/// there is a view of the title's pages, whatever the host calls it.
+pub(crate) fn in_view_space(at: usize) -> bool {
+    if !VIEW_SPACE_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let spaces = VIEW_SPACE.read().unwrap_or_else(|e| e.into_inner());
+    let n = spaces.partition_point(|s| s.0 <= at);
+    n > 0 && at < spaces[n - 1].1
+}
+
+/// Renderer port #7's switch (`VICTORY_PORT_JOURNAL=1`, off by default):
+/// the heaps' records asked for at the title's submit (`crate::port_journal`)
+/// are here with it; the journal's notes in parts of their own
+/// ([`port_journal_counts`]) are not (see [`PORT_JOURNAL_PARTS_ABSENT`]).
+pub(crate) fn port_journal() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_JOURNAL") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_JOURNAL").is_some_and(|v| v == "1"))
+}
+
+/// Said once, where the frame line would count the journal's parts.
+const PORT_JOURNAL_PARTS_ABSENT: &str = "the journal's notes in parts of their own are not in this tree (the Wine tree keeps the journal whole)";
+
+/// Renderer port #7's journal counts: here only the word that the parts are
+/// not ([`PORT_JOURNAL_PARTS_ABSENT`]).
+pub(crate) struct PortJournalCounts;
+
+impl PortJournalCounts {
+    pub(crate) fn per_frame(&self, _frames: f64) -> &'static str {
+        PORT_JOURNAL_PARTS_ABSENT
+    }
+}
+
+/// [`PortJournalCounts`], taken.
+pub(crate) fn port_journal_counts() -> PortJournalCounts {
+    PortJournalCounts
+}
+
+/// Renderer port #6's guard planning (`VICTORY_PORT_GUARD=1`, off by
+/// default). Its guards, shared with the faults and their claims on blocks,
+/// are not in this tree's `watch`: the guards here are held alone, with the
+/// faults of our own memory let through under them ([`Held`]). Off, so the
+/// planning they make wider is not asked for.
+pub(crate) fn port_guard_plan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let set = *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD").is_some_and(|v| v != "0"));
+    if set {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                "VICTORY_PORT_GUARD is set, but renderer port 6's guards shared with the faults are not in this tree \
+                 (UPSTREAM.md): the guards are held alone, as before"
+            );
+        });
+    }
+    false
+}
+
+/// Renderer port #6's line of the frame lines: nothing here (no shared
+/// guards to count).
+#[allow(unused_variables)]
+pub(crate) fn port_guard_line(frames: f64) {}
+
+/// Renderer port #7's line of the askings made each range alone: nothing
+/// here (`crate::watch::ask_rest` asks them as before).
+#[allow(unused_variables)]
+pub(crate) fn alone_line(frames: f64) {}
 
 #[cfg(test)]
 mod tests {

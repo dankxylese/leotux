@@ -78,3 +78,70 @@ driver). `VICTORY_WARM_FIRST=0` starts the title at once.
 
 "present times" (diagnostics, `host.rs`, added here): every 5 s, the median, 95th and 99th percentile and longest
 time between presents, and the share over 50 ms; a 5-second mean frame rate hides a stutter, these show it.
+
+## Merged avatarmanz `main` `014d52d` and PR #440 (`born/linux-wine-pr`)
+
+2026-11-27, in a scratch repo (the LeoTux monorepo shares no history with avatarmanz, so this
+was a three-way merge through a synthetic base): this tree as one commit on `0a43566`, then
+`git merge avatarmanz/main` (`014d52d`, 186 commits after `0a43566`), then `git merge
+born/linux-wine-pr` ([borntofrag34](https://github.com/borntofrag34), PR #440, `deebee8`,
+written against `014d52d`: +4,181/-100, 36 files; its `docs/linux-wine.md` has the
+measurements). From main: the renderer ports (1, 2, 5, 6, 7), the compiler guard for AMD's
+driver, `VICTORY_PORT_CONSTANTS_ORDER`, FSR 4 through AMD's library, the pipeline book. From
+the PR: what makes the frame 27 to 28 ms at 1920x1080 there (`VICTORY_WINE_MAP`, the pipeline
+watcher for a worker the host ends, `VICTORY_COMPUTE_WAIT_MS`, `VICTORY_LIBRARY_NULL`,
+`VICTORY_SINGLE_LATCH`, `VICTORY_CLAMP_SYNC`, `VICTORY_CARD_BUFFERS_MIN_KB`, the frame
+intervals, `VICTORY_JOIN_PARTS_DRAWS`), `tests/fixtures/wine-bench`, and `scripts/play.sh` and
+`scripts/play-1080p.sh` as they came (this tree's launcher keeps its own settings).
+
+Conflicts, and what stayed where it does something the newer code does not:
+
+- `victory-gpu/src/watch.rs` (19 hunks: both trees reworked it): **this tree's** version, which
+  tracks the title's views (`VICTORY_VIEW_WATCH`, `title_memory_views_tracked`, the arenas of
+  placeholder reservations) and holds the guards alone with a fault of ours let through under
+  the lock (`Held`, `opened_held`). Main's guards are shared with the faults' claims only with
+  renderer port 6 on, and with it off a write of ours that faults under the lock waits for
+  itself. Ported in: the PR's `title_view_space`/`in_view_space` (its `wine_map` tells which
+  reservations have the pages it shows by the host's `mmap`) and, from main,
+  `VICTORY_ASK_NORESET`/`reset_found` and `refused_as_view` in the asking's filter. Stubbed so
+  that the modules beside it link: `port_journal` (the switch is read; the journal stays
+  whole), `port_journal_counts` (says so in the frame line), `port_guard_plan`,
+  `port_guard_line`, `alone_line` (off, nothing). Renderer port 6's shared guards and port 7's
+  journal parts are therefore not here: by the PR's own runs neither gains anything under Wine,
+  and port 6's one measurable effect there (protection changes trebled) is a loss.
+- `pipeline/library.rs`: both. Main's span, the PR's `VICTORY_LIBRARY_NULL` (an empty library
+  asked for with no address: vkd3d-proton refuses an empty slice's pointer), then this tree's
+  early pipeline list saved where there is no library at all.
+- `pipeline/make.rs`: main's compiler guard (`warm-bad.txt`, the vectored handler, a worker in
+  its place) and the PR's watcher for a worker the host ended, in one `spawn_worker`; the first
+  use tries this tree's `VICTORY_LEAVE_OUT`, then `VICTORY_RT_RESOLVE`, then the bad keys, and
+  makes the rest on a large stack (`on_a_large_stack`). The worker's stack is
+  `victory_shader::emit::PIPELINE_STACK` unless the PR's `VICTORY_PIPELINE_STACK_MB` says
+  otherwise; `VICTORY_PIPELINE_LOWEST` and the `LARGE_STACK` mark are this tree's.
+- `texture.rs`: the upload is deferred to the submission (`PreludeUpload`, as main and the PR
+  both have it); this tree's aliasing barrier before the first upload into a pooled block came
+  with it, now recorded in `PreludeUpload::record` where the copy is.
+- `ambient.rs`: main's newer shader and its settle plumbing (`probe`, `jump`, `fresh`, `dt`,
+  `least`) with this tree's reflections held to the light around in a seventeenth constant
+  (`VICTORY_AMBIENT_REFLECT`, `held`); the root signature is 17 constants wide.
+- `xmem.rs`: both. This tree's `title_memory_placeholder` (for reservations views come into)
+  beside main's `LOW_RESERVATIONS` (the title's 32-bit heap); the PR's `wine_map` `show`/`hide`
+  with this tree's `recent`/`count`/`census`; the PR's `free_in_space` in the title's `VirtualFree`.
+- `descriptor.rs`, `descriptor/host.rs`, `cores.rs`, `pool.rs`, `shadow.rs`, `queue.rs`,
+  `host/upq.rs`: main's (newer: the ranges a check looks at say whether port 2's fallback looks
+  at them whole; `Waiting`'s `since`/`waited`/`away`; `fast_by_class`/`fast_by_cache`;
+  `is_multiple_of`), with this tree's `made_at` mark kept in `pool::made_now`.
+- `host.rs`: main's frame lines (made by a thread of ours) and its present result, with this
+  tree's "present times", its batch retirement and the line that counts fine card passes put
+  back into it.
+- `inplace.rs`, `pipeline.rs`, `emit/mod.rs`, `emit/lower.rs`, `loader/lib.rs`, `lib.rs`: both
+  sides' additions, side by side. `README.md` is this tree's (the Linux fork's).
+- `emit/bitcode.rs`: one `single_latches`, the PR's (with `VICTORY_SINGLE_LATCH` and the test
+  that checks the latch's one join); this tree's second implementation and its test are gone.
+
+Checked: `cargo build --profile diag -p victory --features diagnostics --bins --target
+x86_64-pc-windows-msvc` (clean), `cargo test --release -p victory-shader --lib` (215 passed, 2
+ignored), and the Windows test binaries of `victory-gpu` (with `tests/replay*.rs`),
+`victory-hle` (`tests/fidelityfx.rs`, `tests/no_dll_planting.rs`) and `victory-loader`
+(`tests/title_dlls.rs`, `tests/load_probe.rs`) compile; none of them was run (a Linux host, no
+Wine here), and nothing in the title was measured.

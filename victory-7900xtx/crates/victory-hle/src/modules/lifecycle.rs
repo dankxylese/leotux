@@ -110,7 +110,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = place(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -136,7 +136,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = place(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -145,6 +145,56 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// `VICTORY_FULLSCREEN=1`: the title's top-level window becomes a borderless
+/// window covering the primary monitor (Wine maps it to a full-screen
+/// window); what it shows is scaled to it, as with [`fit`]. Otherwise the
+/// window is fitted to the work area.
+///
+/// `VICTORY_FULLSCREEN_AT=<x>,<y>,<width>,<height>` (with it): the window
+/// covers that rectangle of the desktop instead, another monitor's (the
+/// primary monitor's corner is 0,0; one to its left has a negative x).
+/// `scripts/play.sh` works it out for the output named in `VICTORY_SCREEN`.
+/// Unset: the primary monitor, as before.
+fn place(
+    parent: HWND,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, i32, i32, i32, i32) {
+    static FULLSCREEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fullscreen = *FULLSCREEN
+        .get_or_init(|| std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1"));
+    if fullscreen && parent.is_null() && style & wm::WS_CHILD == 0 {
+        static AT: std::sync::OnceLock<Option<(i32, i32, i32, i32)>> = std::sync::OnceLock::new();
+        let at = *AT.get_or_init(|| {
+            let value = std::env::var("VICTORY_FULLSCREEN_AT").ok()?;
+            let parsed = parse_screen_rect(&value);
+            if parsed.is_none() {
+                tracing::warn!(value, "VICTORY_FULLSCREEN_AT expects x,y,width,height: the primary monitor is used");
+            }
+            parsed
+        });
+        if let Some((left, top, w, h)) = at {
+            let style = (style & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP;
+            tracing::info!(width, height, at = ?(left, top), to = ?(w, h), "title window made full screen on the monitor asked for");
+            return (style, left, top, w, h);
+        }
+        // SAFETY: plain metric queries.
+        let (w, h) = unsafe {
+            (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN))
+        };
+        if w > 0 && h > 0 {
+            let style = (style & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP;
+            tracing::info!(width, height, to = ?(w, h), "title window made full screen");
+            return (style, 0, 0, w, h);
+        }
+    }
+    let (x, y, width, height) = fit(parent, x, y, width, height);
+    (style, x, y, width, height)
 }
 
 /// A console title sizes its window to its render target (
@@ -168,6 +218,13 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// `x,y,width,height` (`VICTORY_FULLSCREEN_AT`): a monitor's rectangle.
+fn parse_screen_rect(value: &str) -> Option<(i32, i32, i32, i32)> {
+    let mut parts = value.split(',').map(|part| part.trim().parse::<i32>());
+    let (x, y, width, height) = (parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?);
+    (parts.next().is_none() && width > 0 && height > 0).then_some((x, y, width, height))
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -528,6 +585,15 @@ mod tests {
             "2147483648x1080",
         ] {
             assert_eq!(parse_window_limit(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_screen_rectangle_is_four_numbers_and_may_lie_left_of_the_primary() {
+        assert_eq!(parse_screen_rect("2560,0,1920,1080"), Some((2560, 0, 1920, 1080)));
+        assert_eq!(parse_screen_rect(" -1920, 0, 1920, 1080 "), Some((-1920, 0, 1920, 1080)));
+        for bad in ["", "2560,0", "2560,0,1920", "2560,0,0,1080", "2560,0,1920,-1", "2560,0,1920,1080,1", "a,0,1920,1080"] {
+            assert_eq!(parse_screen_rect(bad), None, "{bad}");
         }
     }
 

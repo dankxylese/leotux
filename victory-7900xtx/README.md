@@ -12,7 +12,7 @@ It is not there yet.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## Where it stands (2026-11-26)
 
 Tested on one machine only: Linux 7.3 (CachyOS), Ryzen 9 9950X3D, 64 GB RAM,
 Radeon RX 9070 XT (16 GB) with RADV, Proton Hotfix `hotfix-20261110` (vkd3d-proton
@@ -89,6 +89,26 @@ scripts\play.ps1 -Exe <path of your copy's executable>
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
 something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
 
+For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
+`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
+`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
+`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
+
+`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
+the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
+and `performance` selects 1920×1080. All three output 3840×2160. With
+`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
+The log reports the provider at context creation and the actual input and
+output sizes at the first successful temporal dispatch. The title profile
+and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
+
+On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
+high-performance adapter with Shader Model 6.6. The runtime logs its adapter
+name, PCI vendor and device IDs, and dedicated VRAM. Set
+`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
+name to select it explicitly. With the launcher, pass
+`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
+
 Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell
@@ -99,6 +119,61 @@ target\diag\victory.exe warm --used                     # pipelines earlier runs
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
+
+## Linux (Wine)
+
+The same `victory.exe` runs under Wine with vkd3d-proton, started by
+`scripts/play.sh`, the counterpart of `play.ps1`. Measured on one PC (Ryzen 9
+9900X, Radeon RX 7900 GRE 16 GB with RADV of Mesa 26.3, Proton Experimental's
+Wine 11, kernel 7.3), Series X profile, ray tracing off, in the title's first
+scene: 2.3 frames a second before this work, 21 at 3840x2160, and 36 to 37 with
+`scripts/play-1080p.sh` (the title rendering at 1920x1080, renderer patches 1,
+2 and 5, the title let above its 30 frames a second). Everything that is
+Wine's alone is behind `on_wine()` or a switch and leaves Windows as it was.
+
+You need a Vulkan driver with mesh shaders, Proton (its Wine, vkd3d-proton and
+DXVK's `dxgi.dll` are copied into a prefix of their own; `PROTON=<folder>`
+names another than Steam's Proton Experimental), Microsoft's 64-bit
+`d3dcompiler_47.dll` (`D3DCOMPILER=<path>`; Wine's own cannot compile the
+runtime's shaders), Rust with the `x86_64-pc-windows-msvc` target and
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin), and your own dump of
+the title.
+
+```sh
+git clone https://github.com/avatarmanz/VIctory-7900XTX
+cd VIctory-7900XTX
+cp victory.example.toml victory.toml        # then set your paths as Wine sees them (Z:\home\...), outside this folder
+cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
+scripts/play.sh --cmd shaders                        # every shader of the title translated, once
+scripts/play.sh <your copy's executable>             # as play.ps1 does
+scripts/play-1080p.sh                                # GAME_EXE=<executable>: 1920x1080, the fastest settings measured
+```
+
+`scripts/play.sh --safe`, `--rt`, `--start` (into the first scene without the
+keyboard) and `KEY=VALUE` settings are described at the top of the script;
+`VICTORY_SCREEN=<output>` puts the window on another monitor than the primary
+one.
+
+What was found under Wine, with the runs behind each figure, the switches and
+what is still open: [docs/linux-wine.md](docs/linux-wine.md). In short:
+
+- Wine's server walked its list of views at every map and unmap: the title's
+  pages are shown with the host's `mmap` instead (`VICTORY_WINE_MAP`).
+- Programs with loops of several back edges ran vkd3d-proton's dxil-spirv out
+  of stack; they get one latch a loop (`VICTORY_SINGLE_LATCH`), and a pipeline
+  whose making ends its worker is given up (`VICTORY_PIPELINE_WATCH`).
+- Renderer patch 1 gave a black picture: amdgpu takes memory by address only as
+  one anonymous mapping, so the title's graphics pages are shown as one
+  (`VICTORY_PORT_HOME`).
+- People other than the heroine had no face in every second or third run: a
+  compute pass the title runs once was dropped while its pipeline was being
+  made. Compute passes wait for theirs (`VICTORY_COMPUTE_WAIT_MS`), and the
+  pipeline library is kept under Wine as on Windows (`VICTORY_LIBRARY_NULL`).
+- The waits around the layer's own clamps of indirect arguments emptied the
+  card under RADV; they name what they wait for (`VICTORY_CLAMP_SYNC`).
+
+Not looked at: any scene but the first, play, ray tracing, other cards and
+drivers.
 
 ## What is different here
 

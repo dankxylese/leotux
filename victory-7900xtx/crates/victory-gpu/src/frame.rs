@@ -8,6 +8,12 @@
 //!
 //! shortcut: event offsets are ignored (every event is at the tick); tie
 //! the clock to presentation if a title paces by them.
+//!
+//! `VICTORY_FRAME_INTERVAL_MS=<ms>` ticks at that interval whatever the
+//! title sets (16.667: 60 a second; 0: no wait at all, every wait ends at
+//! once); unset, the title's interval as before. The loader gives the title
+//! the matching frame rate too (`victory_loader::frame_rate`), as the title
+//! would otherwise keep to its 30 with a limiter of its own.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
@@ -24,6 +30,73 @@ const ORIGIN: u32 = 0;
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
+
+/// `VICTORY_FRAME_INTERVAL_MS`: the interval asked for in place of the
+/// title's (zero: no wait). Read once.
+fn asked() -> Option<Duration> {
+    static ASKED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
+        let ms = parse_ms(&spec);
+        match ms {
+            Some(d) => tracing::info!(interval = ?d, "frame interval of ours in place of the title's (VICTORY_FRAME_INTERVAL_MS)"),
+            None => tracing::warn!(spec, "VICTORY_FRAME_INTERVAL_MS: expected milliseconds from 0 to 1000; the title's interval kept"),
+        }
+        ms
+    })
+}
+
+/// `16.667` → 16,667 us; 0 → zero; negative, more than a second or not a
+/// number → `None`.
+fn parse_ms(spec: &str) -> Option<Duration> {
+    let ms = spec.trim().parse::<f64>().ok().filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))?;
+    Some(Duration::from_nanos((ms * 1e6).round() as u64))
+}
+
+/// `VICTORY_FRAME_INTERVAL_DRAWS=<n>` (read here; with
+/// `VICTORY_FRAME_INTERVAL_MS`, and unset: that interval for every frame, as
+/// before): the interval asked for only after a frame that ran `n` draws or
+/// more, and the title's own 33.3 ms after the others (from the start, and
+/// again after thirty of them in a row).
+///
+/// The title's opening animation and videos are made for its 30 frames a
+/// second. Ticked at 60 with the launcher's settings, 7 of 100 frames in a
+/// row of the animation were the frame before again, a hitch every fourteenth
+/// frame, and 58 of 100 of a video of 24 pictures a second, two and three
+/// ticks a picture by turns (run 98, docs/linux-wine.md). With this the
+/// videos and menus tick as the title has them and the world as asked.
+fn interval_from_draws() -> Option<u64> {
+    static LEAST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LEAST.get_or_init(|| std::env::var("VICTORY_FRAME_INTERVAL_DRAWS").ok().and_then(|v| v.trim().parse::<u64>().ok()))
+}
+
+/// The title's own interval of menus and videos.
+const THIRTIETH: Duration = Duration::from_micros(33_333);
+
+/// A frame was presented that ran `draws` draws: the clock ticks by what
+/// [`interval_from_draws`] says of it from now on.
+pub(crate) fn frame_drew(draws: u64) {
+    let (Some(least), Some(fast)) = (interval_from_draws(), asked()) else {
+        return;
+    };
+    // Back to the title's own only after a second of such frames: a frame of
+    // the world can count few draws (its lists are translated into the
+    // frame after), and the clock changed 183 times in 100 s without this
+    // (run 99).
+    static FEW: AtomicU64 = AtomicU64::new(u64::MAX / 2);
+    let few = if draws < least { FEW.fetch_add(1, Ordering::Relaxed) + 1 } else { FEW.swap(0, Ordering::Relaxed) * 0 };
+    let wanted = if few >= 30 { THIRTIETH.max(fast) } else { fast };
+    let mut clock = clock();
+    let Some(c) = clock.as_mut() else { return };
+    if c.interval == wanted {
+        return;
+    }
+    // As a new interval set by the title: from now, after the last tick
+    // handed out.
+    let first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
+    *c = Clock { start: Instant::now(), interval: wanted, first };
+    tracing::info!(interval = ?wanted, draws, "frame interval by the frame's draws (VICTORY_FRAME_INTERVAL_DRAWS)");
+}
 
 struct Clock {
     start: Instant,
@@ -49,11 +122,12 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked_by_title = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = asked().unwrap_or(asked_by_title);
+    tracing::info!(?interval, title = ?asked_by_title, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -105,9 +179,14 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        interval: asked().unwrap_or(SIXTIETH),
         first: 0,
     });
+    if c.interval.is_zero() {
+        // No wait: every wait ends at once, on a tick of its own.
+        let tick = last(kind).load(Ordering::Relaxed) + 1;
+        return (tick, Duration::ZERO);
+    }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =
@@ -153,7 +232,9 @@ pub(crate) extern "system" fn wait(
         std::thread::sleep(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
@@ -167,6 +248,7 @@ pub(crate) extern "system" fn wait(
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        pace::begun();
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };
@@ -184,6 +266,81 @@ pub(crate) extern "system" fn wait(
         "frame wait"
     );
     hr
+}
+
+/// How even the frames are (`VICTORY_TIMER_LOG=1`): the times between frame
+/// beginnings, logged every 5 s by bands, with the pairs of a short frame
+/// next to a long one (a 16/33 alternation shows as many of them).
+mod pace {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Upper edges of the bands, in milliseconds (the last band is open).
+    const BANDS: [f64; 6] = [12.0, 20.0, 28.0, 38.0, 55.0, 70.0];
+
+    struct Stats {
+        since: Instant,
+        last: Option<Instant>,
+        last_ms: f64,
+        bands: [u32; 7],
+        sum_ms: f64,
+        max_ms: f64,
+        n: u32,
+        alternations: u32,
+    }
+
+    static STATS: Mutex<Option<Stats>> = Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_TIMER_LOG").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    pub(super) fn begun() {
+        if !on() {
+            return;
+        }
+        let now = Instant::now();
+        let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = stats.get_or_insert_with(|| Stats {
+            since: now,
+            last: None,
+            last_ms: 0.0,
+            bands: [0; 7],
+            sum_ms: 0.0,
+            max_ms: 0.0,
+            n: 0,
+            alternations: 0,
+        });
+        if let Some(last) = s.last.replace(now) {
+            let ms = (now - last).as_secs_f64() * 1e3;
+            let band = BANDS.iter().position(|&edge| ms < edge).unwrap_or(BANDS.len());
+            s.bands[band] += 1;
+            s.sum_ms += ms;
+            s.max_ms = s.max_ms.max(ms);
+            if s.n > 0 && (ms < 20.0 && s.last_ms > 28.0 || ms > 28.0 && s.last_ms < 20.0) {
+                s.alternations += 1;
+            }
+            s.last_ms = ms;
+            s.n += 1;
+        }
+        if now - s.since >= Duration::from_secs(5) && s.n > 0 {
+            tracing::info!(
+                frames = s.n,
+                mean_ms = format_args!("{:.2}", s.sum_ms / f64::from(s.n)),
+                max_ms = format_args!("{:.1}", s.max_ms),
+                bands = ?s.bands,
+                alternations = s.alternations,
+                "frame pacing: times between frame beginnings (bands <12, <20, <28, <38, <55, <70, more ms)"
+            );
+            s.since = now;
+            s.bands = [0; 7];
+            s.sum_ms = 0.0;
+            s.max_ms = 0.0;
+            s.n = 0;
+            s.alternations = 0;
+        }
+    }
 }
 
 /// Device method: no statistics are kept, so none are returned.
@@ -204,6 +361,17 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_reads_milliseconds() {
+        assert_eq!(parse_ms("16.667"), Some(Duration::from_micros(16_667)));
+        assert_eq!(parse_ms(" 8.333 "), Some(Duration::from_micros(8_333)));
+        assert_eq!(parse_ms("0"), Some(Duration::ZERO));
+        assert_eq!(parse_ms("-1"), None);
+        assert_eq!(parse_ms("1001"), None);
+        assert_eq!(parse_ms("NaN"), None);
+        assert_eq!(parse_ms("fast"), None);
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {

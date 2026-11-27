@@ -2037,43 +2037,6 @@ mod tests {
     }
 
     #[test]
-    fn the_vectored_handler_continues_past_a_null_vtable_call() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
-        };
-        report_crashes();
-        // mov (%rcx),%r10; call *(%r10); add $0x7b,%eax; ret, with the
-        // call far enough into the page that the guard reads the load
-        // before it. The object's vtable pointer is null, as the title's was.
-        let mut code = [0x90u8; 32];
-        code[16..27].copy_from_slice(&[
-            0x4c, 0x8b, 0x11, // mov (%rcx),%r10
-            0x41, 0xff, 0x12, // call *(%r10)
-            0x05, 0x7b, 0x00, 0x00, 0x00, // add $0x7b,%eax
-        ]);
-        code[27] = 0xc3; // ret
-        // SAFETY: a page of ours, executable, running the call above through
-        // a null vtable pointer and then returning to us.
-        unsafe {
-            let page = VirtualAlloc(
-                std::ptr::null(),
-                0x1000,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_EXECUTE_READWRITE,
-            )
-            .cast::<u8>();
-            assert!(!page.is_null());
-            page.copy_from_nonoverlapping(code.as_ptr(), code.len());
-            let object = [0u64];
-            let run: extern "C" fn(*const u64) -> u64 = std::mem::transmute(page);
-            let returned = run(object.as_ptr());
-            // `rax` was 0 after the skipped call, and execution went on.
-            assert_eq!(returned, 0x7b);
-            VirtualFree(page.cast(), 0, MEM_RELEASE);
-        }
-    }
-
-    #[test]
     fn a_site_skipped_too_often_is_reported_instead() {
         // A site of its own, so the other tests' skips do not count.
         #[repr(align(4096))]

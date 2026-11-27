@@ -149,7 +149,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     // (Counted only, while a thread of ours makes a stream's calls:
     // `batch_begin`.)
@@ -242,6 +242,13 @@ pub(crate) struct Detached {
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
+    }
+
+    /// Releases this list's dynamic descriptor slots once its GPU submission
+    /// has completed, without waiting for the full `bury_lag` (64 submissions)
+    /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
     }
 }
 
@@ -1898,6 +1905,17 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOTALS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Since the start, never reset (`crate::popwatch` takes the difference
+/// between two presented frames): draws of any kind, dispatches, indirect
+/// executions.
+static TOTALS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// See [`TOTALS`].
+pub(crate) fn totals() -> [u64; 3] {
+    TOTALS.each_ref().map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -1927,6 +1945,7 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    TOTALS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -1977,6 +1996,7 @@ pub(crate) fn take_indirect() -> u64 {
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOTALS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[cfg(not(windows))]
 extern "system" fn dispatch(_: This) {
@@ -2168,15 +2188,131 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// Diagnostics: the title's barrier groups read as the PC's structures: a
+/// group of 16 bytes (kind, count, pointer); a global barrier of 16 bytes
+/// (kind 0), a texture's of 64 (kind 1), a buffer's of 40 (kind 2), each
+/// beginning with the work before and after and the accesses before and
+/// after, a texture's with its layouts before and after next. `each` gets a
+/// barrier's kind and those six words (the layouts 0 but for a texture).
+/// False if a group does not look like one of these (the rest is not read).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn each_barrier(count: u32, groups: *const u8, mut each: impl FnMut(u32, [u32; 6])) -> bool {
+    if groups.is_null() {
+        return false;
+    }
+    for g in 0..count as usize {
+        // SAFETY: the title passes `count` groups.
+        let (kind, barriers, first) = unsafe {
+            let at = groups.add(16 * g);
+            (at.cast::<u32>().read_unaligned(), at.add(4).cast::<u32>().read_unaligned(), at.add(8).cast::<usize>().read_unaligned())
+        };
+        let stride = match kind {
+            0 => 16,
+            1 => 64,
+            2 => 40,
+            _ => return false,
+        };
+        if barriers > 4096 || (barriers > 0 && first < 0x10000) {
+            return false;
+        }
+        for b in 0..barriers as usize {
+            // SAFETY: that many barriers of the kind's size, as the group says.
+            let w = unsafe {
+                let at = (first as *const u8).add(stride * b);
+                let w: [u32; 4] = at.cast::<[u32; 4]>().read_unaligned();
+                let layouts: [u32; 2] = if kind == 1 { at.add(16).cast::<[u32; 2]>().read_unaligned() } else { [0, 0] };
+                [w[0], w[1], w[2], w[3], layouts[0], layouts[1]]
+            };
+            each(kind, w);
+        }
+    }
+    true
+}
+
+/// Diagnostics (`VICTORY_BARRIER_GROUPS_LOG=1`, read here): what the title's
+/// barrier groups ask for ([`each_barrier`]). Every 100,000 barriers the
+/// commonest are logged, with how many calls named a barrier that waits for
+/// a shader write (what stood before it was unordered access, or the common
+/// access, which says nothing: the only ones the wait the host records for a
+/// group is for) and of those the calls whose such barriers wait for compute
+/// alone. Nothing changes in what is recorded.
+///
+/// In the title's first scene (run 50 of docs/linux-wine.md): 800 calls a
+/// frame of four barriers each; a fifth of the calls name no such barrier,
+/// one in twenty-five waits for compute by name, and the rest name every
+/// shader stage on both sides, as the title does throughout.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn count_groups(count: u32, groups: *const u8) {
+    use std::collections::HashMap;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BARRIER_ACCESS_NO_ACCESS, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_NONE,
+    };
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_GROUPS_LOG").is_some_and(|v| v == "1")) || groups.is_null() {
+        return;
+    }
+    /// Barriers by what they ask; then barriers, calls, calls with a barrier
+    /// that waits for a shader write, those of them that wait for compute
+    /// alone, and calls not all read.
+    type Seen = (HashMap<[u32; 7], u64>, [u64; 5]);
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (by, n) = seen.get_or_insert_with(Default::default);
+    let (mut barriers, mut work) = (0u64, 0u32);
+    let read = each_barrier(count, groups, |kind, w| {
+        *by.entry([kind, w[0], w[1], w[2], w[3], w[4], w[5]]).or_default() += 1;
+        barriers += 1;
+        let (before, access) = (w[0], w[2]);
+        if before != D3D12_BARRIER_SYNC_NONE.0 as u32
+            && access != D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32
+            && (access == 0 || access & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32 != 0)
+        {
+            work |= before;
+        }
+    });
+    n[0] += barriers;
+    n[1] += 1;
+    n[2] += u64::from(work != 0);
+    n[3] += u64::from(work == D3D12_BARRIER_SYNC_COMPUTE_SHADING.0 as u32);
+    n[4] += u64::from(!read);
+    if n[0] >= 100_000 {
+        let mut all: Vec<_> = by.drain().collect();
+        all.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        tracing::info!(
+            "the title's barrier groups (VICTORY_BARRIER_GROUPS_LOG): {} barriers in {} calls; {} calls with a barrier that waits for a shader write, {} of them for compute alone; {} calls not all read; {} kinds of barriers, the commonest follow",
+            n[0], n[1], n[2], n[3], n[4], all.len()
+        );
+        for (k, count) in all.into_iter().take(24) {
+            tracing::info!(
+                "  {count} barriers: kind {} (0 global, 1 texture, 2 buffer), work before {:#x} after {:#x}, access before {:#x} after {:#x}, layout before {:#x} after {:#x}",
+                k[0], k[1], k[2], k[3], k[4], k[5], k[6]
+            );
+        }
+        *n = [0; 5];
+    }
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
+///
+/// Under Wine that wait was tried lighter: none where a call names no
+/// barrier after unordered access, and one for compute passes alone where
+/// the groups name those alone or no draw of the list since its last full
+/// wait has a shader that can store. Four calls in five were recorded so,
+/// and the frame was the same in both trees (runs 53 and 55 of
+/// docs/linux-wine.md, by turns in one run: 30.1 ms against 30.2, 33.5
+/// against 32.5): unlike the waits around our clamps (`crate::indirect`'s
+/// `narrow`), these are not what the card stands still for. Taken out again.
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+    // Diagnostics: counted (with what the groups ask for, where the title's
+    // structures still stand: `count_groups`), and left out under
+    // `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
+        count_groups(count, _groups);
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         if crate::copystat::barrier_test() & 1 != 0 {
             return;

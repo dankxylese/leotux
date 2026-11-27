@@ -356,11 +356,52 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     // the unwinder's own.
     unsafe {
         if GetThreadContext(thread, &mut context.0) != 0 {
-            unwind_into(context.0, low, high, &mut frames);
+            if on_wine() {
+                scan_into(&context.0, low, high, &mut frames);
+            } else {
+                unwind_into(context.0, low, high, &mut frames);
+            }
         }
         ResumeThread(thread);
     }
     (frames, (info.priority, info.base_priority, info.affinity))
+}
+
+/// Whether the host is Wine (its ntdll says which version).
+fn on_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: plain lookups in ntdll, always loaded.
+    *WINE.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    })
+}
+
+/// [`unwind_into`] for Wine, where unwinding another thread's frames faults
+/// in ntdll's `RtlVirtualUnwind` (a read of address 0, run 12: the profile
+/// ended the title as it began): the thread's instruction, then the words of
+/// its stack that point where images are loaded, nearest first. Not every
+/// such word is a return address of a call still under way; the first ones
+/// mostly are.
+fn scan_into(context: &CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+    frames.push(context.Rip);
+    // (The executable's own range, and where Wine loads other images.)
+    let image = |at: u64| (0x1_4000_0000..0x1_8000_0000).contains(&at) || (0x6f00_0000_0000..0x7000_0000_0000).contains(&at);
+    let rsp = (context.Rsp as usize).next_multiple_of(8);
+    if rsp < low || rsp >= high {
+        return;
+    }
+    for at in (rsp..high.min(rsp + (32 << 10))).step_by(8) {
+        if frames.len() == MAX_FRAMES {
+            break;
+        }
+        // SAFETY: inside the suspended thread's committed stack.
+        let word = unsafe { (at as *const u64).read() };
+        if image(word) && frames.last() != Some(&word) {
+            frames.push(word);
+        }
+    }
 }
 
 pub(crate) fn start_of(thread: HANDLE) -> usize {

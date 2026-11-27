@@ -53,6 +53,10 @@ pub struct Search {
     pub wait_all: bool,
     /// Experiments on the frame.
     pub options: Options,
+    /// With [`Player::watch`]: words written into buffers right before a
+    /// list runs (list, resource, offset, words): what the list makes of
+    /// other memory.
+    pub pokes: Vec<(u32, u32, u64, Vec<u32>)>,
 }
 
 impl Player {
@@ -821,6 +825,13 @@ impl Player {
                 let here = global;
                 global += 1;
                 let inside = s.lists.is_some_and(|(a, b)| (a..=b).contains(&here));
+                // (A submission's first list brings the copies of what the
+                // CPU wrote, over what is written here: poke a later one.)
+                for (_, id, at, values) in s.pokes.iter().filter(|p| p.0 == here) {
+                    self.poke(*id, *at, values)?;
+                    say(format!("before list {here}: {} words written into #{id} at {at:#x}", values.len()));
+                    was = words(self)?;
+                }
                 let mut cuts: Vec<usize> = vec![0];
                 if inside {
                     cuts.extend((0..cmds.len()).filter(|&c| cmds[c].works()).map(|c| c + 1));
@@ -990,6 +1001,28 @@ impl Player {
     }
 
     /// `len` bytes of a buffer from `at`.
+    /// Writes `words` into the buffer `id` at `at` (an experiment's).
+    fn poke(&mut self, id: u32, at: u64, words: &[u32]) -> Result<()> {
+        let o = self.objects.get(&id).with_context(|| format!("no resource {id} to write into"))?;
+        let len = words.len() as u64 * 4;
+        anyhow::ensure!(
+            at.checked_add(len).is_some_and(|end| end <= self.frame.resources[o.index].desc.width),
+            "the words written into {id} go past its end"
+        );
+        if len == 0 {
+            return Ok(());
+        }
+        let res = o.res.clone();
+        let (up, data) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_UPLOAD, len, D3D12_RESOURCE_FLAG_NONE)?;
+        // SAFETY: the mapping of `len` bytes just made.
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), data, len as usize) };
+        self.worker.run(|list| {
+            // SAFETY: an open list; live buffers.
+            unsafe { list.CopyBufferRegion(&res, at, &up, 0, len) };
+        })?;
+        Ok(())
+    }
+
     fn slice(&mut self, id: u32, at: u64, len: u64) -> Result<Vec<u8>> {
         let Some(o) = self.objects.get(&id) else {
             return Ok(Vec::new());
@@ -1154,6 +1187,17 @@ impl Player {
                                 say(format!("  slot {base}+{k}: never written"));
                             }
                         }
+                        // Their twins in the half of raw views (what a
+                        // constant buffer is read through, patch 5), where
+                        // one is written. (Where that half starts is the
+                        // run's: 2^21 in the captures made so far.)
+                        let raw = 0x20_0000;
+                        for k in 0..12 {
+                            let s = self.slot_at(heap, (base + k) | raw, i);
+                            if s.kind != slot::EMPTY {
+                                say(format!("  raw slot {base}+{k}: {}", self.slot_text(&s)));
+                            }
+                        }
                     }
                 }
                 here += 1;
@@ -1214,7 +1258,7 @@ impl Player {
                 word(if s.kind == slot::SRV { 4 } else { 2 }),
                 word(if s.kind == slot::SRV { 6 } else { 4 }),
                 word(if s.kind == slot::SRV { 7 } else { 5 }),
-                word(if s.kind == slot::SRV { 8 } else { 8 }),
+                word(8),
             ),
         }
     }

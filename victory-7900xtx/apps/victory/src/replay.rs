@@ -115,6 +115,12 @@ pub(crate) struct Replay {
     /// `<resource>:<offset>:<bytes>` (hexadecimal; repeatable).
     #[arg(long)]
     watch: Vec<String>,
+    /// With --watch: write words into a buffer right before a list runs,
+    /// `<list>:<resource>:<offset>:<word>[,<word>...]` (offset and words
+    /// hexadecimal; repeatable). Not a submission's first list: the copies
+    /// of what the CPU wrote come with it, over these.
+    #[arg(long)]
+    poke: Vec<String>,
     /// With --diverge-picture and one list in --lists: its commands (`0..900`)
     /// and how many are stepped over at a time.
     #[arg(long)]
@@ -399,12 +405,24 @@ pub(crate) fn run(r: Replay) -> Result<()> {
             Some(text) => Some(range(text).with_context(|| format!("--lists {text}"))?),
             None => None,
         };
+        let mut pokes = Vec::new();
+        for text in &r.poke {
+            let parts: Vec<&str> = text.split(':').collect();
+            let parsed = (|| {
+                let [list, id, at, words] = parts.as_slice() else { return None };
+                let words: Option<Vec<u32>> = words.split(',').map(|w| u32::from_str_radix(w.trim_start_matches("0x"), 16).ok()).collect();
+                Some((list.parse().ok()?, id.parse().ok()?, u64::from_str_radix(at.trim_start_matches("0x"), 16).ok()?, words?))
+            })();
+            pokes.push(parsed.with_context(|| format!("--poke {text}: expected <list>:<resource>:<offset>:<word>[,<word>...]"))?);
+        }
+        anyhow::ensure!(pokes.is_empty() || !watched.is_empty(), "--poke goes with --watch");
         let search = play::diverge::Search {
             runs: runs.max(2),
             lists,
             roots: r.roots,
             wait_all: options.wait_all,
             options: options.clone(),
+            pokes,
         };
         let mut player = play::Player::load(&r.folder, &options)?;
         if !watched.is_empty() {

@@ -1913,7 +1913,29 @@ unsafe extern "system" fn copy_descriptors(
 unsafe extern "system" fn execute(this: Ptr, n: u32, lists: *const Ptr) {
     // SAFETY: `n` closed lists, as D3D12 asks; the state is the queue's.
     unsafe {
-        let go = || own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+        let go = || {
+            // Under Wine the lists go to the host with their own method
+            // tables, and point at their shims again after: vkd3d-proton
+            // knows a list of its own by its table
+            // (`d3d12_command_list_from_iface` answers null for any other),
+            // and its `ExecuteCommandLists` read through that null at the
+            // first submission (runs 47, 48 and 59 of docs/linux-wine.md: a
+            // fault in d3d12core reading 0x2b20). Closed lists: no other
+            // thread calls them meanwhile.
+            let mut bare: Vec<(Ptr, usize)> = Vec::new();
+            if crate::pipeline::on_wine() && !lists.is_null() {
+                for &list in std::slice::from_raw_parts(lists, n as usize) {
+                    if !list.is_null() && hook::ours(list) {
+                        bare.push((list, hook::table(list)));
+                        hook::remove(list);
+                    }
+                }
+            }
+            own!(this, ID3D12CommandQueue_Vtbl.ExecuteCommandLists)(this, n, lists);
+            for (list, shim) in bare {
+                list.cast::<usize>().write(shim);
+            }
+        };
         let Some(r) = recorder().filter(|_| !ours()) else {
             return go();
         };

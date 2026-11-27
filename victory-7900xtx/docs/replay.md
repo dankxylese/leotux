@@ -122,8 +122,9 @@ report counts them). `--no-merge` runs the copies as recorded.
 | `--diverge [runs]` | runs each list this often from the very same memory, finds the first commands that make different memory of it, and says what differs (same values in another order: places given out); contents go to `diverge` in the capture |
 | `--diverge-picture [runs]` | from each list on, runs the rest this often from the same memory: where the pictures start to agree, what lies before decides. `--lists 76 --commands 0..900 --step 8` goes into one list |
 | `--diverge 10 --lists 76 --draws <text>` | each draw of the pipelines named, alone, this often: how many outcomes, and what it reads |
-| `--watch <id>:<offset>:<bytes>` | which lists (with `--lists`: commands) change those words |
-| `--slots <list>:<command>` | the heap slots its constants name |
+| `--watch <id>:<offset>:<bytes>` | which lists (with `--lists`: commands) change those words (offset and bytes hexadecimal); the words at the start, then each change |
+| `--slots <list>:<command>` | the heap slots its constants name, and their twins in the half of raw views where one is written (what a constant buffer is read through with `VICTORY_PORT_CBV=1`) |
+| `--poke <list>:<id>:<offset>:<word>[,<word>...]` | with `--watch`: writes those words (hexadecimal, as the offset) into a buffer right before that list runs, to see what the list makes of other memory. Not a submission's first list: the copies of what the CPU wrote come with it, over them |
 | `--check-written` | that everything the frame changes is put back |
 | `--upcopies` | runs the frame twice: which words the copies of the CPU's sides of card buffers bring that the card holds another value of (those the card wrote alike in both runs are the ones to look at), and which pieces shaders wrote that were not declared as written. The live check is `VICTORY_UPCOPY_CHECK=1` (`host/upcheck.rs`) |
 | `--flow <lists>` | what the dispatches (`--flow-draws`: draws too) have bound: pipeline, root arguments, heap slots their constants lead to; no device is made |

@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -35,6 +37,8 @@ pub mod xgame;
 pub mod xgameruntime;
 pub mod xgamesave;
 pub mod xgameui;
+#[cfg(windows)]
+mod wine_map;
 #[cfg(windows)]
 pub mod xmem;
 pub mod xnetworking;
@@ -72,5 +76,9 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(windows)]
+    if fidelityfx::serving() {
+        all.push(fidelityfx::module());
+    }
     all
 }

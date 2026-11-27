@@ -1,0 +1,16 @@
+# What the kernel calls the write watch and the guards make cost on this host: under Wine each of
+# them goes through ntdll's Unix side and its one lock for the address space. NOT a workspace
+# member; no dependencies. Built and run by hand (docs/linux-wine.md):
+#   cargo xwin build --release --target x86_64-pc-windows-msvc
+#   wine target/x86_64-pc-windows-msvc/release/wine-bench.exe
+[package]
+name = "wine-bench"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[profile.release]
+panic = "abort"
+
+[workspace]

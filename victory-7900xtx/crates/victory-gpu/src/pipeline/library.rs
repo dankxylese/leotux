@@ -446,6 +446,7 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            let _opening = crate::timeline::span("pipeline: open the host pipeline library");
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
@@ -457,30 +458,38 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// Whether an empty library is asked for with a null address (see [`open`]):
+/// under Wine, unless `VICTORY_LIBRARY_NULL=0`.
+fn null_when_empty() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| super::on_wine() && std::env::var_os("VICTORY_LIBRARY_NULL").is_none_or(|v| v != "0"))
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // An empty library is asked for with a null blob, as the method's
-        // documentation has it: the binding's slice form passes an empty
-        // slice's dangling pointer with length 0, which Windows accepts and
-        // vkd3d-proton refuses (E_INVALIDARG), so under Wine no library was
-        // ever made and no pipeline kept.
-        if bytes.is_empty() {
-            let mut out = std::ptr::null_mut();
-            // SAFETY: the method's own signature, on our device; `out` is
-            // read only after success, when it holds one reference of ours.
-            return unsafe {
-                (Interface::vtable(device).CreatePipelineLibrary)(
-                    Interface::as_raw(device),
+        // Under Wine an empty library is asked for with no address at all:
+        // vkd3d-proton refuses a blob of no bytes that has one (an empty
+        // slice's is not null), so no library was ever made there, no
+        // pipeline kept and none started early: "no host pipeline library:
+        // pipelines are not kept" in every run's log, and each run made the
+        // world's pipelines at its first frames (docs/linux-wine.md).
+        // `VICTORY_LIBRARY_NULL=0`: asked as on Windows.
+        if bytes.is_empty() && null_when_empty() {
+            let mut made: Option<ID3D12PipelineLibrary> = None;
+            // SAFETY: the method's own signature; no bytes are read.
+            unsafe {
+                (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
+                    windows::core::Interface::as_raw(device),
                     std::ptr::null(),
                     0,
-                    &ID3D12PipelineLibrary1::IID,
-                    &mut out,
+                    &<ID3D12PipelineLibrary as windows::core::Interface>::IID,
+                    (&raw mut made).cast(),
                 )
                 .ok()?;
-                Ok(ID3D12PipelineLibrary1::from_raw(out))
-            };
+            }
+            return made.ok_or_else(windows::core::Error::empty)?.cast();
         }
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
@@ -540,6 +549,10 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    let create = || {
+        let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
+        create()
+    };
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
@@ -547,9 +560,11 @@ pub(crate) fn pipeline(
     };
     let began = std::time::Instant::now();
     let loaded = {
+        let mut loading = crate::timeline::span("pipeline: acquire library load guards");
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
+        loading.next("pipeline: load a PSO from the driver library");
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
     // The load read the library's file (see `trim`).
@@ -579,9 +594,11 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    let mut storing = crate::timeline::span("pipeline: acquire library store guards");
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
+    storing.next("pipeline: store a PSO in the driver library");
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
@@ -603,6 +620,7 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let _saving = crate::timeline::span("pipeline: save the library and early list");
     let Some(library) = library() else {
         // No library (vkd3d-proton refuses one; its own disk cache keeps the
         // compiled pipelines): the early list is still kept, so the next run
@@ -643,6 +661,7 @@ pub(crate) fn save(now: bool) {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
+            let _writing = crate::timeline::span("pipeline: serialize the library to disk");
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
