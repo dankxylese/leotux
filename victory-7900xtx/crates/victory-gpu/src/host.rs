@@ -2691,33 +2691,6 @@ fn relay_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
 }
 
-/// How many stages a landing's fetch is cut into, its copy given to the queue
-/// all at once and each stage waited for only when its merge begins
-/// (`VICTORY_RELAY_AHEAD`: 4; `=0` one list, one wait, the whole fetch, as
-/// before; 1 to 8, else).
-///
-/// The thread that lands flights stands 26.2-26.7 ms of a 75 ms frame
-/// waiting for the fetches of card copies' pieces (run 102: 1,561 pieces,
-/// 91.6 MB, 11.7 landings), and 18.4 ms merging them; the fetching is a copy
-/// engine's work and the merging this thread's and its helpers', and nothing
-/// makes one wait for the other but the order they were written in. Cut in
-/// stages, the second stage's bytes fly while the first is merged, and only
-/// the first stage's flight is exposed.
-///
-/// What it does not do is issue the next landing's fetch ahead of this
-/// landing's merge: a landing's pieces are known only when the card has run
-/// the flight that compared them, which is the moment this thread lands it,
-/// and a flight's fences (and its ranges done with) are told only after what
-/// its shaders wrote is in title memory (`Host::relay_land`): a fetch left
-/// waiting while the landing it belongs to is told would leave title memory
-/// short at the very points the title waits on.
-fn ahead() -> usize {
-    static STAGES: OnceLock<usize> = OnceLock::new();
-    *STAGES.get_or_init(|| {
-        std::env::var("VICTORY_RELAY_AHEAD").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(4, |n| n.min(8))
-    })
-}
-
 /// Told when something joins [`LINE`], for the thread that lands flights
 /// ([`relay`]); [`LINE_MOVED`] stays the word for the thread that looks at
 /// what queues hold.
@@ -2738,10 +2711,8 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
 /// card with nothing to land, microseconds it waited for fetches of card
-/// copies' pieces, microseconds of landing in all; then the stages those
-/// fetches were cut into and the copy regions they were recorded as
-/// ([`ahead`], [`crate::land::runs`]).
-static RELAY_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+/// copies' pieces, microseconds of landing in all.
+static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
@@ -3766,11 +3737,8 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
-    /// The landing's fetch as its stages: one list each, the first made with
-    /// the fetch and more if the fetch is cut in more stages than it has
-    /// ([`ahead`]).
-    lists: Vec<Prelude>,
-    /// With [`relay_copy`]: the card's copy queue, which `lists` are for.
+    list: Prelude,
+    /// With [`relay_copy`]: the card's copy queue, which `list` is for.
     queue: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     event: HANDLE,
@@ -4010,17 +3978,12 @@ fn late_line(frames: f64) {
         tracing::info!(
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
-             fetches of card copies' pieces (VICTORY_RELAY_AHEAD={}: {:.1} stages of {:.0} copy regions a landing, \
-             VICTORY_RELAY_RUN={} KiB), and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
+             fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
              \"settles\" above are waits of other threads for it)",
             r[1],
             r[0],
             r[2] / 1000.0,
             r[3] / 1000.0,
-            ahead(),
-            if r[0] > 0.0 { r[5] / r[0] } else { 0.0 },
-            if r[0] > 0.0 { r[6] / r[0] } else { 0.0 },
-            crate::land::run_most() >> 10,
             r[4] / 1000.0,
         );
         if send::own() {
@@ -4997,7 +4960,7 @@ impl Host {
         }
     }
 
-    /// The relay's own lists, fence, event for [`Host::relay_card_back`].
+    /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         // SAFETY: plain object creation.
         let copying = relay_copy().then(|| unsafe {
@@ -5027,7 +4990,7 @@ impl Host {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
-                lists: vec![list],
+                list,
                 queue,
                 fence,
                 event,
@@ -5039,29 +5002,9 @@ impl Host {
         }
     }
 
-    /// One more list for [`Host::relay_card_back`]'s fetch, of the copy
-    /// queue's if that is where its pieces come down and of the queue that
-    /// draws otherwise.
-    fn make_relay_list(&self, copying: bool) -> Option<Prelude> {
-        if !copying {
-            return self.make_prelude();
-        }
-        // SAFETY: plain object creation.
-        unsafe {
-            (|| -> windows::core::Result<Prelude> {
-                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
-                let list: ID3D12GraphicsCommandList =
-                    self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
-                list.Close()?;
-                Ok((allocator, list))
-            })()
-        }
-        .ok()
-    }
-
     /// [`relay`], on the thread that lands flights: for the plans of the
     /// flights being landed (the card has run them), the pieces their
-    /// compares flagged are fetched, once each, with lists and a wait of
+    /// compares flagged are fetched, once each, with a list and a wait of
     /// this thread's own, and what shaders wrote in them goes into title
     /// memory (`Shadow::card_merge_relay`). As [`Host::card_back`], but:
     /// no submission lock; a piece flagged under one range of a plan is
@@ -5071,12 +5014,6 @@ impl Host {
     /// nothing is sent back up. `plans` come with the value signalled behind
     /// their flight. `meanwhile` is called while the fetch is on its way, if
     /// there is one.
-    ///
-    /// The fetch is recorded as few large regions, pieces of one copy joined
-    /// across the blocks they lie in ([`crate::land::runs`]), and cut into
-    /// stages, every stage given to the queue before any is waited for
-    /// ([`ahead`]): the merge of a stage runs while the stages after it come
-    /// down, and the thread stands only the first stage's flight.
     fn relay_card_back(&self, plans: &[(&CardPlan, u64)], fetch: &mut Option<RelayFetch>, meanwhile: &mut dyn FnMut()) {
         use crate::land;
         let gathering = std::time::Instant::now();
@@ -5197,91 +5134,52 @@ impl Host {
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
-        // What comes down: the pieces as the check gives them (whole pieces,
-        // to be hashed) or as they are merged; their runs are the copy
-        // regions, pieces of one copy that touch joined across the 64 KiB
-        // blocks they lie in ([`crate::land::runs`]).
-        let copies: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)] =
-            check.as_ref().map_or(&pieces, |c| &c.copies);
-        let fetched: Vec<land::Fetched> = copies
-            .iter()
-            .map(|(shadow, lo, hi, at)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo, *at))
-            .collect();
-        // The stages ([`ahead`]): each waited for when its merge begins. The
-        // check hashes pieces whole, so with it the fetch is one stage.
-        let (cut, recorded) = match check.is_some() {
-            true => (vec![0..pieces.len()], vec![0..fetched.len()]),
-            false => {
-                let cut = land::stages(&fetched, ahead());
-                (cut.clone(), cut)
-            }
-        };
-        let first = f.sent + 1;
-        f.sent += cut.len() as u64;
-        while f.lists.len() < cut.len() {
-            match self.make_relay_list(f.queue.is_some()) {
-                Some(list) => f.lists.push(list),
-                None => fail(format_args!(
-                    "no command list to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"
-                )),
-            }
-        }
-        let lists: Vec<Prelude> = f.lists[..cut.len()].to_vec();
-        let (fence, event, copy_queue) = (f.fence.clone(), f.event, f.queue.clone());
+        f.sent += 1;
+        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let copy_queue = f.queue.clone();
+        let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
         // been given to the queue. On the copy queue, those landed here.
         let ahead = match copy_queue {
             Some(_) => 0,
             None => line().target,
         };
-        // SAFETY: each list's last run was waited for by this thread; live
+        // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
         let ran = unsafe {
             (|| -> windows::core::Result<u64> {
+                allocator.Reset()?;
+                list.Reset(&allocator, None)?;
+                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
+                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                }
+                list.Close()?;
+                let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
-                // In the order of the queue: the sends of title bytes so far
-                // are ahead of this fetch, every later one behind it. Held
-                // until every stage of it is on the queue.
-                let order = copy_queue.is_none().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-                let mut regions = 0u64;
-                for (i, (list, stage)) in lists.iter().zip(&recorded).enumerate() {
-                    let (allocator, list) = list;
-                    allocator.Reset()?;
-                    list.Reset(allocator, None)?;
-                    for (piece, lo, len, down) in land::runs(&fetched[stage.clone()], land::run_most()) {
-                        let shadow = &copies[stage.start + piece].0;
-                        list.CopyBufferRegion(&buffer, down, &shadow.buffer, lo as u64, len as u64);
-                        regions += 1;
-                    }
-                    list.Close()?;
-                    let one = [Some(list.cast::<ID3D12CommandList>()?)];
-                    match &copy_queue {
-                        // Beside the queue that draws, when the card's copy
-                        // queue has the fetch.
-                        Some(queue) => queue.ExecuteCommandLists(&one),
-                        None => self.queue.ExecuteCommandLists(&one),
-                    }
-                    let value = first + i as u64;
-                    match &copy_queue {
-                        Some(queue) => queue.Signal(&fence, value)?,
-                        None => self.queue.Signal(&fence, value)?,
-                    }
+                if let Some(queue) = &copy_queue {
+                    queue.ExecuteCommandLists(&lists);
+                    queue.Signal(&fence, sent)?;
+                    meanwhile();
+                    fence.SetEventOnCompletion(sent, event)?;
+                    #[cfg(feature = "diagnostics")]
+                    let _card = crate::timeline::card_wait(None);
+                    WaitForSingleObject(event, INFINITE);
+                    return Ok(behind);
                 }
-                let after = match &order {
-                    // In the order of the queue: the sends of title bytes so
-                    // far are ahead of this fetch, every later one behind it.
-                    Some(order) => **order,
-                    // On the copy queue: only known to be behind those its
-                    // flights ran behind.
-                    None => behind,
-                };
+                // In the order of the queue: the sends of title bytes so
+                // far are ahead of this fetch, every later one behind it.
+                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                self.queue.ExecuteCommandLists(&lists);
+                let after = *order;
                 drop(order);
-                if copy_queue.is_none() {
-                    self.card_sent();
-                }
-                RELAY_STATS[5].fetch_add(recorded.len() as u64, Ordering::Relaxed);
-                RELAY_STATS[6].fetch_add(regions, Ordering::Relaxed);
+                self.card_sent();
+                self.queue.Signal(&fence, sent)?;
+                meanwhile();
+                fence.SetEventOnCompletion(sent, event)?;
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(None);
+                WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
         };
@@ -5289,86 +5187,62 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
-        meanwhile();
-        let merging = std::time::Instant::now();
-        let _merging = crate::timeline::span("landing: merging fetched pieces");
-        let mut written = 0;
-        let mut waited = 0u64;
-        for (i, stage) in cut.iter().enumerate() {
-            let waiting = std::time::Instant::now();
-            // SAFETY: the fence and the event are this thread's, and the list
-            // that signals this value has been given to the queue.
-            unsafe {
-                if let Err(e) = fence.SetEventOnCompletion(first + i as u64, event) {
-                    fail(format_args!(
-                        "what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)"
-                    ));
-                }
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
-            }
-            waited += waiting.elapsed().as_micros() as u64;
-            // This stage's pieces, in their order, while the stages after it
-            // are on their way.
-            if land::on() {
-                let titles: Vec<(usize, usize)> = pieces[stage.clone()]
-                    .iter()
-                    .map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo))
-                    .collect();
-                let jobs = land::jobs(&titles);
-                let put = std::sync::atomic::AtomicU64::new(0);
-                let base = stage.start;
-                land::each(jobs.len(), &|j| {
-                    let working = std::time::Instant::now();
-                    if let Some(check) = &check {
-                        for i in jobs[j].clone() {
-                            // SAFETY: as below.
-                            unsafe { check.look(base + i, data) }
-                        }
-                    }
-                    let mut notes = land::Notes::default();
-                    for run in pieces[base + jobs[j].start..base + jobs[j].end]
-                        .chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0))
-                    {
-                        let addressed: Vec<(usize, usize, usize)> =
-                            run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
-                        // SAFETY: the mapping of the fetched bytes, `total` of
-                        // them; the copy into this stage has run, and the next
-                        // waits for this call.
-                        let landed = unsafe { run[0].0.land_card(&addressed, after, &mut notes) };
-                        crate::wc::back(run[0].0.span().0 as usize + run[0].1, landed);
-                        put.fetch_add(landed, Ordering::Relaxed);
-                    }
-                    notes.flush();
-                    land::spent(land::stat::CARD_ALL, working);
-                });
-                land::count(land::stat::JOBS, jobs.len() as u64);
-                written += put.into_inner();
-            } else {
-                let mut title = Vec::new();
-                for (p, (shadow, lo, hi, at)) in pieces[stage.clone()].iter().enumerate() {
-                    if let Some(check) = &check {
-                        // SAFETY: as below.
-                        unsafe { check.look(stage.start + p, data) }
-                    }
-                    // SAFETY: the mapping of the fetched bytes, `total` of them;
-                    // the copy into it has run.
-                    let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                    let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-                    shadow.walls_merged(gpu.len(), merged);
-                    crate::wc::back(shadow.span().0 as usize + *lo, merged as u64);
-                    written += merged as u64;
-                }
-            }
-        }
-        RELAY_STATS[3].fetch_add(waited, Ordering::Relaxed);
+        let us = waiting.elapsed().as_micros() as u64;
+        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
-            CARD_STATS[6].fetch_add(waited, Ordering::Relaxed);
+            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+        }
+        let merging = std::time::Instant::now();
+        let _merging = crate::timeline::span("landing: merging fetched pieces");
+        let mut written = 0;
+        if land::on() {
+            let titles: Vec<(usize, usize)> =
+                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
+            let jobs = land::jobs(&titles);
+            let put = std::sync::atomic::AtomicU64::new(0);
+            land::each(jobs.len(), &|j| {
+                let working = std::time::Instant::now();
+                if let Some(check) = &check {
+                    for i in jobs[j].clone() {
+                        // SAFETY: as below.
+                        unsafe { check.look(i, data) };
+                    }
+                }
+                let mut notes = land::Notes::default();
+                for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
+                    let addressed: Vec<(usize, usize, usize)> =
+                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    // SAFETY: the mapping of the fetched bytes, `total` of
+                    // them; the copy into it has run, and the next waits
+                    // for this call.
+                    let landed = unsafe { run[0].0.land_card(&addressed, after, &mut notes) };
+                    crate::wc::back(run[0].0.span().0 as usize + run[0].1, landed);
+                    put.fetch_add(landed, Ordering::Relaxed);
+                }
+                notes.flush();
+                land::spent(land::stat::CARD_ALL, working);
+            });
+            land::count(land::stat::JOBS, jobs.len() as u64);
+            written = put.into_inner();
+        } else {
+            let mut title = Vec::new();
+            for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
+                if let Some(check) = &check {
+                    // SAFETY: as below.
+                    unsafe { check.look(i, data) };
+                }
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                crate::wc::back(shadow.span().0 as usize + *lo, merged as u64);
+                written += merged as u64;
+            }
         }
         land::spent(land::stat::CARD, merging);
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);

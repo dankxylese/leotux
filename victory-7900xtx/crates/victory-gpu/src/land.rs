@@ -22,12 +22,6 @@
 //! other copies; a landing is done, whole, before the title is told
 //! anything and before the next one starts (`Host::relay_land`).
 //!
-//! What a landing fetches it fetches in a few large regions ([`runs`]:
-//! pieces of one copy that touch, joined across the blocks they lie in, up
-//! to 2 MiB) and in stages, each waited for only when its merge begins
-//! (`crate::host`'s `VICTORY_RELAY_AHEAD`): the pieces are still merged one
-//! by one, each within its block, so the order above is untouched.
-//!
 //! With `VICTORY_LAND_BESIDE` (on by default) title memory that is a view of
 //! the title's physical pages is written through a view of our own of the
 //! same pages ([`crate::inplace::beside`]). The guards (`crate::watch`) are
@@ -389,87 +383,6 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
 
 /// A piece to land: the copy's number, the title address, its bytes.
 pub(crate) type Piece = (u64, usize, usize);
-
-/// A piece as it is fetched: the copy's number, the title address, its
-/// bytes, and where its bytes come down (an offset in the fetch's buffer).
-pub(crate) type Fetched = (u64, usize, usize, u64);
-
-/// The longest run of a copy's pieces one `CopyBufferRegion` brings
-/// (`VICTORY_RELAY_RUN`, in bytes; 2 MiB; 64 KiB or less, one region per
-/// piece, as before).
-///
-/// [`ordered`] cuts pieces at the 64 KiB the compare hashes, and joining
-/// only inside one block left every transfer 64 KiB: 1,561 of them,
-/// 91.6 MB, a frame, at 3.4 GB/s (run 102). The card reads whole
-/// megabytes back several times faster.
-pub(crate) fn run_most() -> usize {
-    static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
-        let asked = std::env::var("VICTORY_RELAY_RUN").ok().and_then(|v| v.trim().parse::<usize>().ok());
-        asked.unwrap_or(2 << 20).max(BLOCK)
-    })
-}
-
-/// `pieces`, in [`ordered`]'s order, as the runs one `CopyBufferRegion` each
-/// brings: pieces of one copy that touch, joined across the 64 KiB blocks
-/// they lie in, no run longer than `most` bytes. Each as the number of the
-/// piece it begins with, its title address, its bytes, and where they come
-/// down.
-///
-/// The pieces themselves stay as they are: each is still merged on its own,
-/// within one block, in the order given ([`ordered`]'s rule). Only the copy
-/// down is one region, and its bytes are one range of the copy's card side
-/// and one range of the buffer (they come down in the order they are landed
-/// in).
-pub(crate) fn runs(pieces: &[Fetched], most: usize) -> Vec<(usize, usize, usize, u64)> {
-    let mut out: Vec<(usize, usize, usize, u64)> = Vec::with_capacity(pieces.len());
-    for (i, &(copy, at, len, down)) in pieces.iter().enumerate() {
-        match out.last_mut() {
-            Some(last)
-                if pieces[last.0].0 == copy
-                    && last.1 + last.2 == at
-                    && last.3 + last.2 as u64 == down
-                    && last.2 + len <= most =>
-            {
-                last.2 += len;
-            }
-            _ => out.push((i, at, len, down)),
-        }
-    }
-    out
-}
-
-/// `pieces` (in [`ordered`]'s order) cut into `count` stages of about the
-/// same bytes, at piece boundaries: each stage's copy is given to the queue
-/// with the others, and is waited for only when its merge begins, so what is
-/// left of the fetch flies while the stage before it is merged.
-pub(crate) fn stages(pieces: &[Fetched], count: usize) -> Vec<std::ops::Range<usize>> {
-    let count = count.clamp(1, 8).min(pieces.len().max(1));
-    if pieces.len() < 2 || count < 2 {
-        return vec![0..pieces.len()];
-    }
-    let bytes: u64 = pieces.iter().map(|p| p.2 as u64).sum();
-    let share = (bytes / count as u64).max(1);
-    // (Pieces are alike in size; the bytes are what a stage costs to bring.)
-    let each = pieces.len().div_ceil(count);
-    let mut out: Vec<std::ops::Range<usize>> = Vec::with_capacity(count);
-    let (mut from, mut taken) = (0usize, 0u64);
-    for (i, piece) in pieces.iter().enumerate() {
-        taken += piece.2 as u64;
-        // (Never more stages than asked for: the last piece or pieces are
-        // the last stage.)
-        let left = count - out.len();
-        if left > 1 && (i + 1 - from >= each || taken >= share) {
-            out.push(from..i + 1);
-            from = i + 1;
-            taken = 0;
-        }
-    }
-    if from < pieces.len() {
-        out.push(from..pieces.len());
-    }
-    out
-}
 
 /// `pieces` in the order they are landed: by the 64 KiB block of title
 /// memory they lie in, those in one block in the order given (each is
