@@ -87,7 +87,7 @@ systemd-run --user --collect -p MemoryMax=58G -p MemorySwapMax=40G \
 `run-victory-direct.sh` mirrors `scripts/run_victory_proton.sh`'s env but runs a bare Wine binary: it pre-starts
 the rbtree server, compiles the pipelines earlier runs used (`victory warm --used`), then starts the title.
 `WINEDEBUG=err+seh` when triaging: the worst crash family is silent under `-all` (exit code 3, nothing logged).
-The log goes to `$LOG_DIR/victory-trace.log` (default `GTA6-btw-logs/` beside the repo); the layer's crash reports
+The log goes to `$LOG_DIR/victory-trace.log` (default `LeoTux-logs/` beside the repo); the layer's crash reports
 and the title's Breakpad dumps land in the prefix under `users/<user>/AppData/Local/victory/data/<titleid>/`
 (crashes.log, temp/). Controllers need hidraw access: a udev `uaccess` rule for the Sony ids (see
 docs/knowledge-base) — Wine enumerates hidraw controllers at startup.

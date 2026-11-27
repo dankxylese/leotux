@@ -146,7 +146,7 @@ if [[ "${VICTORY_WARM_FIRST:-$NEWER}" == 1 ]]; then
   DIALOG=
   if command -v zenity > /dev/null && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
     ( while kill -0 "$WARM" 2> /dev/null; do echo "#Compiling shaders... ${SECONDS}s"; sleep 1; done; echo 100 ) |
-      zenity --progress --pulsate --auto-close --no-cancel --title="GTA6-btw" \
+      zenity --progress --pulsate --auto-close --no-cancel --title="LeoTux" \
         --text="Compiling shaders..." --width=320 2> /dev/null &
     DIALOG=$!
   fi

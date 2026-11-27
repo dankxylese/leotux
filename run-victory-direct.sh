@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GTA6-btw: system wine 11.21 + rbtree wineserver + vkd3d-proton/DXVK dlls in the prefix.
+# LeoTux: system wine 11.21 + rbtree wineserver + vkd3d-proton/DXVK dlls in the prefix.
 # (proton-cachyos's wine stack-overflows its services.exe on this host, hanging every
 # launcher path; the victory-ntdll optimizations are optional per linux/wine/README.md,
 # and the rbtree server below IS the upstream fix for the loading-speed issue.)
@@ -30,13 +30,13 @@ defaults WINEDEBUG=-all \
 
 # Caches (per tree, on the SSD)
 CACHE_DIR="${VICTORY_HOST_CACHE_DIR:-$PROJ/victory-cache/$VICTORY_TREE}"
-mkdir -p "$CACHE_DIR/vkd3d" "$PROJ/GTA6-btw-logs" \
+mkdir -p "$CACHE_DIR/vkd3d" "$PROJ/LeoTux-logs" \
          "$WINEPREFIX/drive_c/users/manse/AppData/Local/$VICTORY_TREE/cache/pipelines"
 defaults "VICTORY_CACHE_DIR=C:\\users\\manse\\AppData\\Local\\$VICTORY_TREE\\cache" \
          "VKD3D_SHADER_CACHE_PATH=Z:${CACHE_DIR//\//\\\\}\\vkd3d"
 
 # VIctory settings (same defaults as run_victory_proton.sh)
-defaults VICTORY_LOG=info "VICTORY_LOG_FILE=Z:\\home\\manse\\A.Projects\\GTA6-Emulation\\GTA6-btw-logs\\victory-trace.log" \
+defaults VICTORY_LOG=info "VICTORY_LOG_FILE=Z:\\home\\manse\\A.Projects\\GTA6-Emulation\\LeoTux-logs\\victory-trace.log" \
          VICTORY_NO_WATCHDOG=1 \
          VICTORY_SKIP_INT3=1 \
          VICTORY_HAIR=1 \
