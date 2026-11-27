@@ -6,29 +6,41 @@ distro Wine — **no Proton build**.
 
 **No game files are in this repository.** You need your own copy of the game.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
-Tested on one machine: Ryzen 7 5800x3d, 32 GB RAM, Radeon RX 7800 XT 16 GB, Arch Linux.
+Tested on one machine: Ryzen 7 5800X3D, 32 GB RAM, Radeon RX 7800 XT 16 GB (RADV), CachyOS. The reference
+scene is the prologue (it renders real world content and is 1-to-1 comparable between runs).
 
 | | |
 |---|---|
-| Boot, menus, intro video | 30 fps, the title's own cap |
-| From the start to the world | about 20-30s |
-| Open world, first mission | 10-20 fps (`victory-7900xtx`) |
+| Boot, menus, intro video | 30 fps, the title's own cap (no rubber-banding: joins are world-only) |
+| From the start to the world | about 20-30 s (shaders and pipelines made before the title starts, `warm-up.sh`) |
+| Prologue, in-world | 13-20 fps, 74.7 ms a frame median (p90 101.7) |
+| Faces and mouths | **working** — skin on every run, lips follow the dialogue |
 | Shaders | every shader the title used translates |
+
+The tree is avatarmanz/main + zeex64 + PR [#440](https://github.com/avatarmanz/VIctory-7900XTX/pull/440)
+(Linux under Wine) + its advance of the same day (the mouths fix), with ours on top; see
+`victory-7900xtx/UPSTREAM.md`. What made faces and mouths move: a face-deform compute pass is never dropped
+while its pipeline builds (`VICTORY_COMPUTE_WAIT_MS`, and the pipeline library is kept between runs), and the
+face network's 16-bit buffer accesses are lowered as integers through half views with the raw typed loads —
+they used to be read as floats through integer views, which computes zeros: a face at rest.
 
 Known to be wrong:
 
-- **Mouths do not move** while characters speak (the voice plays). Not a rendering drop: still so with every GPU pass
-  running. Never worked in any tree here.
 - **Some scenes are too dark, and the phone's screen stays blank**: both need the console's ray-tracing structures,
   which are off (`VICTORY_BVH_BUILDER=1` turns them on, at about half the frame rate).
-- **The first intro scene can stutter** on some settings while the title's movie competes for the CPU (the opening
-  videos can also repeat three frames in a row: the submissions joining, `VICTORY_JOIN_PARTS=1` avoids it at ~3 ms).
-- **Textures appear late** while the title streams; 12 GB of video memory fills up.
+- **Textures can appear late** while the title streams; 12 GB of video memory fills up.
+- **The frame is the layer's memory overlay, not the GPU**: ~25 ms uploading pages the title wrote and ~45 ms
+  reading back what shaders wrote, of a ~75 ms frame, with the GPU idle for most of it. Being worked on
+  (docs/knowledge-base/TODO.md); 30 fps is the target.
 - **Rare title crash**: a null-vtable read in the title's own streaming code (a spawn descriptor consumed before its
-  object is constructed; the upstream "null pointer in own code" race). `VICTORY_SKIP_NULL_VTABLE` (in progress)
-  survives it.
+  object is constructed; the upstream "null pointer in own code" race). `VICTORY_SKIP_NULL_VTABLE` (on unless `0`)
+  survives it: the call is skipped with a zero result, counted, and reported; a per-site loop breaker keeps a
+  limping title from spinning in place.
+- **`--console series-s` does not boot here** (stalls before boot compute; the Series-S memory profile it reports
+  wedges the title's pool setup). Series X at 4K output is the tested profile; on a 1080p monitor the compositor
+  downscale looks native. `VICTORY_OUTPUT` is not used (it upscales from a low internal resolution).
 
 ## Quick start
 
@@ -95,7 +107,7 @@ from, what was merged and how conflicts were resolved is in its `UPSTREAM.md`.
 
 | Tree | What it is | State here |
 |---|---|---|
-| `victory-7900xtx` (default) | [avatarmanz's RDNA 3 fork](https://github.com/avatarmanz/VIctory-7900XTX) + [zeex64's Linux work](https://github.com/zeex64/VIctory-7900XTX) + ours | the fastest under Wine: 10-20 fps in the world |
+| `victory-7900xtx` (default) | [avatarmanz's RDNA 3 fork](https://github.com/avatarmanz/VIctory-7900XTX) + [zeex64's Linux work](https://github.com/zeex64/VIctory-7900XTX) + PR [#440](https://github.com/avatarmanz/VIctory-7900XTX/pull/440) and its mouths-fix advance + ours | 13-20 fps in the prologue with faces and mouths working |
 | `victory`, `scarlight` | older Belobug and [Scarlight](https://github.com/pablogonz12/Scarlight) trees | kept for reference |
 
 `victory-belobug` and `victory-dexnom` were dropped here (2026-11-27): both were far behind
@@ -107,8 +119,9 @@ the GTA6-btw clone.
 crash reports and stack dumps in that log, the 1.0.2.1 int3 assert stepped over (`VICTORY_SKIP_INT3`), copy-back into
 write-watched pages that Wine refuses to write, the early pipeline list kept without a host pipeline library, and
 [KLBF Lab](https://github.com/PastiiJay/klbf-lab)'s half-wave port for 64-lane AMD hosts (`VICTORY_PS_HALVES`);
-plus, from LeoTux: the direct-Wine launcher (`run-victory-direct.sh`), the rbtree-server engagement, and
-`VICTORY_SKIP_NULL_VTABLE` (in progress).
+plus, from LeoTux: the direct-Wine launcher (`run-victory-direct.sh`) with the `warm-up.sh` progress window,
+the rbtree-server engagement, the `VICTORY_SKIP_NULL_VTABLE` survival guard, and the port-1 home decoupled
+from the mmap mode (`VICTORY_PORT_HOME=1` under `VICTORY_WINE_MAP=0`).
 
 ## Settings
 
@@ -123,7 +136,10 @@ variable set in the environment wins. Our `run-victory-direct.sh` takes the same
 | `WINE` | `/usr/bin/wine` | the Wine binary (run-victory-direct.sh) |
 | `RBTREE` | `1` | `0`: run the stock wineserver (run-victory-direct.sh) |
 | `PROTON` | `victory-ntdll` | the compat tool (run_victory_proton.sh; needs the Proton build) |
-| `VICTORY_CONSOLE` | `series-x` | `series-s`: 1080p, less video memory, about 5 ms faster, a softer picture |
+| `VICTORY_CONSOLE` | `series-x` | `series-s` is broken here (see "Where it stands") |
+| `VICTORY_WINE_MAP` | `0` | the mmap title-memory mode: poison with our write-tracking (gigabytes read as changed per frame); the rbtree server covers its benefit |
+| `VICTORY_PORT_HOME` | `1` | renderer port 1's home under `VICTORY_WINE_MAP=0`: the title's 32-bit graphics heap used in place (prologue A/B: -7 ms median, p90 -18) |
+| `VICTORY_TEXTURE_MAX` | `0` | the merged tree caps streamed textures at 1024 px by default (muddy textures); `0` keeps full mips on the 16 GB card |
 | `VICTORY_WARM_FIRST` | `1` | `0`: start the title without compiling shaders first |
 | `VICTORY_FORK_SETTINGS` | `1` | `0`: none of the tree's speed switches (to tell whether one of them is at fault) |
 | `VICTORY_AMBIENT` | `0` | the title's own ambient light; `0.8`: the forks' stand-in for the missing ray-traced light (flatter skin) |
