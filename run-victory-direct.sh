@@ -9,9 +9,11 @@ PROJ=/home/manse/A.Projects/GTA6-Emulation
 VICTORY_TREE="${VICTORY_TREE:-victory-7900xtx}"
 VICTORY_EXE="${VICTORY_EXE:-$PROJ/LeoTux/$VICTORY_TREE/target/x86_64-pc-windows-msvc/diag/victory.exe}"
 GAME_EXE="${GAME_EXE:-$PROJ/GTA6.Xbox.v1.0.2.1-CYBERLEEK/game_scarlett_master.exe}"
-# Both monitors are 1080p: series-s profile (1080p, less VRAM, ~5 ms faster, softer
-# picture). VICTORY_CONSOLE=series-x env restores 4K.
-VICTORY_CONSOLE="${VICTORY_CONSOLE:-series-s}"
+# series-x. series-s is BROKEN here (run12, 2026-11-27): the title stalls right after
+# core_licenses, before the boot-compute burst — its Series-S memory profile
+# (0 GPU-optimal + 7776 MiB) wedges pool setup. 1080p comes from VICTORY_OUTPUT=1920x1080
+# (post-merge), not from the series-s profile.
+VICTORY_CONSOLE="${VICTORY_CONSOLE:-series-x}"
 
 defaults() { local kv name; for kv in "$@"; do name="${kv%%=*}"; [[ -n "${!name+x}" ]] || export "$kv"; done; }
 
