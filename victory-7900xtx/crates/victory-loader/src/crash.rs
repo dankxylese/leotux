@@ -20,8 +20,8 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, EXCEPTION_RECORD, M128A,
+    RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -111,8 +111,29 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
+/// A `VICTORY_...` switch that is on unless it is set to `0` (or `false`,
+/// `off`, `no`).
+fn switch(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
+    // Read here, not in the handler: a faulting thread may hold any lock,
+    // the heap's included.
+    SKIP_NULL_VTABLE.store(switch("VICTORY_SKIP_NULL_VTABLE"), Relaxed);
+    static AT_EXIT: std::sync::Once = std::sync::Once::new();
+    // SAFETY: registers a function with the host CRT's exit table; it reads
+    // our counters and logs, nothing else.
+    AT_EXIT.call_once(|| unsafe {
+        atexit(skips_at_exit);
+    });
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         unsafe { report_unhandled(info) };
@@ -469,6 +490,294 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+/// `VICTORY_SKIP_NULL_VTABLE` (on unless it is `0`): a call through a null
+/// vtable pointer is skipped instead of ending the process (see
+/// [`skip_null_vtable`]). Read once by [`report_crashes`], so the handler
+/// reads no environment on a thread that may hold the heap's lock.
+static SKIP_NULL_VTABLE: AtomicBool = AtomicBool::new(true);
+
+/// The skips the guard made, printed at exit and put in crash reports: a
+/// title that limps must not read like one that never faltered.
+static NULL_VTABLE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Below any object the title could have: a read here is a null pointer's.
+const NULL_LIMIT: usize = 0x1_0000;
+
+/// Fault addresses the loop breaker tracks: a fixed table, so that the
+/// handler allocates nothing and waits for no lock (the faulting thread may
+/// hold the title's, ours or the heap's).
+const SKIP_SITES: usize = 64;
+/// A site skipped more often than this within [`SKIP_WINDOW`] stops being
+/// skipped: a guard that hides an infinite loop is worse than the crash it
+/// hides.
+const SKIP_LIMIT: u32 = 8;
+/// Seconds of [`SKIP_WINDOW`]: a site's allowance comes back after this long.
+const SKIP_WINDOW: u64 = 60;
+
+/// One fault address the guard skipped at, and how often lately.
+struct Site {
+    rip: AtomicUsize,
+    skips: AtomicU32,
+    /// Unix time of the first skip in the current window.
+    since: AtomicU64,
+}
+
+impl Site {
+    const fn new() -> Self {
+        Self {
+            rip: AtomicUsize::new(0),
+            skips: AtomicU32::new(0),
+            since: AtomicU64::new(0),
+        }
+    }
+}
+
+static SITES_SEEN: [Site; SKIP_SITES] = [const { Site::new() }; SKIP_SITES];
+
+/// The table entry for `rip`, taking a free one if the site is new; `None`
+/// with every entry taken by other sites (the guard then gives up, rather
+/// than skip a site it cannot count).
+fn site_for(rip: usize) -> Option<&'static Site> {
+    let first = (rip >> 4) % SKIP_SITES;
+    for i in 0..SKIP_SITES {
+        let site = &SITES_SEEN[(first + i) % SKIP_SITES];
+        if site.rip.load(Relaxed) == rip {
+            return Some(site);
+        }
+        if site.rip.load(Relaxed) == 0
+            && site.rip.compare_exchange(0, rip, Relaxed, Relaxed).is_ok()
+        {
+            return Some(site);
+        }
+    }
+    None
+}
+
+/// Counts one skip at `rip` and says whether it may happen: its number at
+/// the site (to log), or `None` past [`SKIP_LIMIT`] within [`SKIP_WINDOW`],
+/// which leaves the exception to be reported as usual.
+fn count_skip(rip: usize) -> Option<u32> {
+    let site = site_for(rip)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let n = site.skips.fetch_add(1, Relaxed) + 1;
+    if n == 1 {
+        site.since.store(now, Relaxed);
+    }
+    let since = match site.since.load(Relaxed) {
+        0 => now,
+        since => since,
+    };
+    if n <= SKIP_LIMIT {
+        return Some(n);
+    }
+    if now.saturating_sub(since) < SKIP_WINDOW {
+        return None;
+    }
+    // The site behaved for a window: its allowance starts again.
+    site.since.store(now, Relaxed);
+    site.skips.store(1, Relaxed);
+    Some(1)
+}
+
+/// A vtable call: `mov reg, [reg2]` and then `call|jmp *disp(reg)`.
+struct VtableCall {
+    /// Bytes from the call to the instruction after it.
+    len: usize,
+    /// The register holding the vtable pointer, as instructions encode it.
+    vtable: u8,
+    /// The slot read through it, which is the address faulted on when the
+    /// vtable pointer is null.
+    slot: u64,
+}
+
+/// The virtual call at `at` in `code`, if it has exactly the shape of a
+/// call through a vtable pointer the title loaded from an object: a load of
+/// the pointer and the indirect call through it, nothing between, and a
+/// slot that is one (`0` to `0x78`, a multiple of 8). `reg`, `reg2`, the
+/// call or the `jmp` a tail call makes of it, and the slot are free: a
+/// title's crash moves from site to site, not its idiom.
+fn null_vtable_call(code: &[u8], at: usize) -> Option<VtableCall> {
+    let (rex, mut i) = match *code.get(at)? {
+        rex @ 0x40..=0x4f => (rex, at + 1),
+        _ => (0, at),
+    };
+    if *code.get(i)? != 0xff {
+        return None;
+    }
+    let modrm = *code.get(i + 1)?;
+    // /2 is `call`, /4 `jmp`, both through memory.
+    if !matches!((modrm >> 3) & 7, 2 | 4) {
+        return None;
+    }
+    let (mode, rm) = (modrm >> 6, modrm & 7);
+    if mode == 3 {
+        return None;
+    }
+    i += 2;
+    let mut has_sib = false;
+    let base = if rm == 4 {
+        let sib = *code.get(i)?;
+        // A base register and no index: a scaled index is no vtable slot.
+        if (sib >> 3) & 7 != 4 || rex & 2 != 0 {
+            return None;
+        }
+        has_sib = true;
+        i += 1;
+        sib & 7
+    } else if rm == 5 && mode == 0 {
+        // RIP-relative: no object's vtable.
+        return None;
+    } else {
+        rm
+    };
+    // A SIB with no base register at all (an absolute address).
+    if has_sib && mode == 0 && base == 5 && rex & 1 == 0 {
+        return None;
+    }
+    let (disp, size) = match mode {
+        0 => (0i64, 0usize),
+        1 => (i64::from(*code.get(i)? as i8), 1),
+        _ => (
+            i64::from(i32::from_le_bytes(code.get(i..i + 4)?.try_into().ok()?)),
+            4,
+        ),
+    };
+    let len = i + size - at;
+    if !(0..=0x78).contains(&disp) || disp % 8 != 0 {
+        return None;
+    }
+    let vtable = base | (rex & 1) << 3;
+    // The load of the vtable pointer, immediately before the call.
+    vtable_load(code, at, vtable).then_some(VtableCall {
+        len,
+        vtable,
+        slot: disp as u64,
+    })
+}
+
+/// Whether `mov reg, [reg2]` into `vtable` ends exactly at `end`:
+/// `REX.W(+R/B) 8B /r`, no SIB, no displacement.
+fn vtable_load(code: &[u8], end: usize, vtable: u8) -> bool {
+    (end.saturating_sub(4)..end).any(|at| load_into(code, at, end) == Some(vtable))
+}
+
+/// The register `mov reg, [reg2]` at `at` loads, if that is the whole
+/// instruction and it ends at `end`.
+fn load_into(code: &[u8], at: usize, end: usize) -> Option<u8> {
+    let &[rex @ 0x48..=0x4f, 0x8b, modrm] = code.get(at..at + 3)? else {
+        return None;
+    };
+    if at + 3 != end || modrm >> 6 != 0 || matches!(modrm & 7, 4 | 5) {
+        return None;
+    }
+    Some((modrm >> 3) & 7 | (rex & 4) << 1)
+}
+
+/// The guard: for an access violation that is a virtual call through a null
+/// vtable pointer -- `*(rdi)` is 0 at `mov (%rdi),%r15; call *0x8(%r15)`,
+/// which faults reading `0x8` -- skip the call: `rax = 0` (a call returns in
+/// it, and the title's use of the result is a pointer it has to check
+/// anyway), `rip` past the call, the flags as they were (a call leaves
+/// them). Nothing else is emulated, because nothing else is known.
+///
+/// Only a fault that is a read below [`NULL_LIMIT`], of exactly the slot the
+/// call reads, through a register that is exactly 0, at an instruction of
+/// exactly the two-instruction shape, is skipped. Anything else returns
+/// `false` and is reported as before: a guard that guesses is worse than a
+/// crash that says where it was.
+fn skip_null_vtable(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
+    let p = record.ExceptionInformation;
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+        || record.NumberParameters < 2
+        || p[0] != 0
+        || p[1] >= NULL_LIMIT
+    {
+        return false;
+    }
+    let rip = context.Rip as usize;
+    // The call's 15 bytes at most, and the vtable load's 4 before it.
+    let Some(base) = rip.checked_sub(15) else {
+        return false;
+    };
+    let mut code = [0u8; 32];
+    // SAFETY: reads the title's code below `rip` through the system, which
+    // faults nothing of ours; the buffer is ours.
+    if !unsafe { read_into(base, &mut code) } {
+        return false;
+    }
+    let Some(call) = null_vtable_call(&code, 15) else {
+        return false;
+    };
+    // The state as well as the bytes: the register the call read holds the
+    // vtable pointer, it is null, and the access was to that slot itself.
+    if *gpr(context, call.vtable) != 0 || p[1] != call.slot as usize {
+        return false;
+    }
+    let Some(n) = count_skip(rip) else {
+        tracing::warn!(
+            site = %locate(rip),
+            "null vtable call not skipped: too many at this site"
+        );
+        return false;
+    };
+    context.Rax = 0;
+    context.Rip = context.Rip.wrapping_add(call.len as u64);
+    let total = NULL_VTABLE_SKIPS.fetch_add(1, Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(4) {
+        tracing::warn!(
+            site = %locate(rip),
+            slot = format_args!("{:#x}", call.slot),
+            skip = n,
+            total,
+            "null vtable call skipped"
+        );
+    }
+    true
+}
+
+/// `n` bytes at `at` if all of them are readable, without allocating: the
+/// handler may run on a thread that holds the heap's lock.
+///
+/// # Safety
+/// Writes only `out`, through the system's own copy.
+unsafe fn read_into(at: usize, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut read = 0usize;
+    // SAFETY: the system copies at most `out.len()` bytes into `out` and
+    // says how many; nothing is read through a pointer of ours.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            at as *const _,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            &mut read,
+        )
+    };
+    ok != 0 && read == out.len()
+}
+
+unsafe extern "C" {
+    fn atexit(f: extern "C" fn()) -> i32;
+}
+
+/// Process exit: how many calls the guard skipped, so that a run which
+/// limped through them is not read as one that did not.
+extern "C" fn skips_at_exit() {
+    let skips = NULL_VTABLE_SKIPS.load(Relaxed);
+    if skips == 0 {
+        return;
+    }
+    let sites = SITES_SEEN
+        .iter()
+        .filter(|site| site.rip.load(Relaxed) != 0)
+        .count();
+    tracing::info!(skips, sites, "null vtable calls skipped (at exit)");
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
@@ -508,6 +817,22 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             };
             tracing::warn!(rip = format_args!("{rip:#x}"), len, "breakpoint skipped");
             context.Rip = context.Rip.wrapping_add(len);
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
+    // `VICTORY_SKIP_NULL_VTABLE` (on unless `0`): a virtual call through a
+    // null vtable pointer is the title's own lifecycle race, and is skipped
+    // rather than ending the process (see [`skip_null_vtable`]).
+    if SKIP_NULL_VTABLE.load(Relaxed) {
+        // SAFETY: the system passes the exception being dispatched, and
+        // `skip_null_vtable` reports the exception it could not skip.
+        let skipped = unsafe {
+            skip_null_vtable(
+                &mut *(*info).ContextRecord,
+                &*(*info).ExceptionRecord,
+            )
+        };
+        if skipped {
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
     }
@@ -724,6 +1049,12 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     ));
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    let skips = NULL_VTABLE_SKIPS.load(Relaxed);
+    if skips != 0 {
+        line(format!(
+            "  null vtable calls skipped before this: {skips}"
+        ));
     }
     // Once for a crash (the first-chance report; the unhandled one repeats
     // the registers only).
@@ -1581,5 +1912,179 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    /// `bytes` at a fixed place in a page (so the guard's reads land where
+    /// they expect), as the two instructions of a vtable call: what the
+    /// decode makes of them, with the instruction before at `pre`.
+    fn vtable_call(pre: &[u8], call: &[u8]) -> Option<(usize, u8, u64)> {
+        let at = 8;
+        let mut code = [0x90u8; 24];
+        code[at - pre.len()..at].copy_from_slice(pre);
+        code[at..at + call.len()].copy_from_slice(call);
+        null_vtable_call(&code, at).map(|c| (c.len, c.vtable, c.slot))
+    }
+
+    #[test]
+    fn only_a_loaded_vtable_pointer_called_is_a_null_vtable_call() {
+        // The title's own site: mov (%rdi),%r15; call *0x8(%r15).
+        let load_r15 = [0x4c, 0x8b, 0x3f];
+        let call_r15_8 = [0x41, 0xff, 0x57, 0x08];
+        assert_eq!(
+            vtable_call(&load_r15, &call_r15_8),
+            Some((4, 15, 0x8)),
+            "the site from the crash"
+        );
+        // Any registers, the first slot, and a `jmp` for a tail call.
+        assert_eq!(
+            vtable_call(&[0x48, 0x8b, 0x18], &[0xff, 0x13]),
+            Some((2, 3, 0))
+        );
+        assert_eq!(
+            vtable_call(&[0x48, 0x8b, 0x18], &[0xff, 0x23]),
+            Some((2, 3, 0))
+        );
+        // A base that needs a SIB, and a disp32 slot.
+        assert_eq!(
+            vtable_call(&[0x4c, 0x8b, 0x21], &[0x41, 0xff, 0x54, 0x24, 0x10]),
+            Some((5, 12, 0x10))
+        );
+        assert_eq!(
+            vtable_call(&load_r15, &[0x41, 0xff, 0x97, 0x78, 0x00, 0x00, 0x00]),
+            Some((7, 15, 0x78))
+        );
+        // Not the shape: a register call, a call whose register was never
+        // loaded from memory, slots that are not slots, a load with a
+        // displacement or into another register, and RIP-relative.
+        assert_eq!(vtable_call(&load_r15, &[0xff, 0xd7]), None);
+        assert_eq!(vtable_call(&[0x90, 0x90, 0x90], &call_r15_8), None);
+        assert_eq!(
+            vtable_call(
+                &load_r15,
+                &[0x41, 0xff, 0x97, 0x80, 0x00, 0x00, 0x00]
+            ),
+            None
+        );
+        assert_eq!(vtable_call(&load_r15, &[0x41, 0xff, 0x57, 0x0c]), None);
+        assert_eq!(
+            vtable_call(&[0x4c, 0x8b, 0x7f, 0x08], &call_r15_8),
+            None
+        );
+        assert_eq!(vtable_call(&load_r15, &[0xff, 0x10]), None);
+        assert_eq!(vtable_call(&load_r15, &[0xff, 0x15, 0, 0, 0, 0]), None);
+    }
+
+    /// As if the exception at `code[at]` were an access violation of `kind`
+    /// reading `fault`, with `context` the state there: how far the guard
+    /// advanced `rip`, or `None` if it did not skip.
+    fn skip_at(
+        code: &[u8],
+        at: usize,
+        context: &mut CONTEXT,
+        fault: usize,
+        kind: usize,
+    ) -> Option<usize> {
+        #[repr(align(4096))]
+        struct Code([u8; 4096]);
+        let mut page = Box::new(Code([0xcc; 4096]));
+        page.0[0x800..0x800 + code.len()].copy_from_slice(code);
+        let start = page.0.as_ptr() as usize + 0x800 + at;
+        context.Rip = start as u64;
+        // SAFETY: a zeroed record is valid; the guard reads only the code
+        // page, the record and the context.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        record.NumberParameters = 2;
+        record.ExceptionInformation[0] = kind;
+        record.ExceptionInformation[1] = fault;
+        skip_null_vtable(context, &record).then(|| context.Rip as usize - start)
+    }
+
+    #[test]
+    fn a_null_vtable_call_is_skipped_as_a_call_that_returned_zero() {
+        // mov (%rdi),%r15; call *0x8(%r15), as the title's code has it.
+        let code = [0x4c, 0x8b, 0x3f, 0x41, 0xff, 0x57, 0x08];
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.R15 = 0;
+        context.Rax = 0xdead_beef;
+        context.EFlags = 0x202 | CMP_FLAGS;
+        assert_eq!(skip_at(&code, 3, &mut context, 0x8, 0), Some(4));
+        // The call's result: nothing, a call returns in rax. The flags a
+        // call leaves: as they were.
+        assert_eq!(context.Rax, 0);
+        assert_eq!(context.EFlags, 0x202 | CMP_FLAGS);
+        // A `jmp` (a tail call) is skipped the same way.
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        let jump = [0x4c, 0x8b, 0x3f, 0x41, 0xff, 0x67, 0x08];
+        assert_eq!(skip_at(&jump, 3, &mut context, 0x8, 0), Some(4));
+
+        // Anything but the exact fault is reported as before: a vtable
+        // pointer that is not null, a fault at another address, a write, one
+        // above the null page, and an instruction of another shape.
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.R15 = 0x1000;
+        assert_eq!(skip_at(&code, 3, &mut context, 0x1008, 0), None);
+        // SAFETY: as above.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        assert_eq!(skip_at(&code, 3, &mut context, 0x10, 0), None);
+        assert_eq!(skip_at(&code, 3, &mut context, 0x8, 1), None);
+        assert_eq!(skip_at(&code, 3, &mut context, 0x1_0000, 0), None);
+        let call_only = [0x90, 0x90, 0x90, 0x41, 0xff, 0x57, 0x08];
+        assert_eq!(skip_at(&call_only, 3, &mut context, 0x8, 0), None);
+    }
+
+    #[test]
+    fn the_vectored_handler_continues_past_a_null_vtable_call() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        report_crashes();
+        // mov (%rcx),%r10; call *(%r10); add $0x7b,%eax; ret, with the
+        // call far enough into the page that the guard reads the load
+        // before it. The object's vtable pointer is null, as the title's was.
+        let mut code = [0x90u8; 32];
+        code[16..27].copy_from_slice(&[
+            0x4c, 0x8b, 0x11, // mov (%rcx),%r10
+            0x41, 0xff, 0x12, // call *(%r10)
+            0x05, 0x7b, 0x00, 0x00, 0x00, // add $0x7b,%eax
+        ]);
+        code[27] = 0xc3; // ret
+        // SAFETY: a page of ours, executable, running the call above through
+        // a null vtable pointer and then returning to us.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            page.copy_from_nonoverlapping(code.as_ptr(), code.len());
+            let object = [0u64];
+            let run: extern "C" fn(*const u64) -> u64 = std::mem::transmute(page);
+            let returned = run(object.as_ptr());
+            // `rax` was 0 after the skipped call, and execution went on.
+            assert_eq!(returned, 0x7b);
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn a_site_skipped_too_often_is_reported_instead() {
+        // A site of its own, so the other tests' skips do not count.
+        #[repr(align(4096))]
+        struct Code([u8; 4096]);
+        let page = Box::new(Code([0xcc; 4096]));
+        let rip = page.0.as_ptr() as usize + 0x800;
+        for n in 1..=SKIP_LIMIT {
+            assert_eq!(count_skip(rip), Some(n), "skip {n}");
+        }
+        assert_eq!(count_skip(rip), None, "past the limit, inside the window");
+        // Another site still has its own allowance.
+        assert_eq!(count_skip(rip + 0x100), Some(1));
     }
 }
