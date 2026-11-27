@@ -163,8 +163,8 @@ progress_update() { # <translate|warm> <line>
   return 0
 }
 
-# Reads the tool's output, echoes it, and derives the bar from it.
-progress_filter() { # <kind>
+# Reads tool output lines, echoes them, and derives the bar from them.
+progress_filter() { # <kind>   (stdin: the lines)
   local kind=$1 line
   while IFS= read -r line; do
     line=${line%$'\r'}
@@ -173,7 +173,21 @@ progress_filter() { # <kind>
   done
 }
 
+# Print lines of $2 past the first $3 through progress_filter; the filter's echo
+# goes to the caller's stdout (fd 3), the new line count to real stdout.
+drain() { # <kind> <file> <seen>
+  local kind=$1 file=$2 seen=$3 now
+  now=$(wc -l <"$file" 2>/dev/null || printf 0)
+  if (( now > seen )); then
+    sed -n "$((seen+1)),${now}p" "$file" | progress_filter "$kind" >&3
+  fi
+  printf '%s\n' "$now"
+}
+
 # run_progress <window title> <translate|warm> <command...>
+# The tool writes to a file we poll: the persistent wineserver's service processes
+# inherit the tool's stdout and hold a PIPE open for good, so piping straight into
+# the filter never saw end of file and warm-up hung after the last progress line.
 run_progress() {
   local title=$1 kind=$2 mode=pulsate
   shift 2
@@ -182,13 +196,23 @@ run_progress() {
     BAR=0
     warn "warm-up: no progress window; the tool's own lines follow"
   fi
-  local -a ends=()
+  local tmp rc pid seen=0
+  tmp=$(mktemp "${TMPDIR:-/tmp}/leotux-warmup-out.XXXXXX")
+  exec 3>&1
   set +e
-  "$@" 2>&1 | progress_filter "$kind"
-  ends=("${PIPESTATUS[@]}")
+  "$@" >"$tmp" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    seen=$(drain "$kind" "$tmp" "$seen")
+    sleep 0.5
+  done
+  wait "$pid"; rc=$?
+  seen=$(drain "$kind" "$tmp" "$seen")
+  exec 3>&-
   set -e
+  rm -f "$tmp"
   if [[ $BAR == 1 ]]; then bar_close; fi
-  return "${ends[0]:-1}"
+  return "${rc:-1}"
 }
 
 # What the last full translation pass read: the translator and the archives.
