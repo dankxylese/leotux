@@ -371,9 +371,9 @@ mod tests {
     #[test]
     fn operandless_vop1_preserves_the_following_instruction() {
         for (opcode, name) in [(0, "v_nop"), (0x1b, "v_pipeflush"), (0x41, "v_clrexcp")] {
-            for src in [0xe9, 0xea, 0xf9, 0xfa, 0xff] {
+            for src in 0..=0x1ff {
                 let word = 0x7e00_0000 | (opcode << 9) | src;
-                assert_eq!(summary(&[word, S_ENDPGM]), [(0, 1, name), (4, 1, "s_endpgm")]);
+                assert_eq!(summary(&[word, S_ENDPGM]), [(0, 1, name), (4, 1, "s_endpgm")], "{name} SRC0={src:#x}");
             }
         }
         assert_eq!(summary(&[0x7e00_02ff, 123, S_ENDPGM]), [(0, 2, "v_mov_b32"), (8, 1, "s_endpgm")]);

@@ -34,7 +34,9 @@ pub mod structure;
 /// carries worked out dword by dword, fxceless 1506 and 1507. 0x4c00_0005,
 /// one bump for the merge of the two lines: the scalar rules and fxceless
 /// 1506/1507 together, and always-true/always-false float compares lowered
-/// as constants — no cached translation is trusted across that.)
+/// as constants — no cached translation is trusted across that. The
+/// operandless VOP1 decode and the EXEC destination of VOP3 CMPX (#410)
+/// change translations too, and ride the next bump (0x4c00_0006).)
 pub const TRANSLATOR_VERSION: u32 = 0x4c00_0005;
 
 pub use dxbc::{Container, FourCC, Part};
