@@ -7,9 +7,11 @@ set -euo pipefail
 
 PROJ=/home/manse/A.Projects/GTA6-Emulation
 VICTORY_TREE="${VICTORY_TREE:-victory-7900xtx}"
-VICTORY_EXE="${VICTORY_EXE:-$PROJ/GTA6-btw/$VICTORY_TREE/target/x86_64-pc-windows-msvc/diag/victory.exe}"
+VICTORY_EXE="${VICTORY_EXE:-$PROJ/LeoTux/$VICTORY_TREE/target/x86_64-pc-windows-msvc/diag/victory.exe}"
 GAME_EXE="${GAME_EXE:-$PROJ/GTA6.Xbox.v1.0.2.1-CYBERLEEK/game_scarlett_master.exe}"
-VICTORY_CONSOLE="${VICTORY_CONSOLE:-series-x}"
+# Both monitors are 1080p: series-s profile (1080p, less VRAM, ~5 ms faster, softer
+# picture). VICTORY_CONSOLE=series-x env restores 4K.
+VICTORY_CONSOLE="${VICTORY_CONSOLE:-series-s}"
 
 defaults() { local kv name; for kv in "$@"; do name="${kv%%=*}"; [[ -n "${!name+x}" ]] || export "$kv"; done; }
 
