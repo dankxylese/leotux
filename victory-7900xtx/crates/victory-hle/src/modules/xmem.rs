@@ -553,7 +553,10 @@ impl Section {
 /// Under Wine, with renderer port 1 (`VICTORY_PORT_CONSTANTS=1`): whether the
 /// title's 32-bit graphics pages are shown as memory of their own
 /// (`VICTORY_PORT_HOME=0`: as their section's file, like every other page;
-/// the GPU side then leaves that memory to copies, as without the port).
+/// the GPU side then leaves that memory to copies, as without the port;
+/// `=1` forces it even under `VICTORY_WINE_MAP=0`, which otherwise leaves the
+/// host's `mmap` machinery off — the home tracks nothing through its pages, so
+/// it is safe from the write-tracking misses the global mmap mode is not).
 /// Read here, once.
 ///
 /// vkd3d-proton opens a host heap on memory by importing it into Vulkan, and
@@ -569,7 +572,7 @@ impl Section {
 /// maps the heap's five pieces once). Shown at a second one, the section's
 /// pages all go back to being its file ([`homeless`]), with a warning.
 fn home_on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| port_on() && wine_map::on() && std::env::var_os("VICTORY_PORT_HOME").is_none_or(|v| v != "0"));
+    static ON: LazyLock<bool> = LazyLock::new(|| port_on() && wine_map::available() && std::env::var_os("VICTORY_PORT_HOME").is_none_or(|v| v != "0"));
     *ON
 }
 
@@ -1437,7 +1440,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         home: AtomicUsize::new(0),
         at_home: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
-    if wine_map::on() && section.fd.is_none() {
+    if wine_map::available() && section.fd.is_none() {
         tracing::warn!(n, "the host gave no file descriptor for a section of physical pages: its pages cannot be shown (VICTORY_WINE_MAP=0 shows them as views)");
     }
     let mut table = page_table_mut();

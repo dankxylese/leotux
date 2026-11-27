@@ -68,15 +68,27 @@ static DIRECT: LazyLock<Option<Direct>> = LazyLock::new(|| {
         return None;
     }
     // Read here: `VICTORY_WINE_MAP=0` shows pages as views, through Wine's server.
-    if std::env::var_os("VICTORY_WINE_MAP").is_some_and(|v| v == "0") {
+    // The machinery is still set up for renderer port 1's home (`VICTORY_PORT_HOME=1`):
+    // the port shows the one graphics stretch as memory of its own and tracks nothing
+    // through it, so it does not hit the by-address write-tracking misses that make
+    // the global mmap mode read gigabytes a frame as changed.
+    let global_off = std::env::var_os("VICTORY_WINE_MAP").is_some_and(|v| v == "0");
+    let home_forced = std::env::var_os("VICTORY_PORT_HOME").is_some_and(|v| v == "1");
+    if global_off && !home_forced {
         tracing::info!("title pages are shown as views in placeholders (VICTORY_WINE_MAP=0)");
         return None;
     }
     match find().and_then(|direct| probe(&direct).map(|()| direct)) {
         Ok(direct) => {
-            tracing::info!(
-                "title pages are shown with the host's mmap, beside Wine's server (VICTORY_WINE_MAP=0: as views)"
-            );
+            if global_off {
+                tracing::info!(
+                    "the host's mmap is set up for renderer port 1's home only (VICTORY_PORT_HOME=1; title pages are shown as views, VICTORY_WINE_MAP=0)"
+                );
+            } else {
+                tracing::info!(
+                    "title pages are shown with the host's mmap, beside Wine's server (VICTORY_WINE_MAP=0: as views)"
+                );
+            }
             Some(direct)
         }
         Err(why) => {
@@ -89,8 +101,16 @@ static DIRECT: LazyLock<Option<Direct>> = LazyLock::new(|| {
     }
 });
 
-/// Whether pages are shown this way.
+/// Whether title pages are shown with the host's mmap generally (every
+/// placeholder): the mode `xmem` maps reservations by. Not the same as
+/// [`available`] when the machinery is up for renderer port 1's home alone.
 pub(crate) fn on() -> bool {
+    DIRECT.is_some() && !std::env::var_os("VICTORY_WINE_MAP").is_some_and(|v| v == "0")
+}
+
+/// Whether the host's `mmap` machinery is there to show pages with at all
+/// (renderer port 1's home uses it under `VICTORY_WINE_MAP=0`).
+pub(crate) fn available() -> bool {
     DIRECT.is_some()
 }
 
