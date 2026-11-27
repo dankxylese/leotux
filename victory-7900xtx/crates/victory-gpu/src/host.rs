@@ -5197,12 +5197,17 @@ impl Host {
         // What comes down: the pieces as the check gives them (whole pieces,
         // to be hashed) or as they are merged; their runs are the copy
         // regions, pieces of one copy that touch joined across the 64 KiB
-        // blocks they lie in ([`crate::land::runs`]).
+        // blocks they lie in ([`crate::land::runs`]). The offset each run is
+        // recorded from is an offset in the copy — the offset of the copy's
+        // card-side buffer — not its title address: `span().0 + lo` is what
+        // goes in a `Had` key, and as a buffer offset it reads past the end
+        // of the card's buffer (page fault in `vkd3d_queue`, device removed
+        // 0x887A0005, run 103).
         let copies: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)] =
             check.as_ref().map_or(&pieces, |c| &c.copies);
         let fetched: Vec<land::Fetched> = copies
             .iter()
-            .map(|(shadow, lo, hi, at)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo, *at))
+            .map(|(shadow, lo, hi, at)| (shadow.id(), *lo, hi - lo, *at))
             .collect();
         // The stages ([`ahead`]): each waited for when its merge begins. The
         // check hashes pieces whole, so with it the fetch is one stage.
@@ -5215,6 +5220,10 @@ impl Host {
         };
         let first = f.sent + 1;
         f.sent += cut.len() as u64;
+        // One value signalled per stage, and one wait per stage: the two are
+        // the same list of stages, except where the check makes the fetch one
+        // stage over a copy list of its own.
+        debug_assert_eq!(cut.len(), recorded.len());
         while f.lists.len() < cut.len() {
             match self.make_relay_list(f.queue.is_some()) {
                 Some(list) => f.lists.push(list),
@@ -5246,9 +5255,18 @@ impl Host {
                     let (allocator, list) = list;
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (piece, lo, len, down) in land::runs(&fetched[stage.clone()], land::run_most()) {
+                    for (piece, at, len, down) in land::runs(&fetched[stage.clone()], land::run_most()) {
                         let shadow = &copies[stage.start + piece].0;
-                        list.CopyBufferRegion(&buffer, down, &shadow.buffer, lo as u64, len as u64);
+                        // `at` is an offset in the copy: a region that leaves
+                        // the card's buffer reads memory that is not there (a
+                        // page fault in the queue, not a wrong wall).
+                        let size = shadow.span().1;
+                        if at as u64 + len as u64 > size {
+                            fail(format_args!(
+                                "a fetch of {len} bytes at {at} reads past the copy's {size} (VICTORY_RELAY=1)"
+                            ));
+                        }
+                        list.CopyBufferRegion(&buffer, down, &shadow.buffer, at as u64, len as u64);
                         regions += 1;
                     }
                     list.Close()?;

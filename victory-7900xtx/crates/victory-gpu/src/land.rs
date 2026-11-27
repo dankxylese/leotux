@@ -390,8 +390,16 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
 /// A piece to land: the copy's number, the title address, its bytes.
 pub(crate) type Piece = (u64, usize, usize);
 
-/// A piece as it is fetched: the copy's number, the title address, its
-/// bytes, and where its bytes come down (an offset in the fetch's buffer).
+/// A piece as it is fetched: the copy's number, the offset in the copy its
+/// bytes begin at, its bytes, and where its bytes come down (an offset in
+/// the fetch's buffer).
+///
+/// The second is an offset in the copy — the same one the card-side buffer
+/// is addressed with — and **not** the piece's title address. (The title
+/// address is the copy's start plus it, and recording a region from it made
+/// the fetch read `start` bytes past the end of the copy's card-side buffer:
+/// a GPU read fault in `vkd3d_queue` and device removed 0x887A0005, run
+/// 103.)
 pub(crate) type Fetched = (u64, usize, usize, u64);
 
 /// The longest run of a copy's pieces one `CopyBufferRegion` brings
@@ -411,10 +419,17 @@ pub(crate) fn run_most() -> usize {
 }
 
 /// `pieces`, in [`ordered`]'s order, as the runs one `CopyBufferRegion` each
-/// brings: pieces of one copy that touch, joined across the 64 KiB blocks
-/// they lie in, no run longer than `most` bytes. Each as the number of the
-/// piece it begins with, its title address, its bytes, and where they come
-/// down.
+/// brings: pieces of one copy whose offsets in it touch, joined across the
+/// 64 KiB blocks they lie in, no run longer than `most` bytes. Each as the
+/// number of the piece it begins with, the offset in the copy its bytes
+/// begin at, its bytes, and where they come down.
+///
+/// Joined on the copy's own offsets, so a run is one range of that copy,
+/// inside it: every piece lies in the copy and a join only takes a piece
+/// that begins where the run ends, so no region can read past the copy's
+/// card-side buffer. (A join on title addresses would say the same of one
+/// copy, but the offset is what a region is recorded from, and the two are
+/// only equal for a copy that starts at title address 0.)
 ///
 /// The pieces themselves stay as they are: each is still merged on its own,
 /// within one block, in the order given ([`ordered`]'s rule). Only the copy

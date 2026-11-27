@@ -127,10 +127,10 @@ fn ordered_pieces_hold_the_same_bytes() {
     }
 }
 
-/// Runs join pieces of one copy that touch, across the blocks they lie in;
-/// hold every piece once, in order, no longer than the most asked for; and
-/// end only where the next piece is another copy's, does not touch it, or
-/// would make the run too long.
+/// Runs join pieces of one copy whose offsets in it touch, across the blocks
+/// they lie in; hold every piece once, in order, no longer than the most
+/// asked for; stay inside the copy; and end only where the next piece is
+/// another copy's, does not touch it, or would make the run too long.
 #[test]
 fn runs_join_the_pieces_of_one_copy_across_blocks() {
     let mut random = Random(31);
@@ -182,6 +182,8 @@ fn runs_join_the_pieces_of_one_copy_across_blocks() {
             }
             assert_eq!(len, bytes, "{pieces:?} -> {out:?}");
             assert!(len <= most);
+            // A run is one range of its copy, inside it.
+            assert!(at + len <= 24 * BLOCK, "a run leaves its copy: {at} + {len}");
             // Nothing more could be joined to it.
             if end < pieces.len() {
                 let (fits, touches, same) = (
@@ -254,6 +256,57 @@ fn runs_bring_every_piece_to_its_place() {
                 "round {round}: piece {at} of copy {copy} at {to}"
             );
         }
+    }
+}
+
+/// The offset a run gives is an offset in its copy — what the copy's
+/// card-side buffer is addressed with — so the run stays inside that
+/// buffer. The title address where the offset belongs is the copy's start
+/// further on, and a region recorded from it leaves the buffer: the fetch
+/// read 128 TiB past it and the device went away (run 103, `vkd3d_queue`, RW
+/// 0, 0x887A0005).
+#[test]
+fn runs_give_offsets_in_the_copy_not_title_addresses() {
+    let (len, start) = (4 * BLOCK, 0x7ff6_1a00_0000usize);
+    let pieces: Vec<Fetched> = (0..4).map(|b| (11u64, b * BLOCK, BLOCK, b as u64 * BLOCK as u64)).collect();
+    let out = runs(&pieces, 2 << 20);
+    assert_eq!(out.len(), 1, "the copy's blocks are one run");
+    assert_eq!((out[0].1, out[0].2), (0, len), "the run is the copy's own offsets");
+    assert!(out[0].1 + out[0].2 <= len, "a run stays inside its copy");
+    // The same pieces as title addresses, which is what the record site
+    // used: outside the copy, by its start.
+    let titled: Vec<Fetched> = (0..4).map(|b| (11u64, start + b * BLOCK, BLOCK, b as u64 * BLOCK as u64)).collect();
+    let wrong = runs(&titled, 2 << 20);
+    assert_eq!(wrong.len(), 1);
+    assert!(wrong[0].1 + wrong[0].2 > len, "a title address is not an offset in the copy");
+}
+
+/// Two copies never make one region, even where their offsets in them touch
+/// or overlap: a region is recorded from the first copy's buffer, and the
+/// second's offsets are not there to read.
+#[test]
+fn runs_never_join_two_copies() {
+    let block = |copy: u64, b: usize, down: u64| (copy, b * BLOCK, BLOCK, down);
+    // One copy's two blocks: one region.
+    let joined = runs(&[block(5, 0, 0), block(5, 1, BLOCK as u64)], 2 << 20);
+    assert_eq!(joined.len(), 1, "{joined:?}");
+    assert_eq!(joined[0].2, 2 * BLOCK);
+    // The same offsets, one block each, under two copies: two regions.
+    let apart = runs(&[block(5, 0, 0), block(6, 1, BLOCK as u64)], 2 << 20);
+    assert_eq!(apart.len(), 2, "two copies are two regions: {apart:?}");
+    // And copies that stand over the same memory, block by block.
+    let mut pieces = Vec::new();
+    let mut down = 0;
+    for b in 0..4 {
+        for copy in [3u64, 9] {
+            pieces.push(block(copy, b, down));
+            down += BLOCK as u64;
+        }
+    }
+    let out = runs(&pieces, 2 << 20);
+    assert_eq!(out.len(), pieces.len(), "each piece its own region: {out:?}");
+    for &(first, at, len, down) in &out {
+        assert_eq!((at, len, down), (pieces[first].1, pieces[first].2, pieces[first].3));
     }
 }
 
