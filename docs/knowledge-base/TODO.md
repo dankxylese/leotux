@@ -66,6 +66,14 @@ covers only Wine's builtin. dxil.dll unneeded at runtime (vkd3d carries dxil-spi
       copy-back is 33-54 ms, so this is the next big switch to try after the A/Bs);
       VICTORY_PC_FSR=1 + FSR4.x acceptance (future sharpness option).
 
+## Later digs
+
+- [ ] RT/BVH tree format (the console's ray-tracing structures): document the layout
+      by measurement (captures via the layer's own replay/poke + the BVH builder's
+      fault-bounds knowledge from the merge) so the RT path (dark scenes, phone,
+      ambient-RT) runs on standard DXR trees. Big, not started; the merge already
+      carries avatarmanz's BVH-fault bounds groundwork.
+
 ## Diagnostics / quality of life
 
 - [ ] LeoTux-old cherry-picks (cherry-pick-inventory.md): 44-row null-ref skip family

@@ -16,7 +16,7 @@ real world content and is 1-to-1 comparable between runs).
 |---|---|
 | Boot, menus, intro video | 30 fps, the title's own cap (no rubber-banding: joins are world-only) |
 | From the start to the world | about 20-30 s |
-| Prologue, in-world | 13-20 fps, 74.7 ms a frame median (p90 101.7) |
+| Prologue, in-world | 17-19 fps, 59.6 ms a frame median (p90 100.7) |
 | Faces and mouths | **working** — skin on every run, lips follow the dialogue |
 | Shaders and pipelines | pre-computed before the title starts (`warm-up.sh`: every shader translated once, every pipeline earlier runs drew with made ahead, with a progress window — the title does not stall on them) |
 
@@ -29,9 +29,12 @@ they used to be read as floats through integer views, which computes zeros: a fa
 
 Known to be wrong (only what our own runs hit):
 
-- **The frame is the layer's memory overlay, not the GPU**: ~25 ms uploading pages the title wrote and ~45 ms
-  reading back what shaders wrote, of a ~75 ms frame, with the GPU idle for most of it. Being worked on
-  (docs/knowledge-base/TODO.md); 30 fps is the target.
+- **The frame is the layer's memory overlay, not the GPU**: ~19 ms uploading pages the title wrote and ~20 ms
+  reading back what shaders wrote, of a ~60 ms frame, with the GPU idle for most of it. The read-back was ~49 ms
+  until shaders' writes into write-combined title memory were left on the card (`VICTORY_WC_NO_BACK`, on by
+  default); what is left: ~21 GB a frame re-inspected to find ~90 MB of writes (the guards' protections and
+  lock waits), and fetches of ranges the title's CPU never reads (a lazy, read-fault-triggered copy-back is
+  being designed). Being worked on (docs/knowledge-base/TODO.md); 30 fps is the target.
 - **Rare title crash**: a null-vtable read in the title's own streaming code (a spawn descriptor consumed before its
   object is constructed; the upstream "null pointer in own code" race). `VICTORY_SKIP_NULL_VTABLE` (on unless `0`)
   survives it: the call is skipped with a zero result, counted, and reported; a per-site loop breaker keeps a
@@ -105,7 +108,7 @@ from, what was merged and how conflicts were resolved is in its `UPSTREAM.md`.
 
 | Tree | What it is | State here |
 |---|---|---|
-| `victory-7900xtx` (default) | [avatarmanz's RDNA 3 fork](https://github.com/avatarmanz/VIctory-7900XTX) + [zeex64's Linux work](https://github.com/zeex64/VIctory-7900XTX) + PR [#440](https://github.com/avatarmanz/VIctory-7900XTX/pull/440) and its mouths-fix advance + ours | 13-20 fps in the prologue with faces and mouths working |
+| `victory-7900xtx` (default) | [avatarmanz's RDNA 3 fork](https://github.com/avatarmanz/VIctory-7900XTX) + [zeex64's Linux work](https://github.com/zeex64/VIctory-7900XTX) + PR [#440](https://github.com/avatarmanz/VIctory-7900XTX/pull/440) and its mouths-fix advance + [Belobug#477](https://github.com/Belobug/VIctory-Belobug-AMD/pull/477) (`VICTORY_WC_NO_BACK`) + ours (a staged read-back relay, the port-1 home decoupled, the null-vtable guard) | 17-19 fps in the prologue with faces and mouths working |
 | `victory`, `scarlight` | older Belobug and [Scarlight](https://github.com/pablogonz12/Scarlight) trees | kept for reference |
 
 `victory-belobug` and `victory-dexnom` were dropped here (2026-11-27): both were far behind
@@ -138,6 +141,7 @@ variable set in the environment wins. Our `run-victory-direct.sh` takes the same
 | `VICTORY_WINE_MAP` | `0` | the mmap title-memory mode: poison with our write-tracking (gigabytes read as changed per frame); the rbtree server covers its benefit |
 | `VICTORY_PORT_HOME` | `1` | renderer port 1's home under `VICTORY_WINE_MAP=0`: the title's 32-bit graphics heap used in place (prologue A/B: -7 ms median, p90 -18) |
 | `VICTORY_TEXTURE_MAX` | `0` | the merged tree caps streamed textures at 1024 px by default (muddy textures); `0` keeps full mips on the 16 GB card |
+| `VICTORY_WC_NO_BACK` | `1` | shaders' writes into write-combined title memory stay on the card (prologue A/B: read-back 49 -> 20 ms, median 74.7 -> 53.6); `0` restores fetching |
 | `VICTORY_WARM_FIRST` | `1` | `0`: start the title without compiling shaders first |
 | `VICTORY_FORK_SETTINGS` | `1` | `0`: none of the tree's speed switches (to tell whether one of them is at fault) |
 | `VICTORY_AMBIENT` | `0` | the title's own ambient light; `0.8`: the forks' stand-in for the missing ray-traced light (flatter skin) |
