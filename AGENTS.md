@@ -106,6 +106,19 @@ python -I tools/rdna2spirv.py <work>/shaders/dxbc/disasm --out <scratch> --shard
 Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`. Report translated and
 `spirv-val`-valid counts before and after; a change that lowers either is a regression.
 
+## Session Commands
+
+### /resume
+1. Read the 3 most recent session logs in `docs/knowledge-base/logs/`
+2. Summarize current state and what's left to do
+3. Do not read source files as part of this process
+
+### /save
+1. Create a session log at `docs/knowledge-base/logs/YYYY-MM-DD-description.md`
+2. Record: what was done, decisions made, pending items, any changed architectural constraints
+3. If a decision affects how a system works, note which `docs/` file needs updating
+4. **Propose the commit.** Once the owner agrees, commit and push in the same step
+
 ## Conventions
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
