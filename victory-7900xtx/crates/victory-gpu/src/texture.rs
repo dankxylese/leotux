@@ -1724,6 +1724,15 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
+    // Under Wine the title's sections are committed whole (xmem): what views
+    // the runtime mapped show all of is there, without asking the host
+    // (~30 µs a question there; `VICTORY_COMMITTED_BY_VIEWS=0`: asked).
+    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BY_VIEWS.get_or_init(|| crate::wine::switch("VICTORY_COMMITTED_BY_VIEWS", true))
+        && crate::inplace::shown_bytes(at as usize, len) == Some(len as u64)
+    {
+        return true;
+    }
     let (there, of) = readable(at as usize, len, true);
     there == of
 }

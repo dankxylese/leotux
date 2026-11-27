@@ -1183,8 +1183,15 @@ fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) / 10
 }
 
-/// This thread's processor time so far (user, kernel), in microseconds.
+/// This thread's processor time so far (user, kernel), in microseconds;
+/// zeros with `VICTORY_THREAD_TIMES=0`, the default under Wine, where each
+/// asking is a costly trip (two a submission: ~4% of the submitting
+/// thread's time in the 2026-11-27 profile).
 fn thread_times() -> (u64, u64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("VICTORY_THREAD_TIMES").map_or(!crate::wine::on_wine(), |v| v != "0")) {
+        return (0, 0);
+    }
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };

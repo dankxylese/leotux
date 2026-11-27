@@ -84,6 +84,9 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
             1,
         )
     } as usize;
+    if at != 0 {
+        crate::pagemap::memory_watched(at, len);
+    }
     (at != 0).then_some(at)
 }
 

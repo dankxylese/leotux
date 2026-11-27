@@ -18,6 +18,12 @@
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod wine;
+#[cfg(windows)]
+mod pagemap;
+#[cfg(windows)]
+pub use pagemap::memory_watched;
+#[cfg(windows)]
 mod lightprobe;
 #[cfg(windows)]
 mod texlate;
