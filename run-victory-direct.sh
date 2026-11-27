@@ -37,6 +37,13 @@ mkdir -p "$CACHE_DIR/vkd3d" "$PROJ/LeoTux-logs" \
 defaults "VICTORY_CACHE_DIR=C:\\users\\manse\\AppData\\Local\\$VICTORY_TREE\\cache" \
          "VKD3D_SHADER_CACHE_PATH=Z:${CACHE_DIR//\//\\\\}\\vkd3d"
 
+# Xwayland restarts with a fresh auth cookie when a GPU reset kills it; an
+# inherited or default XAUTHORITY then points at a dead cookie and the window
+# never opens. Follow the newest cookie when none was given.
+if [[ -z "${XAUTHORITY:-}" && -n "${DISPLAY:-}" ]]; then
+  newest_xauth=$(ls -t /run/user/"$(id -u)"/xauth_* 2>/dev/null | head -1) && [[ -n $newest_xauth ]] && export XAUTHORITY=$newest_xauth
+fi
+
 # VIctory settings (same defaults as run_victory_proton.sh)
 # VICTORY_WINE_MAP (mmap title memory, on-by-default under Wine since the PR merge) is
 # POISON here: the kernel's by-address write tracking misses writes through the mmap
