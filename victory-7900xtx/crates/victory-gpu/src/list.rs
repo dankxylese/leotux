@@ -281,6 +281,14 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// For the memory bench (`crate::host::membench`): the host lists idle in
+/// [`IDLE`] and the scratch bytes they keep.
+#[cfg(all(windows, test))]
+pub(crate) fn idle() -> (usize, u64) {
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    (idle.0.len(), idle.1)
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
