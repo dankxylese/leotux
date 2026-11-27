@@ -82,8 +82,6 @@ if [[ "${1:-}" == "warm" ]]; then
 fi
 
 if [[ "${VICTORY_WARM_FIRST:-1}" == 1 ]]; then
-  echo "compiling shaders before the title starts..."
-  "$WINE" "$VICTORY_EXE" warm --used || echo "warning: warm failed; starting anyway" >&2
-  echo "shaders ready"
+  "$PROJ/LeoTux/warm-up.sh" || echo "warning: warm-up failed; starting anyway" >&2
 fi
 exec "$WINE" "$VICTORY_EXE" run --execute --console "$VICTORY_CONSOLE" "$GAME_EXE" "$@"
