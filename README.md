@@ -36,10 +36,12 @@ Known to be wrong (only what our own runs hit):
   world-load frame's few-second dip; a batched wait is being written), ~21 GB a frame re-inspected to find
   ~90 MB of writes, and fetches of ranges the title's CPU never reads. Being worked on
   (docs/knowledge-base/TODO.md); 30 fps is the target.
-- **Rare title crash**: a null-vtable read in the title's own streaming code (a spawn descriptor consumed before its
-  object is constructed; the upstream "null pointer in own code" race). `VICTORY_SKIP_NULL_VTABLE` (on unless `0`)
-  survives it: the call is skipped with a zero result, counted, and reported; a per-site loop breaker keeps a
-  limping title from spinning in place.
+- **Rare title crash**: null dereferences in the title's own streaming code (a spawn descriptor consumed before its
+  object is constructed; the upstream "null pointer in own code" race, ~1 in 30 runs). Two survival guards
+  (each on unless `0`): `VICTORY_SKIP_NULL_VTABLE` for the vtable-call shape and `VICTORY_SKIP_NULL_CHAIN` for
+  null-base direct-offset loads — the fault is skipped with a zero result, decoded fail-closed (only the exact
+  instruction shape, only a null base, only a near-null fault address, only in a title image), counted, reported,
+  and a per-site loop breaker keeps a limping title from spinning in place.
 - **`--console series-s` does not boot here** (stalls before boot compute; the Series-S memory profile it reports
   wedges the title's pool setup). Series X at 4K output is the tested profile; on a 1080p monitor the compositor
   downscale looks native. `VICTORY_OUTPUT` is not used (it upscales from a low internal resolution).
