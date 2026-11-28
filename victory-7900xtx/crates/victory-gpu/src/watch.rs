@@ -2663,6 +2663,121 @@ impl Drop for HotAsker {
     }
 }
 
+/// `VICTORY_WATCH_RANGE=<base:end>` (both hex, and both inside one 64 KiB
+/// block): the write journal's block, kept read-only for the whole run.
+///
+/// A guarded block is normally let go once the title has written it and left
+/// open while it keeps writing ([`Guards::rests`], [`Guards::stays_hot`]). A
+/// block this names is not: every store into it faults, each fault is made
+/// writable so the store goes on, and the block is made read-only again at
+/// the next asking — so every write to it is seen. Each fault is journaled
+/// with the time, the thread, the address, and the qword there before and
+/// after the block was opened (the title's streaming records are published
+/// header-first, and a reader that arrives between the store of a record's
+/// pointer and the store that follows it is the crash this names).
+fn watched_range() -> Option<(usize, usize)> {
+    static RANGE: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let given = std::env::var("VICTORY_WATCH_RANGE").ok()?;
+        let parsed = given.split_once(':').and_then(|(from, to)| {
+            let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+            Some((hex(from)?, hex(to)?))
+        });
+        let Some((from, to)) = parsed else {
+            tracing::warn!(range = %given, "VICTORY_WATCH_RANGE: not <base:end> in hex, nothing watched");
+            return None;
+        };
+        if to <= from || from / BLOCK != (to - 1) / BLOCK {
+            tracing::warn!(
+                range = %given,
+                block = BLOCK,
+                "VICTORY_WATCH_RANGE: not one block, nothing watched"
+            );
+            return None;
+        }
+        tracing::info!(
+            from = format_args!("{from:#x}"),
+            to = format_args!("{to:#x}"),
+            block = from / BLOCK,
+            "a block watched: kept read-only, every write fault on it journaled"
+        );
+        Some((from, to))
+    })
+}
+
+/// Whether `block` is the watched one ([`watched_range`]).
+fn watched(block: usize) -> bool {
+    watched_range().is_some_and(|(from, _)| from / BLOCK == block)
+}
+
+/// Said once: the watched block is not ours to guard at this asking (another
+/// view's page, or the kernel's, or a range the runtime is changing), so its
+/// stores will not fault and the journal will not see them. A journal with no
+/// line on it is otherwise read as "the title never wrote there", which is the
+/// wrong conclusion of the two.
+fn watched_not_guarded() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "VICTORY_WATCH_RANGE: the watched block is not ours to guard at this asking (another view's, the kernel's, or being changed): its stores are not journaled while that lasts"
+        );
+    }
+}
+
+/// When the run's watch journal started counting microseconds, and the one
+/// its last line was written at.
+static JOURNAL_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static JOURNAL_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The qword at `at` — its 8-byte slot, so that the read stays inside one
+/// page — if `at` is in the watched block.
+fn journal_qword(at: usize) -> Option<u64> {
+    if !watched(at / BLOCK) {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    // SAFETY: a read of title memory through the system, which copies into
+    // our buffer and reads nothing through a pointer of ours.
+    crate::host::read_into((at & !7) as *const u8, &mut bytes).then(|| u64::from_le_bytes(bytes))
+}
+
+/// One line of the journal: a write fault on the watched block at `at`, and
+/// the qword there read before the block was opened (`before`).
+///
+/// The line carries the microseconds since the run started, the thread that
+/// faulted, the address, the qword before, and the qword after the block was
+/// made writable again. The faulting store has not run yet when this is
+/// written (the fault is how it is seen: it runs when the handler returns),
+/// so a qword that differs is another thread's write in that window — and
+/// the store's own value is the *next* line's `before` at that address,
+/// which is what the gap beside it times.
+fn journal_write(at: usize, before: Option<u64>) {
+    let Some(before) = before else {
+        return;
+    };
+    let started = JOURNAL_START.get_or_init(std::time::Instant::now);
+    let us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let gap = JOURNAL_LAST.swap(us, std::sync::atomic::Ordering::Relaxed);
+    let after = journal_qword(at);
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    // SAFETY: asks the system which thread this is; nothing is read through
+    // a pointer.
+    let thread = unsafe { GetCurrentThreadId() };
+    let of = |q: Option<u64>| match q {
+        Some(q) => format!("{q:#018x}"),
+        None => "unreadable".to_owned(),
+    };
+    tracing::warn!(
+        us,
+        thread,
+        at = format_args!("{at:#x}"),
+        before = %of(Some(before)),
+        after = %of(after),
+        gap_us = us.saturating_sub(if gap == 0 { us } else { gap }),
+        "a write fault on the watched block"
+    );
+}
+
 impl Guards {
     fn left_alone(&self, block: usize) -> bool {
         // (What a change that is done left in `changing` counts no more:
@@ -2672,16 +2787,23 @@ impl Guards {
     }
 
     /// Whether `block` is left open for now: the title has just written it,
-    /// or keeps writing it ([`hot_frames`]).
+    /// or keeps writing it ([`hot_frames`]). Never the watched block: its
+    /// stores are the journal's, and they are seen by its faults
+    /// ([`watched_range`]).
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        if watched(block) {
+            return false;
+        }
         !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
     }
 
     /// Whether `block`, which is open, is hot and stays open at this asking
     /// of a refresh ([`hot_frames`]): told as written once more. Not if that
-    /// has been far more often than it was written ([`HOT_WORTH`]).
+    /// has been far more often than it was written ([`HOT_WORTH`]), and not
+    /// the watched block: it is made read-only again at every asking, so that
+    /// its stores fault and are journaled ([`watched_range`]).
     fn stays_hot(&mut self, block: usize) -> bool {
-        if self.heat.is_empty() {
+        if watched(block) || self.heat.is_empty() {
             return false;
         }
         let now = crate::frame::current();
@@ -3498,6 +3620,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                     }
                     covers.push((block, block + 1));
                 } else if g.foreign.contains(&block) || g.left_alone(block) || g.rests(block, rest) {
+                    if watched(block) && (g.foreign.contains(&block) || g.left_alone(block)) {
+                        // (The journal's block, which this pass cannot make
+                        // read-only: said once, so that a journal with no
+                        // lines on it is not read as a page never written.)
+                        watched_not_guarded();
+                    }
                     if let Some(run) = run.take() {
                         plan.push(run);
                     }
@@ -5112,6 +5240,10 @@ fn title_memory_changed(at: usize, len: usize) {
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
+    // (The watch journal's block, read here and not in the handler: a
+    // faulting thread may hold any lock, and this reads the environment and
+    // logs once.)
+    let _ = watched_range();
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -5197,12 +5329,22 @@ pub(crate) fn install() {
             }
             #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
+            // (The watch journal's qword, read before the block is opened:
+            // [`journal_write`] reads it again once it is writable. Nothing
+            // is read at all unless `VICTORY_WATCH_RANGE` named this block.)
+            let journaled = journal_qword(at);
             // (Let go again before the next look: the runtime wants the
             // guards to end a change. [`open`] holds a shard's lock only for
             // its lookups, and asks Windows with none held.)
             let (opened, noted, _) = open_fault(at, at + 1, Some(block), false);
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
+            // (After the write access is back, and after the fault's own time
+            // is taken: the journal's read of the page is not the guard's
+            // cost and must not pad it.)
+            if opened != 0 {
+                journal_write(at, journaled);
+            }
             if opened != 0 {
                 if !noted {
                     // (Its state is another shard's: noted there.)

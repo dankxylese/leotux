@@ -132,6 +132,7 @@ pub fn report_crashes() {
     // other.
     SKIP_NULL_VTABLE.store(switch("VICTORY_SKIP_NULL_VTABLE"), Relaxed);
     SKIP_NULL_CHAIN.store(switch("VICTORY_SKIP_NULL_CHAIN"), Relaxed);
+    SKIP_SMALL_WRITE.store(switch("VICTORY_SKIP_SMALL_WRITE"), Relaxed);
     static AT_EXIT: std::sync::Once = std::sync::Once::new();
     // SAFETY: registers a function with the host CRT's exit table; it reads
     // our counters and logs, nothing else.
@@ -516,6 +517,16 @@ static NULL_VTABLE_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// the same accounting (at exit, and in every crash report).
 static NULL_CHAIN_SKIPS: AtomicU64 = AtomicU64::new(0);
 
+/// `VICTORY_SKIP_SMALL_WRITE` (on unless it is `0`): a store through a small
+/// non-null pointer — a size or a count where a pointer belongs — is skipped
+/// instead of ending the process (see [`skip_small_write`]). Its own switch
+/// as the other two have theirs. Read once by [`report_crashes`].
+static SKIP_SMALL_WRITE: AtomicBool = AtomicBool::new(true);
+
+/// The stores [`skip_small_write`] skipped: `WRITE_SKIPS` at exit and in
+/// every crash report, beside the other two.
+static WRITE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
 /// Title images the loader mapped, that [`skip_null_chain`] may skip in: a
 /// fixed table, so that the handler reads it without a lock (the faulting
 /// thread may hold any of the title's, ours or the heap's). More images than
@@ -682,13 +693,29 @@ struct VtableCall {
     slot: u64,
 }
 
-/// The virtual call at `at` in `code`, if it has exactly the shape of a
-/// call through a vtable pointer the title loaded from an object: a load of
-/// the pointer and the indirect call through it, nothing between, and a
-/// slot that is one (`0` to `0x78`, a multiple of 8). `reg`, `reg2`, the
-/// call or the `jmp` a tail call makes of it, and the slot are free: a
-/// title's crash moves from site to site, not its idiom.
-fn null_vtable_call(code: &[u8], at: usize) -> Option<VtableCall> {
+/// An indirect call through a slot of an object: `call|jmp *disp(reg)` and
+/// the slot read through it.
+struct IndirectCall {
+    /// Bytes from the call to the instruction after it.
+    len: usize,
+    /// The register holding the vtable pointer, as instructions encode it.
+    vtable: u8,
+    /// The slot read through it, which is the address faulted on when the
+    /// vtable pointer is null.
+    slot: u64,
+}
+
+/// The indirect call at `at` in `code`, if it has exactly the shape of a
+/// call through a slot of an object: a `call` or a `jmp` (a tail call's)
+/// through memory, a SIB with a base and no scaled index, not RIP-relative,
+/// and a slot that is one (`0` to `0x78`, a multiple of 8). `reg`, the base
+/// and the slot are free: a title's crash moves from site to site, not its
+/// idiom.
+///
+/// Whether a `mov` filled that register is [`vtable_load`]'s question: the
+/// two are separate so that a call of the shape whose load does not check
+/// out is a fault the guard refuses to skip, and says so.
+fn indirect_call(code: &[u8], at: usize) -> Option<IndirectCall> {
     let (rex, mut i) = match *code.get(at)? {
         rex @ 0x40..=0x4f => (rex, at + 1),
         _ => (0, at),
@@ -739,27 +766,103 @@ fn null_vtable_call(code: &[u8], at: usize) -> Option<VtableCall> {
         return None;
     }
     let vtable = base | (rex & 1) << 3;
-    // The load of the vtable pointer, immediately before the call.
-    vtable_load(code, at, vtable).then_some(VtableCall {
+    Some(IndirectCall {
         len,
         vtable,
         slot: disp as u64,
     })
 }
 
-/// Whether `mov reg, [reg2]` into `vtable` ends exactly at `end`:
-/// `REX.W(+R/B) 8B /r`, no SIB, no displacement.
-fn vtable_load(code: &[u8], end: usize, vtable: u8) -> bool {
-    (end.saturating_sub(4)..end).any(|at| load_into(code, at, end) == Some(vtable))
+/// The virtual call at `at` in `code`, if [`indirect_call`]'s shape is there
+/// and [`vtable_load`] proves the register it goes through was filled by a
+/// `mov reg, [base]`.
+fn null_vtable_call(code: &[u8], at: usize) -> Option<VtableCall> {
+    let call = indirect_call(code, at)?;
+    vtable_load(code, at, call.vtable).then_some(VtableCall {
+        len: call.len,
+        vtable: call.vtable,
+        slot: call.slot,
+    })
 }
 
-/// The register `mov reg, [reg2]` at `at` loads, if that is the whole
-/// instruction and it ends at `end`.
-fn load_into(code: &[u8], at: usize, end: usize) -> Option<u8> {
+/// How far before the call the load of its register may be: the title's
+/// code puts a few `mov reg, reg` between them, and no more.
+const VTABLE_REACH: usize = 16;
+
+/// Whether a `mov reg, [reg2]` into `vtable` ends exactly at `end` — the
+/// call — or ends at most [`VTABLE_REACH`] bytes before it and only argument
+/// setup came between: `mov reg, reg` instructions that write neither
+/// `vtable` nor any memory.
+///
+/// The run48 crash is why: the compiler put three of them between the load
+/// and the call (`mov r15,[rdi]; mov rcx,rdi; mov edx,ebx; mov r14,rax;
+/// call [r15+8]`), and a load that ends exactly at the call — all this asked
+/// for before — is not the shape the title's code has.
+///
+/// Fail-closed: the nearest load into that register is taken only if every
+/// byte between it and the call is such a move. An instruction that writes
+/// the register, reads or writes memory, or that is not a register move ends
+/// the walk, and the answer is no: the fault is then reported as before,
+/// because a skip on a valid call corrupts the title silently.
+fn vtable_load(code: &[u8], end: usize, vtable: u8) -> bool {
+    let first = end.saturating_sub(VTABLE_REACH);
+    (first..=end.saturating_sub(3))
+        .rev()
+        .any(|at| load_into(code, at) == Some(vtable) && register_setup(code, at + 3, end, vtable))
+}
+
+/// Whether `code[from..to]` is argument setup only: instructions that move
+/// one register into another, none of them writing `keep`, and none of them
+/// reading or writing memory. The bytes must tile exactly: a range that
+/// decodes to anything else, or that a move overruns, is no setup.
+fn register_setup(code: &[u8], from: usize, to: usize, keep: u8) -> bool {
+    let mut at = from;
+    while at < to {
+        let Some((len, dst)) = move_register(code, at) else {
+            return false;
+        };
+        // (The move must end inside the range, not past it.)
+        if dst == keep || at + len > to {
+            return false;
+        }
+        at += len;
+    }
+    at == to
+}
+
+/// `mov reg, reg` at `at`: an optional REX prefix, `88`/`89` (the modrm's
+/// `rm` is written) or `8a`/`8b` (`reg` is), `modrm` mod 11 — a register as
+/// the source and as the destination. Its length and the register written.
+/// Anything with a memory operand is a load or a store and is no argument
+/// setup; so is anything else, and both end the walk back.
+fn move_register(code: &[u8], at: usize) -> Option<(usize, u8)> {
+    let rex = match *code.get(at)? {
+        rex @ 0x40..=0x4f => rex,
+        _ => 0,
+    };
+    let i = at + usize::from(rex != 0);
+    let op = *code.get(i)?;
+    let modrm = *code.get(i + 1)?;
+    if !matches!(op, 0x88..=0x8b) || modrm >> 6 != 3 {
+        return None;
+    }
+    // 88/89 write `rm`, 8a/8b write `reg`. An 8- or 16-bit move writes its
+    // register too: which part of it does not matter to the walk.
+    let dst = if op & 2 == 0 {
+        modrm & 7 | (rex & 1) << 3
+    } else {
+        (modrm >> 3) & 7 | (rex & 4) << 1
+    };
+    Some((i + 2 - at, dst))
+}
+
+/// The register `mov reg, [reg2]` at `at` loads, if that is one instruction
+/// of three bytes: `REX.W(+R/B) 8B /r`, mod 00, no SIB, no displacement.
+fn load_into(code: &[u8], at: usize) -> Option<u8> {
     let &[rex @ 0x48..=0x4f, 0x8b, modrm] = code.get(at..at + 3)? else {
         return None;
     };
-    if at + 3 != end || modrm >> 6 != 0 || matches!(modrm & 7, 4 | 5) {
+    if modrm >> 6 != 0 || matches!(modrm & 7, 4 | 5) {
         return None;
     }
     Some((modrm >> 3) & 7 | (rex & 4) << 1)
@@ -774,9 +877,15 @@ fn load_into(code: &[u8], at: usize, end: usize) -> Option<u8> {
 ///
 /// Only a fault that is a read below [`NULL_LIMIT`], of exactly the slot the
 /// call reads, through a register that is exactly 0, at an instruction of
-/// exactly the two-instruction shape, is skipped. Anything else returns
-/// `false` and is reported as before: a guard that guesses is worse than a
-/// crash that says where it was.
+/// exactly the shape [`indirect_call`] decodes and with a load of that
+/// register proven by [`vtable_load`] (the load, or argument setup and then
+/// the load), is skipped. Anything else returns `false` and is reported as
+/// before: a guard that guesses is worse than a crash that says where it
+/// was. A call whose shape is right and whose register is null but whose
+/// load the walk back cannot prove is refused, and the refusal is logged: it
+/// says the compiler put something between the load and the call that this
+/// does not know, which is the one thing this guard should be widened for
+/// next.
 fn skip_null_vtable(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
     let p = record.ExceptionInformation;
     if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
@@ -787,17 +896,38 @@ fn skip_null_vtable(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
         return false;
     }
     let rip = context.Rip as usize;
-    // The call's 15 bytes at most, and the vtable load's 4 before it.
-    let Some(base) = rip.checked_sub(15) else {
-        return false;
+    // The call's 15 bytes at most, and the walk back's 16 before it; where
+    // the page below is not there to read, the load can only be the one that
+    // ends at the call, as it was before.
+    let mut code = [0u8; VTABLE_REACH + 16];
+    let at = match rip.checked_sub(VTABLE_REACH) {
+        // SAFETY: reads the title's code below `rip` through the system,
+        // which faults nothing of ours; the buffer is ours.
+        Some(base) if unsafe { read_into(base, &mut code[..VTABLE_REACH + 15]) } => VTABLE_REACH,
+        _ => {
+            let Some(base) = rip.checked_sub(15) else {
+                return false;
+            };
+            // SAFETY: as above.
+            if !unsafe { read_into(base, &mut code[..VTABLE_REACH + 16]) } {
+                return false;
+            }
+            15
+        }
     };
-    let mut code = [0u8; 32];
-    // SAFETY: reads the title's code below `rip` through the system, which
-    // faults nothing of ours; the buffer is ours.
-    if !unsafe { read_into(base, &mut code) } {
-        return false;
-    }
-    let Some(call) = null_vtable_call(&code, 15) else {
+    let Some(call) = null_vtable_call(&code, at) else {
+        // The shape, then, without a load it would skip on: if that is what
+        // faulted, it is this guard's fault it is not skipped.
+        if let Some(shape) = indirect_call(&code, at)
+            && *gpr(context, shape.vtable) == 0
+            && p[1] == shape.slot as usize
+        {
+            tracing::warn!(
+                site = %locate(rip),
+                slot = format_args!("{:#x}", shape.slot),
+                "null vtable call not skipped: no load of the call's register between the walk back's reach and the call"
+            );
+        }
         return false;
     };
     // The state as well as the bytes: the register the call read holds the
@@ -837,30 +967,50 @@ struct ChainLoad {
     base: u8,
     /// The offset read, which is the address that faults through a null base.
     disp: u64,
+    /// The bytes the load reads: 8 for `mov`, 2 for `movzx`/`movsx`.
+    width: u8,
 }
 
-/// The `mov reg, [base + disp]` at `at` in `code`, if it is exactly the load
-/// of a chain: `REX.W 8B /r` with REX.B and REX.X clear (so the base is one
-/// of the first eight registers and no index is in play), `modrm` mod 00, 01
-/// or 10, `rm` neither 100 (a SIB) nor, at mod 00, 101 (RIP-relative: no
-/// base register at all), and a displacement from 0 up to [`NULL_LIMIT`].
-/// The chain the title builds offsets forward from the object it should have
-/// had; a negative displacement is not that shape.
+/// The load at `at` in `code`, if it is exactly the load of a chain, with
+/// REX.B and REX.X clear (so the base is one of the first eight registers
+/// and no index is in play), `modrm` mod 00, 01 or 10, `rm` neither 100 (a
+/// SIB) nor, at mod 00, 101 (RIP-relative: no base register at all), and a
+/// displacement from 0 up to [`NULL_LIMIT`]. The chain the title builds
+/// offsets forward from the object it should have had; a negative
+/// displacement is not that shape.
+///
+/// Three forms of it, which are the same fault when the base is null:
+///
+/// * `REX.W 8B /r` — `mov reg, [base + disp]`, eight bytes;
+/// * `REX? 0F B7 /r` — `movzx reg, WORD [base + disp]`, two bytes;
+/// * `REX? 0F BF /r` — `movsx reg, WORD [base + disp]`, two bytes.
+///
+/// The run44 crash is why the last two are here: its load was
+/// `44 0f b7 40 18` (`movzx r8d, WORD [rax+0x18]`) with `rax` null, and a
+/// guard that knew only `8B` reported it as a fault to end the process on.
+/// REX.W is not needed for them: `movzx r8d, …` is a 32-bit destination and
+/// still a chain, and the skip writes 0 into the whole register, which is
+/// the value at any width (a 32-bit destination zero-extends it, and a sign
+/// extension of 0 is 0, so the upper half the title would see is 0 too).
 fn chain_load(code: &[u8], at: usize) -> Option<ChainLoad> {
     let rex = *code.get(at)?;
-    // W set, X and B clear: `48` (and `4c`, REX.R, for a register above r7).
-    if rex & 0x0b != 0x08 {
+    // A REX prefix, with X and B clear: `44` (REX.R, for a register above
+    // r7), `48` (REX.W), `4c` (both).
+    if !matches!(rex, 0x40..=0x4f) || rex & 0x03 != 0 {
         return None;
     }
-    if *code.get(at + 1)? != 0x8b {
-        return None;
-    }
-    let modrm = *code.get(at + 2)?;
+    let (width, i) = match (*code.get(at + 1)?, *code.get(at + 2)?) {
+        (0x8b, _) if rex & 0x08 != 0 => (8u8, at + 2),
+        // `movzx` and `movsx` of a word: the same shape with two bytes read.
+        (0x0f, 0xb7 | 0xbf) => (2u8, at + 3),
+        _ => return None,
+    };
+    let modrm = *code.get(i)?;
     let (mode, rm) = (modrm >> 6, modrm & 7);
     if mode == 3 || rm == 4 || (mode == 0 && rm == 5) {
         return None;
     }
-    let i = at + 3;
+    let i = i + 1;
     let (disp, size) = match mode {
         0 => (0i64, 0usize),
         1 => (i64::from(*code.get(i)? as i8), 1),
@@ -877,6 +1027,7 @@ fn chain_load(code: &[u8], at: usize) -> Option<ChainLoad> {
         dst: (modrm >> 3) & 7 | (rex & 4) << 1,
         base: rm | (rex & 1) << 3,
         disp: disp as u64,
+        width,
     })
 }
 
@@ -915,10 +1066,11 @@ fn skip_null_chain(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
     if !in_title_image(rip) {
         return false;
     }
-    // The longest such load is 7 bytes, and none of them past the faulting
-    // instruction's page: the next page may not be mapped.
-    let room = (0x1000 - (rip & 0xfff)).min(7);
-    let mut code = [0u8; 7];
+    // The longest such load is 8 bytes (`REX 0F B7 /r` and a disp32), and
+    // none of them past the faulting instruction's page: the next page may
+    // not be mapped.
+    let room = (0x1000 - (rip & 0xfff)).min(8);
+    let mut code = [0u8; 8];
     // SAFETY: reads the title's code at `rip` through the system, which
     // faults nothing of ours; the buffer is ours.
     if !unsafe { read_into(rip, &mut code[..room]) } {
@@ -947,6 +1099,7 @@ fn skip_null_chain(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
             site = %locate(rip),
             disp = format_args!("{:#x}", load.disp),
             dst = load.dst,
+            bytes = load.width,
             skip = n,
             total,
             "null chain load skipped"
@@ -955,19 +1108,177 @@ fn skip_null_chain(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
     true
 }
 
-/// The null-pointer guards, in the order the handler runs them; `vtable` and
-/// `chain` are their switches as [`report_crashes`] read them. Their own
-/// switches, not each other's: a run that turns one off keeps the other.
+/// A store through a base register: `mov [base + disp], reg` (or an
+/// immediate).
+struct SmallStore {
+    /// Bytes from the store to the instruction after it.
+    len: usize,
+    /// The register the store is through, as instructions encode it.
+    base: u8,
+    /// The offset the store adds to it, sign-extended as the encoding has it.
+    disp: u64,
+}
+
+/// The store at `at` in `code`, if it is exactly a store of one register (or
+/// one immediate) through one base register: an optional operand-size prefix
+/// and REX prefix, then `88`/`89` (a register is stored) or `C6`/`C7` with
+/// `modrm`'s `reg` field 0 (an immediate is), `modrm` mod 00, 01 or 10, `rm`
+/// neither 100 (a SIB: a scaled index is no base register) nor, at mod 00,
+/// 101 (RIP-relative: no base at all). The immediate and the displacement
+/// are part of the length, so that the whole store is skipped and not half
+/// of it.
+fn small_store(code: &[u8], at: usize) -> Option<SmallStore> {
+    let mut i = at;
+    let sized = match *code.get(i)? {
+        0x66 => {
+            i += 1;
+            true
+        }
+        _ => false,
+    };
+    let rex = match *code.get(i)? {
+        rex @ 0x40..=0x4f => {
+            i += 1;
+            rex
+        }
+        _ => 0,
+    };
+    let op = *code.get(i)?;
+    let modrm = *code.get(i + 1)?;
+    let imm = match op {
+        0x88 | 0x89 => 0usize,
+        // (`reg` field 0: the only immediate forms of the store; `/7` is
+        // `xbegin` and the rest are not stores.)
+        0xc6 if (modrm >> 3) & 7 == 0 => 1,
+        0xc7 if (modrm >> 3) & 7 == 0 => {
+            if sized {
+                2
+            } else {
+                4
+            }
+        }
+        _ => return None,
+    };
+    let (mode, rm) = (modrm >> 6, modrm & 7);
+    if mode == 3 || rm == 4 || (mode == 0 && rm == 5) {
+        return None;
+    }
+    i += 2;
+    let (disp, size) = match mode {
+        0 => (0i64, 0usize),
+        1 => (i64::from(*code.get(i)? as i8), 1),
+        _ => (
+            i64::from(i32::from_le_bytes(code.get(i..i + 4)?.try_into().ok()?)),
+            4,
+        ),
+    };
+    i += size;
+    // The immediate's bytes are part of the store: an instruction cut off
+    // before its end is not one to skip.
+    code.get(i..i + imm)?;
+    i += imm;
+    Some(SmallStore {
+        len: i - at,
+        base: rm | (rex & 1) << 3,
+        disp: disp as u64,
+    })
+}
+
+/// The guard for the title's third crash shape: a *write* through a small
+/// non-null pointer. In run46 the record builder's destination came from a
+/// block's header word (`0xf0`, a size, where a pointer belongs) and its
+/// first store, `mov [rdx+8],al` with `rdx = 0xf0`, faulted writing `0xf8`.
+///
+/// Skipped: the store, whole — the record is one the title's own next
+/// generation overwrites, and a byte more or less in a record whose pointer
+/// slot held a size is a record the title drops anyway (the port-descriptor
+/// fallback and `descriptor.rs` already refuse a record whose words are no
+/// view).
+///
+/// Fail-closed, all of: a write (not a read, not an execute); an address
+/// below [`NULL_LIMIT`]; `rip` inside a title image the loader mapped; an
+/// instruction of exactly the shape [`small_store`] decodes; a base register
+/// that is exactly the address the fault is at, less the store's
+/// displacement; and that address below [`NULL_LIMIT`] — a store through a
+/// null or a header-word pointer, not one through memory of the title's own.
+/// Anything else returns `false` and is reported as before.
+///
+/// The site table and its loop breaker are the other guards', keyed by
+/// `rip`: one site skipping forever must stop being skipped just the same.
+fn skip_small_write(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
+    let p = record.ExceptionInformation;
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+        || record.NumberParameters < 2
+        || p[0] != 1
+        || p[1] >= NULL_LIMIT
+    {
+        return false;
+    }
+    let rip = context.Rip as usize;
+    if !in_title_image(rip) {
+        return false;
+    }
+    // The longest such store is 15 bytes (`66 REX C7 /0` and a disp32 and an
+    // imm32 is 12), and none of them past the faulting instruction's page.
+    let room = (0x1000 - (rip & 0xfff)).min(15);
+    let mut code = [0u8; 15];
+    // SAFETY: reads the title's code at `rip` through the system, which
+    // faults nothing of ours; the buffer is ours.
+    if !unsafe { read_into(rip, &mut code[..room]) } {
+        return false;
+    }
+    let Some(store) = small_store(&code[..room], 0) else {
+        return false;
+    };
+    // The state as well as the bytes: the base the store is through is small
+    // — 0, a size, a count — and the access was to exactly the address the
+    // store makes of it.
+    let base = *gpr(context, store.base);
+    if base >= NULL_LIMIT as u64 || base.wrapping_add(store.disp) != p[1] as u64 {
+        return false;
+    }
+    let Some(n) = count_skip(rip) else {
+        tracing::warn!(
+            site = %locate(rip),
+            "write through a small pointer not skipped: too many at this site"
+        );
+        return false;
+    };
+    context.Rip = context.Rip.wrapping_add(store.len as u64);
+    let total = WRITE_SKIPS.fetch_add(1, Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(4) {
+        tracing::warn!(
+            site = %locate(rip),
+            base = format_args!("{base:#x}"),
+            disp = format_args!("{:#x}", store.disp),
+            at = format_args!("{:#x}", p[1]),
+            len = store.len,
+            skip = n,
+            total,
+            "write through a small pointer skipped"
+        );
+    }
+    true
+}
+
+/// The survival guards, in the order the handler runs them; `vtable`,
+/// `chain` and `write` are their switches as [`report_crashes`] read them.
+/// Their own switches, not each other's: a run that turns one off keeps the
+/// others.
 fn skip_null_faults(
     context: &mut CONTEXT,
     record: &EXCEPTION_RECORD,
     vtable: bool,
     chain: bool,
+    write: bool,
 ) -> bool {
     if vtable && skip_null_vtable(context, record) {
         return true;
     }
     if chain && skip_null_chain(context, record) {
+        return true;
+    }
+    if write && skip_small_write(context, record) {
         return true;
     }
     false
@@ -1001,19 +1312,32 @@ unsafe extern "C" {
 }
 
 /// Process exit: how many calls and loads the guards skipped, so that a run
-/// which limped through them is not read as one that did not.
+/// which limped through them is not read as one that did not. One line with
+/// the three counters by name — the measure of how often the title's race
+/// fires — and one line for each kind that did skip.
 extern "C" fn skips_at_exit() {
     let sites = SITES_SEEN
         .iter()
         .filter(|site| site.rip.load(Relaxed) != 0)
         .count();
     let vtable = NULL_VTABLE_SKIPS.load(Relaxed);
+    let chain = NULL_CHAIN_SKIPS.load(Relaxed);
+    let writes = WRITE_SKIPS.load(Relaxed);
+    tracing::info!(
+        null_vtable = vtable,
+        null_chain = chain,
+        small_write = writes,
+        sites,
+        "NULL_VTABLE_SKIPS {vtable} NULL_CHAIN_SKIPS {chain} WRITE_SKIPS {writes} SITES {sites} (at exit)"
+    );
     if vtable != 0 {
         tracing::info!(skips = vtable, sites, "null vtable calls skipped (at exit)");
     }
-    let chain = NULL_CHAIN_SKIPS.load(Relaxed);
     if chain != 0 {
         tracing::info!(skips = chain, sites, "null chain loads skipped (at exit)");
+    }
+    if writes != 0 {
+        tracing::info!(skips = writes, sites, "writes through a small pointer skipped (at exit)");
     }
 }
 
@@ -1059,10 +1383,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
     }
-    // `VICTORY_SKIP_NULL_VTABLE` / `VICTORY_SKIP_NULL_CHAIN` (each on unless
-    // `0`): a virtual call through a null vtable pointer, or a load through
-    // a null pointer in a chain of them, is the title's own lifecycle race,
-    // and is skipped rather than ending the process (see [`skip_null_faults`]).
+    // `VICTORY_SKIP_NULL_VTABLE` / `VICTORY_SKIP_NULL_CHAIN` /
+    // `VICTORY_SKIP_SMALL_WRITE` (each on unless `0`): a virtual call through
+    // a null vtable pointer, a load through a null pointer in a chain of
+    // them, or a store through a small non-null pointer (a size where a
+    // pointer belongs) is the title's own lifecycle race, and is skipped
+    // rather than ending the process (see [`skip_null_faults`]).
     let skipped = {
         // SAFETY: the system passes the exception being dispatched, and
         // `skip_null_faults` reports the exception it could not skip.
@@ -1072,6 +1398,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
                 &*(*info).ExceptionRecord,
                 SKIP_NULL_VTABLE.load(Relaxed),
                 SKIP_NULL_CHAIN.load(Relaxed),
+                SKIP_SMALL_WRITE.load(Relaxed),
             )
         }
     };
@@ -1300,6 +1627,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         (
             NULL_CHAIN_SKIPS.load(Relaxed),
             "null chain loads skipped before this",
+        ),
+        (
+            WRITE_SKIPS.load(Relaxed),
+            "writes through a small pointer skipped before this",
         ),
     ] {
         if skips != 0 {
@@ -2168,8 +2499,8 @@ mod tests {
     /// they expect), as the two instructions of a vtable call: what the
     /// decode makes of them, with the instruction before at `pre`.
     fn vtable_call(pre: &[u8], call: &[u8]) -> Option<(usize, u8, u64)> {
-        let at = 8;
-        let mut code = [0x90u8; 24];
+        let at = 32;
+        let mut code = [0x90u8; 64];
         code[at - pre.len()..at].copy_from_slice(pre);
         code[at..at + call.len()].copy_from_slice(call);
         null_vtable_call(&code, at).map(|c| (c.len, c.vtable, c.slot))
@@ -2306,7 +2637,7 @@ mod tests {
     /// stays out of every other test's allocations, so no other test's code
     /// can land inside the span, and the span stays good for the process.
     fn title_code(slot: usize, code: &[u8]) -> usize {
-        assert!(slot < 30, "slot {slot} is past the page's 30");
+        assert!(slot < 60, "slot {slot} is past the page's 60");
         assert!(code.len() <= 0x20, "{} bytes is past a slot", code.len());
         static BASE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let base = *BASE.get_or_init(|| {
@@ -2499,24 +2830,287 @@ mod tests {
     }
 
     #[test]
-    fn the_two_null_guards_keep_their_own_switch() {
+    fn a_vtable_load_is_found_behind_the_calls_argument_setup() {
+        // run48's site: mov (%rdi),%r15; mov rcx,rdi; mov edx,ebx;
+        // mov r14,rax; call *0x8(%r15). The load does not end at the call,
+        // and that is what the guard used to require.
+        let load = [0x4c, 0x8b, 0x3f];
+        let setup = [0x48, 0x89, 0xf9, 0x89, 0xda, 0x49, 0x89, 0xc6];
+        let call = [0x41, 0xff, 0x57, 0x08];
+        let mut pre = Vec::new();
+        pre.extend_from_slice(&load);
+        pre.extend_from_slice(&setup);
+        assert_eq!(vtable_call(&pre, &call), Some((4, 15, 0x8)), "run48's site");
+
+        // The load alone, as before.
+        assert_eq!(vtable_call(&load, &call), Some((4, 15, 0x8)));
+        // One `mov reg, reg` between them, and one into the call's own base
+        // register (the one that is not allowed).
+        assert_eq!(
+            vtable_call(&[0x4c, 0x8b, 0x3f, 0x48, 0x89, 0xf9], &call),
+            Some((4, 15, 0x8))
+        );
+        assert_eq!(
+            vtable_call(&[0x4c, 0x8b, 0x3f, 0x49, 0x89, 0xc7], &call),
+            None,
+            "the call's register is written again"
+        );
+        // A load through memory between them, of any register: argument setup
+        // touches no memory, and a fault it could have caused is not this
+        // call's.
+        assert_eq!(
+            vtable_call(&[0x4c, 0x8b, 0x3f, 0x48, 0x8b, 0x47, 0x08], &call),
+            None
+        );
+        // Anything that is not a register move: an address computation, an
+        // immediate, a `push`.
+        assert_eq!(
+            vtable_call(&[0x4c, 0x8b, 0x3f, 0x48, 0x8d, 0x4f, 0x10], &call),
+            None
+        );
+        assert_eq!(
+            vtable_call(&[0x4c, 0x8b, 0x3f, 0xb8, 0x10, 0x00, 0x00, 0x00], &call),
+            None
+        );
+        assert_eq!(
+            vtable_call(&[0x4c, 0x8b, 0x3f, 0x53], &call),
+            None
+        );
+        // A load of another register, with the setup after it.
+        assert_eq!(
+            vtable_call(&[0x48, 0x8b, 0x07, 0x48, 0x89, 0xf9], &call),
+            None
+        );
+        // Past the walk back's 16 bytes: the load, five argument moves, and
+        // the call — the load starts 18 bytes before it, and the walk does not
+        // go that far.
+        let far = [
+            0x4c, 0x8b, 0x3f, 0x48, 0x89, 0xf9, 0x48, 0x89, 0xf9, 0x48, 0x89, 0xf9, 0x48, 0x89,
+            0xf9, 0x48, 0x89, 0xf9,
+        ];
+        assert_eq!(vtable_call(&far, &call), None, "18 bytes back is past the reach");
+    }
+
+    #[test]
+    fn a_null_vtable_call_whose_load_is_behind_argument_setup_is_skipped() {
+        // The whole of run48's site, through the guard: the load, the three
+        // argument moves, and the call through the register it filled.
+        let code = [
+            0x4c, 0x8b, 0x3f, 0x48, 0x89, 0xf9, 0x89, 0xda, 0x49, 0x89, 0xc6, 0x41, 0xff, 0x57,
+            0x08,
+        ];
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.R15 = 0;
+        context.Rax = 0xdead_beef;
+        assert_eq!(skip_at(&code, 11, &mut context, 0x8, 0), Some(4));
+        assert_eq!(context.Rax, 0, "a call's result: nothing");
+    }
+
+    #[test]
+    fn a_chain_load_may_be_a_movzx_or_a_movsx_of_a_word() {
+        let load = |code: &[u8]| chain_load(code, 0).map(|l| (l.len, l.dst, l.base, l.disp, l.width));
+        // run44's site: movzx r8d, WORD [rax+0x18] with rax = 0.
+        assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x40, 0x18]), Some((5, 8, 0, 0x18, 2)));
+        // The same with a sign extension, with a 64-bit destination, with no
+        // displacement, and with a disp32.
+        assert_eq!(load(&[0x44, 0x0f, 0xbf, 0x40, 0x18]), Some((5, 8, 0, 0x18, 2)));
+        assert_eq!(load(&[0x4c, 0x0f, 0xb7, 0x40, 0x18]), Some((5, 8, 0, 0x18, 2)));
+        assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x02]), Some((4, 8, 2, 0, 2)));
+        assert_eq!(
+            load(&[0x44, 0x0f, 0xb7, 0x82, 0x18, 0x00, 0x00, 0x00]),
+            Some((8, 8, 2, 0x18, 2))
+        );
+        // Not one: a byte form, a register as the source, a SIB, RIP-relative
+        // (no base at all), an index register, a base above the first eight,
+        // a negative displacement, and an instruction cut off.
+        assert_eq!(load(&[0x44, 0x0f, 0xb6, 0x40, 0x18]), None);
+        assert_eq!(load(&[0x44, 0x0f, 0xb7, 0xc0]), None);
+        assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x04, 0x10]), None);
+        assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x05, 0x18, 0, 0, 0]), None);
+        assert_eq!(load(&[0x46, 0x0f, 0xb7, 0x40, 0x18]), None);
+        assert_eq!(load(&[0x45, 0x0f, 0xb7, 0x40, 0x18]), None);
+        assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x40, 0xf0]), None);
+        assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x80, 0x18]), None);
+    }
+
+    #[test]
+    fn a_null_movzx_load_is_skipped_as_a_load_of_zero() {
+        let before = NULL_CHAIN_SKIPS.load(Relaxed);
+        // run44's site, through the guard: movzx r8d, WORD [rax+0x18] with
+        // rax = 0, which faults reading 0x18. r8 is the value a null object's
+        // word has, and nothing else is emulated.
+        let (skipped, context) = chain_skip(40, (0, 0), &[0x44, 0x0f, 0xb7, 0x40, 0x18], 0x18, 0);
+        assert_eq!(skipped, Some(5));
+        assert_eq!(context.R8, 0);
+        assert_eq!(context.EFlags, 0x202 | CMP_FLAGS);
+        assert!(NULL_CHAIN_SKIPS.load(Relaxed) > before, "skips are counted");
+        // The same load with a sign extension, and one whose base is not
+        // null: not this fault.
+        assert_eq!(
+            chain_skip(40, (0, 0), &[0x44, 0x0f, 0xbf, 0x40, 0x18], 0x18, 0).0,
+            Some(5)
+        );
+        assert_eq!(
+            chain_skip(41, (0, 0x1000), &[0x44, 0x0f, 0xb7, 0x40, 0x18], 0x1018, 0).0,
+            None
+        );
+        // A write through the same register is the write guard's, not this
+        // one's.
+        assert_eq!(
+            chain_skip(41, (0, 0), &[0x44, 0x0f, 0xb7, 0x40, 0x18], 0x18, 1).0,
+            None
+        );
+    }
+
+    /// As if the store in `code`, at `slot` of the title page, faulted
+    /// writing `fault` with `base`'s register holding `value`: how far the
+    /// write guard advanced `rip`, or `None` if it did not skip.
+    fn write_skip(
+        slot: usize,
+        (base, value): (u8, u64),
+        code: &[u8],
+        fault: usize,
+        kind: usize,
+    ) -> Option<usize> {
+        let start = title_code(slot, code);
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = start as u64;
+        *gpr(&mut context, base) = value;
+        let record = access_violation(fault, kind);
+        skip_small_write(&mut context, &record).then(|| context.Rip as usize - start)
+    }
+
+    #[test]
+    fn a_store_through_a_small_pointer_is_skipped() {
+        let before = WRITE_SKIPS.load(Relaxed);
+        // run46's site: mov [rdx+8],al with rdx = 0xf0 — a block's header
+        // word, a size, where a pointer belongs — which faults writing 0xf8.
+        assert_eq!(write_skip(42, (2, 0xf0), &[0x88, 0x42, 0x08], 0xf8, 1), Some(3));
+        assert!(WRITE_SKIPS.load(Relaxed) > before, "skips are counted");
+        // The rest of the record builder: a byte store of a REX'd register, a
+        // dword store, a word of an immediate, and a store with no
+        // displacement.
+        assert_eq!(
+            write_skip(42, (2, 0xf0), &[0x44, 0x88, 0x42, 0x09], 0xf9, 1),
+            Some(4)
+        );
+        assert_eq!(write_skip(43, (2, 0xf0), &[0x89, 0x42, 0x0c], 0xfc, 1), Some(3));
+        assert_eq!(
+            write_skip(43, (2, 0xf0), &[0x66, 0xc7, 0x42, 0x0a, 0x00, 0x00], 0xfa, 1),
+            Some(6)
+        );
+        assert_eq!(write_skip(44, (2, 0xf0), &[0x88, 0x02], 0xf0, 1), Some(2));
+        // A base that is null (a record built on a null object), and one with
+        // a disp32.
+        assert_eq!(write_skip(44, (2, 0), &[0x88, 0x42, 0x08], 0x8, 1), Some(3));
+        assert_eq!(
+            write_skip(45, (2, 0xf0), &[0x88, 0x82, 0x08, 0x00, 0x00, 0x00], 0xf8, 1),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn anything_but_a_small_base_at_its_own_store_is_not_skipped() {
+        let store = [0x88, 0x42, 0x08];
+        // A read (the load guards'), a base that is a real pointer (the store
+        // of a record that is there), and a fault at an address the store
+        // does not make.
+        assert_eq!(write_skip(46, (2, 0xf0), &store, 0xf8, 0), None);
+        assert_eq!(
+            write_skip(46, (2, 0x6261_03000), &store, 0x6261_03008, 1),
+            None
+        );
+        assert_eq!(write_skip(46, (2, 0xf0), &store, 0xf9, 1), None);
+        // An address at the top of what counts as small: 0xfff8 is, and the
+        // store's own address reaching 0x10000 is not.
+        assert_eq!(write_skip(49, (2, 0xfff8), &[0x88, 0x02], 0xfff8, 1), Some(2));
+        assert_eq!(
+            write_skip(49, (2, 0xfff8), &[0x88, 0x82, 0x08, 0x00, 0x00, 0x00], 0x1_0000, 1),
+            None
+        );
+        // A base that is no small address at all: a real pointer's store is
+        // a store the title made.
+        assert_eq!(
+            write_skip(49, (2, 0x1_0000), &[0x88, 0x82, 0x08, 0x00, 0x00, 0x00], 0x1_0008, 1),
+            None
+        );
+        // A store with a SIB (an index register is no base), a register as
+        // the source, a `C7` that is not a store (`/7`), and an instruction
+        // that is no store at all.
+        assert_eq!(
+            write_skip(47, (2, 0xf0), &[0x4a, 0x89, 0x54, 0xca, 0x10], 0x10, 1),
+            None
+        );
+        assert_eq!(write_skip(47, (2, 0xf0), &[0x88, 0xc2], 0xf0, 1), None);
+        assert_eq!(
+            write_skip(47, (2, 0xf0), &[0xc7, 0xfa, 0x00, 0x00, 0x00, 0x00], 0x4, 1),
+            None
+        );
+        assert_eq!(write_skip(3, (2, 0xf0), &[0x8b, 0x42, 0x08], 0xf8, 1), None);
+        // Not an access violation, and code outside every title image: the
+        // guard leaves both to be reported.
+        let at = title_code(48, &store);
+        // SAFETY: an all-zero record and context are valid.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+        // SAFETY: as above.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = at as u64;
+        context.Rdx = 0xf0;
+        assert!(!skip_small_write(&mut context, &record));
+        #[repr(align(4096))]
+        struct Outside([u8; 4096]);
+        let page = Box::leak(Box::new(Outside([0xcc; 4096])));
+        page.0[0x800..0x803].copy_from_slice(&store);
+        // SAFETY: as above.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = page.0.as_ptr() as u64 + 0x800;
+        context.Rdx = 0xf0;
+        assert!(!skip_small_write(&mut context, &access_violation(0xf8, 1)));
+    }
+
+    #[test]
+    fn a_write_site_skipped_too_often_is_reported_instead() {
+        // A site of its own: the write guard shares the other two's table and
+        // breaker.
+        let code = [0x88, 0x42, 0x08];
+        for n in 1..=SKIP_LIMIT {
+            assert_eq!(write_skip(51, (2, 0xf0), &code, 0xf8, 1), Some(3), "skip {n}");
+        }
+        assert_eq!(
+            write_skip(51, (2, 0xf0), &code, 0xf8, 1),
+            None,
+            "past the limit, inside the window"
+        );
+    }
+
+    #[test]
+    fn the_three_survival_guards_keep_their_own_switch() {
         // mov (%rdi),%r15; call *0x8(%r15) at one site, the chain's load at
-        // another, both registers null as at the title's own sites.
+        // another, a store through a small pointer at a third, with the
+        // registers null (or small) as at the title's own sites.
         let call = title_code(21, &[0x4c, 0x8b, 0x3f, 0x41, 0xff, 0x57, 0x08]) + 3;
         let load = title_code(22, &[0x4c, 0x8b, 0x42, 0x18]);
-        let attempt = |at: usize, fault: usize, vtable: bool, chain: bool| {
+        let store = title_code(50, &[0x88, 0x42, 0x08]);
+        let attempt = |at: usize, fault: usize, kind: usize, base: u64, on: [bool; 3]| {
             // SAFETY: an all-zero context is valid.
             let mut context: CONTEXT = unsafe { std::mem::zeroed() };
             context.Rip = at as u64;
-            skip_null_faults(&mut context, &access_violation(fault, 0), vtable, chain)
+            context.Rdx = base;
+            skip_null_faults(&mut context, &access_violation(fault, kind), on[0], on[1], on[2])
         };
-        // Each guard skips its own shape with its own switch on, whatever
-        // the other's says, and neither with its switch off.
-        assert!(attempt(call, 0x8, true, true));
-        assert!(attempt(call, 0x8, true, false));
-        assert!(!attempt(call, 0x8, false, true));
-        assert!(attempt(load, 0x18, true, true));
-        assert!(attempt(load, 0x18, false, true));
-        assert!(!attempt(load, 0x18, true, false));
+        // Each guard skips its own shape with its own switch on, whatever the
+        // others say, and none with its switch off.
+        assert!(attempt(call, 0x8, 0, 0, [true, true, true]));
+        assert!(attempt(call, 0x8, 0, 0, [true, false, false]));
+        assert!(!attempt(call, 0x8, 0, 0, [false, true, true]));
+        assert!(attempt(load, 0x18, 0, 0, [true, true, true]));
+        assert!(attempt(load, 0x18, 0, 0, [false, true, false]));
+        assert!(!attempt(load, 0x18, 0, 0, [true, false, true]));
+        assert!(attempt(store, 0xf8, 1, 0xf0, [true, true, true]));
+        assert!(attempt(store, 0xf8, 1, 0xf0, [false, false, true]));
+        assert!(!attempt(store, 0xf8, 1, 0xf0, [true, true, false]));
     }
 }

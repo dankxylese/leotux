@@ -38,11 +38,16 @@ Known to be wrong (only what our own runs hit):
   ~21 GB a frame to find those writes — epoch summaries now answer ~4 GB a frame of that in O(1)
   (`VICTORY_REFRESH_EPOCH`), with the rest being dug into (docs/knowledge-base/TODO.md). 30 fps is the target.
 - **Rare title crash**: null dereferences in the title's own streaming code (a spawn descriptor consumed before its
-  object is constructed; the upstream "null pointer in own code" race, ~1 in 30 runs). Two survival guards
-  (each on unless `0`): `VICTORY_SKIP_NULL_VTABLE` for the vtable-call shape and `VICTORY_SKIP_NULL_CHAIN` for
-  null-base direct-offset loads — the fault is skipped with a zero result, decoded fail-closed (only the exact
-  instruction shape, only a null base, only a near-null fault address, only in a title image), counted, reported,
-  and a per-site loop breaker keeps a limping title from spinning in place.
+  object is constructed; the upstream "null pointer in own code" race, ~1 in 30 runs). Three survival guards
+  (each on unless `0`): `VICTORY_SKIP_NULL_VTABLE` for the vtable-call shape (the load of the register may sit up to
+  16 bytes behind the call, across argument setup only), `VICTORY_SKIP_NULL_CHAIN` for null-base direct-offset
+  loads (`mov`, and `movzx`/`movsx` of a word), and `VICTORY_SKIP_SMALL_WRITE` for a *store* through a small
+  non-null pointer (a size where a pointer belongs) — the fault is skipped with a zero result, decoded fail-closed
+  (only the exact instruction shape, only a null or small base, only a near-null fault address, only in a title
+  image), counted (`NULL_VTABLE_SKIPS` / `NULL_CHAIN_SKIPS` / `WRITE_SKIPS`, printed at exit), reported, and a
+  per-site loop breaker keeps a limping title from spinning in place. `VICTORY_WATCH_RANGE=<base:end>` (hex, one
+  64 KiB block) keeps one block read-only for the whole run and journals every write fault on it (µs, thread,
+  address, qword before and after): the instrument that names the title's writer and its lag.
 - **`--console series-s` does not boot here** (stalls before boot compute; the Series-S memory profile it reports
   wedges the title's pool setup). Series X at 4K output is the tested profile; on a 1080p monitor the compositor
   downscale looks native. `VICTORY_OUTPUT` is not used (it upscales from a low internal resolution).
@@ -125,7 +130,8 @@ crash reports and stack dumps in that log, the 1.0.2.1 int3 assert stepped over 
 write-watched pages that Wine refuses to write, the early pipeline list kept without a host pipeline library, and
 [KLBF Lab](https://github.com/PastiiJay/klbf-lab)'s half-wave port for 64-lane AMD hosts (`VICTORY_PS_HALVES`);
 plus, from LeoTux: the direct-Wine launcher (`run-victory-direct.sh`) with the `warm-up.sh` progress window,
-the rbtree-server engagement, the `VICTORY_SKIP_NULL_VTABLE`/`VICTORY_SKIP_NULL_CHAIN` survival guards, the
+the rbtree-server engagement, the `VICTORY_SKIP_NULL_VTABLE`/`VICTORY_SKIP_NULL_CHAIN`/`VICTORY_SKIP_SMALL_WRITE`
+survival guards with the `VICTORY_WATCH_RANGE` write journal, the
 port-1 home decoupled from the mmap mode (`VICTORY_PORT_HOME=1` under `VICTORY_WINE_MAP=0`), the refresh
 region/piece/block epochs with their verifier and the disjoint refresh runs (`VICTORY_REFRESH_EPOCH`,
 `VICTORY_REFRESH_RUNS`), and guards-v2 (protection coalescing, queries outside the lock).
