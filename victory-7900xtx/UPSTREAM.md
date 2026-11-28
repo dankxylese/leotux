@@ -4,6 +4,14 @@
 at `0a43566` (2026-11-25), a speed fork of Marvisak's VIctory for AMD RDNA 3, with GTA6-btw's
 Wine/Linux pieces from `victory-dexnom/` merged on top.
 
+That repository, and the user, were **deleted on 2026-11-27** (both `github.com/avatarmanz` and
+the repo answer 404; PR #440 and its thread are unreadable, and there is no Wayback snapshot of
+it). The line lives on in [borntofrag34/VIctory-7900XTX](https://github.com/borntofrag34/VIctory-7900XTX)
+— born's own words, PR #20, 2026-11-27 19:24Z: *"avatarmanz/VIctory-7900XTX and its #440 are gone
+since this afternoon, so this fork is where this line lives now. PRs here are welcome as before."*
+Its `main` is still upstream `014d52d` (the last upstream commit that exists, 11-26 16:33 −0600);
+its `linux-wine` carries the PR #440 line forward.
+
 Then merged with git: [zeex64/VIctory-7900XTX](https://github.com/zeex64/VIctory-7900XTX) at
 `e2b05f4` (2026-11-26), a fork of the same commit about running under Proton on RADV (RX 9070 XT):
 28 commits (frame-time work, copy queue, Bink skipping, crash reports, `linux/` scripts and Wine
@@ -178,3 +186,77 @@ ignored — the new `valu_tests` are `#[cfg(all(test, windows))]`, so the native
 move), `victory-loader --lib` under Wine (55 passed), and the Windows test binaries: the
 shader's 315 tests give 273 passed, 38 failed, 4 ignored, every failure a test that needs an
 SM 6.6 D3D12 device ("no SM 6.6 device available": a scratch prefix has no card).
+
+## born's `linux-wine` at `bd98961` (2026-11-28): the line's 139 commits, merged
+
+[borntofrag34/VIctory-7900XTX](https://github.com/borntofrag34/VIctory-7900XTX) `linux-wine` at
+`bd98961` (11-28 07:41Z) is 139 commits past `542d441` (the mouths), 111 of them non-merge: the
+PRs #3-#28 that followed our merge point and a batch of cherry-picks from other forks. Merged
+here as a commit with two parents (`41dde4de`, `bd98961`).
+
+Both histories begin at an "Initial commit" of their own, so there is no common ancestor to
+merge from: the merge is a three-way of *trees* — `542d441`'s (the last commit both lines agree
+on), ours at `41dde4de`, born's `bd98961` — applied to `victory-7900xtx/`. 88 files differ
+between the two trees; 9 of them conflicted, 16 blocks in `watch.rs`. `wc.rs` came out
+byte-identical (the `VICTORY_WC_NO_BACK`/`WC_STATS` series we took from Belobug #477 — 14
+commits, ×2 each in born's range): nothing was applied twice.
+
+What it brought: `VICTORY_WINDOWS_BAR_MB` (title windows outside buffers, in card memory, the
+CPU writing them over the bus: 28.3 against 31.7 ms on one scene) and `VICTORY_UI_PLANE_720` (the
+interface on its own 3840x2160 plane — our 1080p runs drew a 4K-sized interface), both
+env-driven and off at their defaults, the launcher's business; `VICTORY_CARD_TOUCHED` (a
+submission asks only the copies in card memory that changed: 3,450 asked, ~130 changed); our own
+`memcpy`/`memmove` under Wine (ntdll's byte copy is 30x slower than ucrtbase's); fxceless
+1506/1507 (64-bit compares and `v_mad_u64_u32` carries worked out dword by dword); always-true
+and always-false float compares lowered as constants; a DXC fallback for the indirect and card
+helpers; the census; the texture pool's fence-based reuse and alias pinning; pipeline waits
+ordered by frame; water readback limited to the bound mips and slices; the loader's image-RVA
+overflow fix; the `xgamesave` migration abort; UwUCammie's `watch.rs`/`host.rs` work (#21-#27).
+
+**Translator**: `TRANSLATOR_VERSION` `0x4c00_0003` (our Vice-Tay AMD scalar rules) and born's
+`0x4c00_0004` (fxceless 1506/1507) become **`0x4c00_0005`**, one fresh bump for the combined
+state, carrying the float-compare change (`fc1b0af`/`3c4e484`) too. `shader_cache`'s `FORMAT`
+stays `0x4c00_0003` and its `MAGIC` `VSL3`: the key carries the translator version string, so
+every cached translation is a miss once without a file-format change.
+
+Resolved to this tree, born's side composed into it:
+
+- The padding mask (`VICTORY_SHAPE_PADDING_MASK`) is ours: born's `c1ffb53`+`674ae56` is that
+  change re-authored, and a second application would double the mask and its test.
+- The relay, the refresh epochs and runs, guards-v2, the mapped batching and `THIN_THREADS` stay.
+  Born's write-watch restructure (`Notes`/`Shard`, `max_written`, `all_below`, the `pieces`
+  iterators: skip a clean shard, no allocation) has no place beside our single `Journal`: its
+  `region_last`/`piece_last`/`block_last` summaries answer the same question finer, and
+  `nothing_new` walks them without gathering or sorting.
+- `73d7b69` (guards never make pages at home read-only — the device was lost at the scene change
+  after the intro) is in `protect_alias`, as `crate::inplace::home_stays_writable` beside our
+  `foreign` check. This tree has no `protect_here`: ranges are guarded block by block.
+- `a71d324`'s re-check in `look_at_holes` (`uncommitted_end(block) <= block`, under the lock).
+- `ed8e4cc`'s alias invalidation: `title_memory_changed`'s scan counts a block whose only note is
+  an alias, and `forget_opened` runs on remap and free.
+- `5cf0828` in `xmem`: a page number that can no longer be served fails `XMemMapPhysicalPages`
+  before any view is taken away, so the title keeps its old mapping. Our alias runs and the
+  same-page skip stay.
+- `x86-64-v3` for the Windows target (`d9fb9f1`, VIctory-NVIDIA #603) merged into this tree's
+  `.cargo/config.toml` beside the xwin linker paths, one `rustflags` list.
+
+Two of born's tests are `#[ignore]`d rather than fixed:
+`remapping_and_unmapping_clear_beside_and_opened_state` and
+`freeing_memory_clears_beside_opened_and_aliased_state` assert born's own `BESIDE` model, which
+guards-v2 replaced (ours is set by a put beside and taken by `guard`; a stale bit costs a
+re-guard, never a missed write). Passing them as written needs born's beside registry back. What
+they check of `opened` and of alias invalidation does hold here.
+
+`7113027` (card-step learning) is in and **off**: `VICTORY_CARD_STEPS_LEARN=1` only; born's own
+A/B is 40.7 ms with against 33.2 without. Do not enable it.
+
+Checked 2026-11-28: `cargo build --profile diag -p victory --features diagnostics --bins --target
+x86_64-pc-windows-msvc` clean, `victory.exe` 16,638,464 bytes; `cargo test --release -p
+victory-shader --lib` 215 passed, 2 ignored (born's new `valu_tests` are `#[cfg(all(test,
+windows))]`, so the native count does not move); `victory-gpu --lib` under Wine, 449 passed, 7
+failed, 39 ignored — the same seven as before the merge (the four `safecopy` guard-page tests and
+three watch tests, `many_askers`' two among them), run with `--test-threads=1` as this
+workspace's CI does (`.github/workflows/ci.yml`, line 52): in parallel the guard tests tread on
+one another and four more names fail, serially they pass; `victory-loader --lib` 64 passed (60,
+and the four born adds in `prepare.rs`, `resolution.rs`, `ui_plane.rs`). No game run.
+

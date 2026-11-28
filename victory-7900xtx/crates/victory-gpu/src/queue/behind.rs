@@ -539,7 +539,14 @@ impl Work for Job {
         match ask {
             &Ask::Wait(fence, value) => crate::fence::completed(fence as This) >= value,
             Ask::Value(wait) => super::value_met(wait),
-            Ask::Lists(recordings) => recordings.iter().all(|r| r.done()),
+            Ask::Lists(recordings) => {
+                let mut ready = true;
+                for r in recordings.iter().filter(|r| !r.done()) {
+                    r.prefer();
+                    ready = false;
+                }
+                ready
+            }
         }
     }
 

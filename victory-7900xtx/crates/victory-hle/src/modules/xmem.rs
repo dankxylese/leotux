@@ -2006,6 +2006,16 @@ pub extern "system" fn XMemMapPhysicalPages(
         let table = page_table();
         pages.iter().map(|page| table.pages.get(page).cloned()).collect()
     });
+    // A page number that can no longer be served fails the call before any
+    // view is taken away: the title keeps using the old mapping (born
+    // `5cf0828`). Checked here rather than at the page, which is after the
+    // unmap.
+    if let (Some(pages), Some(slices)) = (&pages, &slices)
+        && let Some(i) = slices.iter().position(Option::is_none)
+    {
+        tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
+        return std::ptr::null_mut();
+    }
     // The pages `[lo, hi)` change; those before and after show what they
     // are to show already and stay as they are ([`map_same`]; not where a
     // page is unknown: that call fails as it did).
@@ -2359,39 +2369,73 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
         }
         return true;
     }
-    // By the page: the address, and the one whose page it is to show.
-    let pages: Vec<(usize, Option<usize>)> = ranges
+    let mut ranges = ranges
         .iter()
-        .flat_map(|&(to, from, len)| {
-            (0..len as usize).step_by(PAGE).map(move |k| (to as usize + k, (from != 0).then_some(from as usize + k)))
-        })
-        .collect();
-    if pages.iter().any(|p| p.0 % PAGE != 0 || p.1.is_some_and(|from| from % PAGE != 0)) {
-        return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
-    }
-    let mut ok = true;
-    let mut at = 0;
-    while at < pages.len() {
+        .copied()
+        .filter(|&(_, _, len)| len != 0)
+        .map(|(to, from, len)| (to as usize, from as usize, len as usize))
+        .peekable();
+    while ranges.peek().is_some() {
         let _busy = Busy::begin();
         let mut physical = physical();
-        let mut ops: Vec<Op> = Vec::new();
+        let mut ops = Vec::new();
         let mut touched = std::collections::HashSet::new();
-        for &(to, from) in &pages[at..] {
-            // A page the group changes already, or one it would be mapped
-            // from: after it.
-            if ops.len() == GROUP || touched.contains(&to) || from.is_some_and(|from| touched.contains(&from)) {
+        let mut valid = true;
+        while let Some(&(to, from, len)) = ranges.peek() {
+            // A range must see the mapping left by preceding ranges. If
+            // any of its pages depend on this group, apply the group first.
+            let offsets = || (0..len).step_by(PAGE);
+            if !ops.is_empty()
+                && (ops.len() + len.div_ceil(PAGE) > GROUP
+                    || offsets().any(|k| {
+                        touched.contains(&(to + k)) || (from != 0 && touched.contains(&(from + k)))
+                    }))
+            {
                 break;
             }
-            let slice = from.map(|from| physical.slice_at(from));
-            ok &= !matches!(slice, Some(None));
-            touched.insert(to);
-            ops.push(Op::new(to, slice.flatten()));
-            at += 1;
+            let first = ops.len();
+            for k in offsets() {
+                let slice = if from == 0 {
+                    None
+                } else if let Some(slice) = physical.slice_at(from + k) {
+                    Some(slice)
+                } else {
+                    valid = false;
+                    break;
+                };
+                ops.push(Op::new(to + k, slice));
+            }
+            if !valid {
+                ops.truncate(first);
+                break;
+            }
+            ranges.next();
+            if ops.len() >= GROUP {
+                break;
+            }
+            touched.extend(ops[first..].iter().map(|op| op.at));
         }
-        let _changing = victory_gpu::title_memory_remapping();
-        ok &= change(&mut physical, ops);
+        if ops.len() > GROUP {
+            let _changing = victory_gpu::title_memory_remapping();
+            // Even a range larger than GROUP had all its sources resolved.
+            let mut ops = ops.into_iter();
+            while let Some(first) = ops.next() {
+                let chunk = std::iter::once(first).chain(ops.by_ref().take(GROUP - 1));
+                if !change(&mut physical, chunk.collect()) {
+                    return false;
+                }
+            }
+        } else if !ops.is_empty() {
+            let _changing = victory_gpu::title_memory_remapping();
+            if !change(&mut physical, ops) {
+                return false;
+            }
+        }
+        if !valid {
+            return false;
+        }
     }
-    ok
+    true
 }
 
 /// Maps (page number not 0) or unmaps each address; false if a page is not
@@ -3815,6 +3859,91 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[test]
+    fn an_alias_uses_the_original_source_pages() {
+        check_alias_source_pages(map_alias);
+    }
+
+    #[test]
+    fn a_batch_alias_uses_the_original_source_pages() {
+        check_alias_source_pages(|to, from, len| map_aliases(&[(to, from, len)]));
+    }
+
+    fn check_alias_source_pages(copy: impl Fn(u64, u64, u64) -> bool) {
+        // An overlap over a group boundary needs the same snapshot on both sides.
+        const N: usize = GROUP + 3;
+        let pages = allocate(N);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(), (N + 1) * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let at = |i: usize| base.wrapping_byte_add(i * PAGE);
+        let address = |i| at(i) as u64;
+        assert_eq!(XMemMapPhysicalPages(base, N, pages.as_ptr()), base);
+        for i in 0..N {
+            // SAFETY: the first N pages are mapped read-write.
+            unsafe { at(i).cast::<u8>().write(i as u8) };
+        }
+
+        // The first source is valid and the second has no physical page.
+        // Neither destination page may change when the copy is rejected.
+        assert!(!copy(address(0), address(N - 1), (2 * PAGE) as u64));
+        for i in 0..2 {
+            assert_eq!(query(at(i)).host.State, MEM_COMMIT);
+            // SAFETY: the state check confirmed the page remains mapped.
+            assert_eq!(unsafe { at(i).cast::<u8>().read() }, i as u8);
+        }
+
+        assert!(copy(address(0), address(0), PAGE as u64));
+        assert!(copy(address(1), address(0), (N * PAGE) as u64));
+        for i in 0..N {
+            assert_eq!(query(at(i + 1)).host.State, MEM_COMMIT);
+            // SAFETY: the successful copy mapped the destination read-write.
+            assert_eq!(unsafe { at(i + 1).cast::<u8>().read() }, i as u8);
+        }
+        assert!(map_alias(address(0), 0, ((N + 1) * PAGE) as u64));
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_remap_with_an_unknown_page_leaves_the_pages_it_showed() {
+        let mut pages = [0usize; 3];
+        let mut count = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()), 1);
+        assert_eq!(count, pages.len());
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let second = base.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(base, 2, pages.as_ptr()), base);
+        // SAFETY: Both pages are mapped read-write.
+        unsafe {
+            base.cast::<u8>().write(0x5a);
+            second.cast::<u8>().write(0xa5);
+        }
+        assert_eq!(XMemFreePhysicalPages(1, pages[1..].as_ptr()), 1);
+
+        // A different first page could be mapped, but the second is gone.
+        // The old first page must survive too.
+        let request = [pages[2], pages[1]];
+        assert!(XMemMapPhysicalPages(base, request.len(), request.as_ptr()).is_null());
+        assert_eq!(query(base).host.State, MEM_COMMIT);
+        assert_eq!(query(second).host.State, MEM_COMMIT);
+        // SAFETY: The committed pages above remain readable.
+        unsafe {
+            assert_eq!(base.cast::<u8>().read(), 0x5a);
+            assert_eq!(second.cast::<u8>().read(), 0xa5);
+        }
+        assert_eq!(XMemMapPhysicalPages(base, 2, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, pages[2..].as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a

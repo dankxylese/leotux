@@ -65,6 +65,8 @@ with the presented one.
 | `--buffers vram` / `sysmem` | all buffers in the card's / the PC's memory |
 | `--only-buffers <what>` | with `--buffers`: only the buffers all of these match: `name=<text>`, `min=<bytes>`, `max=<bytes>`, `seen=No`, `Cached` or `Combined`, `id=<a>..<b>`, or `!` and one of them (repeatable) |
 | `--listing 3..7` | only writes the frame's buffers and those lists' commands |
+| `--flow 3..7` | lists the pipelines and bindings for the dispatches in those lists |
+| `--flow-draws` | with `--flow`, includes draws as well as dispatches |
 | `--one-submit` | one `ExecuteCommandLists`, with a full wait between the former ones |
 | `--only 3..7` | runs these lists; of the others only barriers |
 | `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |
@@ -82,6 +84,9 @@ leaves out waits or work can draw another picture and, with wild data, lose
 the device: save work in other programs first. Do not run the title at the
 same time.
 
+The `--listing` and `--flow` options read the capture without creating a GPU
+device. Use them to identify the relevant lists before replaying a frame.
+
 ## What draws a pixel
 
     victory replay <folder> --pixel 1234,567 [--of 1280x720] [--lists 40..80]
@@ -92,8 +97,8 @@ command that can change it, and names each command that did with its pipeline
 targets (where the viewport has the picture's shape), dispatches and draws with
 the textures of the picture's shape shaders may write at that time, copies,
 resolves and clears. `--of` is the size of the picture the point was read from
-(a screenshot's). The commands are numbered `<list>:<command>` as in
-`--listing`, `--slots` and `--looks`.
+(a screenshot's). The commands use the same list and command numbers as
+`--listing`, `--flow` and `--slots`.
 
 | switch | does |
 |---|---|

@@ -293,9 +293,32 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
     Ok((host, version))
 }
 
+/// The upscaler version asked of the PC library: 4.1.2, or what
+/// `VICTORY_FSR_VERSION` says (read here; `4.1.1`, `3.1.5`: a library or a
+/// driver that offers another one, as Proton's does on Linux, where the FSR 4
+/// it serves is the one in its `amdxcffx64.dll`: "4.1.1 *, 3.1.5, 2.3.4" on an
+/// RX 7900 GRE there, and the title ended at once for want of 4.1.2).
+fn wanted_version() -> &'static str {
+    static WANTED: OnceLock<String> = OnceLock::new();
+    WANTED.get_or_init(|| std::env::var("VICTORY_FSR_VERSION").ok().filter(|v| !v.trim().is_empty()).map_or_else(|| "4.1.2".to_owned(), |v| v.trim().to_owned()))
+}
+
 fn is_fsr_4_1_2(name: &str) -> bool {
-    name.strip_prefix("4.1.2")
+    name.strip_prefix(wanted_version())
         .is_some_and(|suffix| !suffix.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Any FSR 4 family provider (`4.<minor>.<patch>`, with the SDK's ` *` mark
+/// allowed after it). The Linux shim offers 4.1.1 where 4.1.2 is not shipped.
+fn is_fsr_4(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("4.") else { return false };
+    let core = rest.trim_end_matches(" *");
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 2
+        && parts.iter().all(|part| {
+            let digits = part.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+        })
 }
 
 /// The SDK supplies the version id to put in the context creation chain.
@@ -331,6 +354,7 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
         ));
     }
     let mut available = Vec::new();
+    let mut fallback: Option<(u64, String)> = None;
     for (id, name) in ids.into_iter().zip(names).take(count as usize) {
         if !name.is_null() {
             // SAFETY: NUL-terminated name owned by the SDK.
@@ -340,11 +364,18 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             if is_fsr_4_1_2(&name) {
                 return Ok((id, name));
             }
+            if is_fsr_4(&name) && fallback.is_none() {
+                fallback = Some((id, name.clone()));
+            }
             available.push(name);
         }
     }
+    if let Some((id, name)) = fallback {
+        return Ok((id, name));
+    }
     Err(format!(
-        "no FSR 4.1.2 provider for this adapter (available: {})",
+        "no FSR {} provider for this adapter (available: {}; VICTORY_FSR_VERSION asks for another)",
+        wanted_version(),
         available.join(", ")
     ))
 }
@@ -442,7 +473,7 @@ extern "C" fn ffxCreateContext(
         .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
     if query_code != OK
         || version.id != host.provider_id
-        || !name.as_deref().is_some_and(is_fsr_4_1_2)
+        || !name.as_deref().is_some_and(|n| is_fsr_4_1_2(n) || is_fsr_4(n))
     {
         tracing::warn!(
             query_code,

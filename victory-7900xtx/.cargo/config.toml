@@ -1,8 +1,15 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# x86-64-v3 (AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE) for our own code: the title
+# runs only on a processor with AVX2 (it is built for the console's Zen 2), and
+# without it the compiler kept to SSE2. (VIctory-NVIDIA #603, part a; born
+# `d9fb9f1`) merged with the xwin SDK paths this tree builds the Windows target
+# with — the two tables are one, so both sets of flags apply.
 [target.x86_64-pc-windows-msvc]
 linker = "lld-link"
 rustflags = [
+  "-C", "target-cpu=x86-64-v3",
   "-Lnative=/home/manse/.local/share/xwin-sdk/VC/Tools/MSVC/14.44.17.14/lib/x64",
   "-Lnative=/home/manse/.local/share/xwin-sdk/Windows Kits/10/Lib/10.0.26100/ucrt/x64",
   "-Lnative=/home/manse/.local/share/xwin-sdk/Windows Kits/10/Lib/10.0.26100/um/x64",

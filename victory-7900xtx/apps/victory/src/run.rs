@@ -68,9 +68,23 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    // PC FidelityFX at the title's own resolution (`VICTORY_PC_FSR=1`), without
+    // the 4K preset: ported from Belobug #532. The provider is selected before
+    // the first lookup builds the import registry.
+    if fsr.is_none() && execute && std::env::var_os("VICTORY_PC_FSR").is_some_and(|value| value == "1") {
+        let dir = cfg.fidelityfx_dir.as_deref().context(
+            "PC FidelityFX requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+        )?;
+        victory_hle::modules::fidelityfx::use_host_dir(dir)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
+    }
     let image = if let Some(preset) = fsr {
         anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
-        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
+        // What it puts out: 3840x2160, or the title's mode `VICTORY_OUTPUT`
+        // names (applied below, as without a profile).
+        let (width, height) = victory_loader::resolution::asked_output().unwrap_or((3840, 2160));
+        fsr_4k::prepare_fsr_4k(&mut prepared, preset, [width, height])?;
         let dir = cfg.fidelityfx_dir.as_deref().context(
             "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
         )?;
@@ -240,12 +254,20 @@ pub fn run(
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
-    // VICTORY_UPSCALER; each off without it).
+    // VICTORY_UPSCALER; each off without it). With a FidelityFX profile
+    // (VICTORY_FSR_4K) the output size alone: the profile has its own scale
+    // and upscaler, written in the places the others change.
     #[cfg(windows)]
-    if execute && fsr.is_none() {
+    if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe {
+            if fsr.is_none() {
+                victory_loader::resolution::apply_asked(image.base(), size);
+            } else {
+                victory_loader::resolution::apply_output(image.base(), size);
+            }
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");

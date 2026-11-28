@@ -2006,13 +2006,16 @@ mod tests {
         // An R16G16B16A16_FLOAT buffer view of memory in the second slot.
         let memory = [0u64; 64];
         let address = memory.as_ptr() as u64;
+        let key = memory.as_ptr() as usize;
+        crate::shadow::register(key, address, 512);
         let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
         let mut words = [0u32; 16];
         words[..10].copy_from_slice(&[10, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
         words[10] = address as u32;
         words[11] = (address >> 32) as u32;
         create_placed_srv(std::ptr::null(), &resource, &words, second);
-        assert!(view(second).as_ref().and_then(host::half_view).is_some());
+        let original = view(second).expect("a placed buffer view");
+        let half = host::half_view(&original).expect("an unsigned half view");
         let mut state = crate::draw::State::default();
         state.set_heaps(&[h]);
         state.set_table(true, 1, first);
@@ -2032,14 +2035,24 @@ mod tests {
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
         let next = host_heap.dynamic(1).expect("a dynamic slot");
+        let actual = host_heap.descriptor_bytes(offset / 32 + 1);
+        host_heap.make_at(next, &original);
+        let original = host_heap.descriptor_bytes(next);
+        host_heap.make_at(next, &half);
+        let expected = host_heap.descriptor_bytes(next);
         host_heap.release(next, 1);
         drop(state);
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::shadow::unregister(key, address);
         assert_eq!(
             next,
             offset / 32 + 2,
             "the next allocation took the table's second slot"
         );
+        if let (Some(actual), Some(original), Some(expected)) = (actual, original, expected) {
+            assert_ne!(original, expected, "the two formats produced identical host descriptors");
+            assert_eq!(actual, expected, "the table must use the unsigned half view");
+        }
     }
 
     #[test]

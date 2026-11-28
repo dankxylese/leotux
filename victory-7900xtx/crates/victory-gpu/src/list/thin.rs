@@ -82,6 +82,9 @@ impl Front {
             && !self.submitted
         {
             recording.abandoned.store(true, Release);
+            if descriptor_gate() {
+                WORK.notify_all();
+            }
         }
         self.words.clear();
     }
@@ -144,7 +147,7 @@ impl Front {
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
-            held(&READY).push_back(recording.clone());
+            held(&READY).ready.push_back(recording.clone());
             WORK.notify_one();
         }
     }
@@ -161,8 +164,7 @@ impl Front {
 
 /// Streams' memory to use again.
 static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
-/// Recordings with words to translate.
-static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
+static READY: Mutex<WorkQueue> = Mutex::new(WorkQueue { ready: VecDeque::new(), parked: VecDeque::new() });
 static WORK: Condvar = Condvar::new();
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -171,6 +173,31 @@ static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static PARKS: AtomicU64 = AtomicU64::new(0);
+
+fn descriptor_gate() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN_GATE").is_some_and(|v| v == "1"))
+}
+
+fn descriptor_pressure() -> bool {
+    crate::descriptor::with_view_heap(crate::descriptor::host::HostHeap::dynamic_pressure).unwrap_or(false)
+}
+
+/// Parked recordings are still scheduled. They return when the view heap
+/// has room or someone needs them to finish before more work can be sent.
+#[derive(Default)]
+struct WorkQueue {
+    ready: VecDeque<Arc<Recording>>,
+    parked: VecDeque<Arc<Recording>>,
+}
+
+impl WorkQueue {
+    fn take(&mut self, pressure: bool) -> Option<Arc<Recording>> {
+        let next = self.parked.iter().position(|recording| !recording.held_back(pressure));
+        next.and_then(|at| self.parked.remove(at)).or_else(|| self.ready.pop_front())
+    }
+}
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -185,6 +212,10 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// The submission queue or a synchronous submit needs this recording.
+    priority: AtomicBool,
+    /// The title needs the open back list for a synchronous host API call.
+    waiting_for_back: AtomicBool,
 }
 
 #[derive(Default)]
@@ -194,8 +225,6 @@ struct Inner {
     kept: Vec<Vec<u64>>,
     /// It is among [`READY`] or being translated.
     scheduled: bool,
-    /// The title needs the open back list for a synchronous host API call.
-    waiting_for_back: bool,
     /// The list of ours (0: none yet).
     back: usize,
     /// That list was closed by the stream.
@@ -210,6 +239,8 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            priority: AtomicBool::new(false),
+            waiting_for_back: AtomicBool::new(false),
         }
     }
 
@@ -217,8 +248,22 @@ impl Recording {
         self.done.load(Acquire)
     }
 
+    pub(crate) fn prefer(&self) {
+        if descriptor_gate() && !self.priority.swap(true, Release) {
+            WORK.notify_all();
+        }
+    }
+
+    fn held_back(&self, pressure: bool) -> bool {
+        pressure
+            && !self.priority.load(Acquire)
+            && !self.waiting_for_back.load(Acquire)
+            && !self.abandoned.load(Acquire)
+    }
+
     /// Waits until it is translated.
     pub(crate) fn wait(&self) {
+        self.prefer();
         let mut inner = held(&self.inner);
         while !self.done() {
             inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
@@ -231,13 +276,19 @@ impl Recording {
     }
 
     /// Translates what there is.
-    fn run(&self) {
+    fn run(self: &Arc<Self>) {
         loop {
             let (chunk, back) = {
                 let mut inner = held(&self.inner);
+                if descriptor_gate() && !inner.chunks.is_empty() && self.held_back(descriptor_pressure()) {
+                    drop(inner);
+                    held(&READY).parked.push_back(self.clone());
+                    PARKS.fetch_add(1, Relaxed);
+                    return;
+                }
                 let Some(chunk) = inner.chunks.pop_front() else {
                     inner.scheduled = false;
-                    if inner.waiting_for_back {
+                    if self.waiting_for_back.load(Acquire) {
                         self.moved.notify_all();
                     }
                     return;
@@ -320,12 +371,20 @@ fn start() {
             crate::queue::no_drain_here();
             loop {
                 let recording = {
-                    let mut ready = held(&READY);
+                    let mut work = held(&READY);
                     loop {
-                        match ready.pop_front() {
-                            Some(r) => break r,
-                            None => ready = WORK.wait(ready).unwrap_or_else(|e| e.into_inner()),
+                        let parked = !work.parked.is_empty();
+                        if let Some(recording) = work.take(parked && descriptor_pressure()) {
+                            break recording;
                         }
+                        work = if parked {
+                            // Slots can return during landing without work
+                            // being added here. Check until a list can move.
+                            WORK.wait_timeout(work, std::time::Duration::from_millis(1))
+                                .unwrap_or_else(|e| e.into_inner()).0
+                        } else {
+                            WORK.wait(work).unwrap_or_else(|e| e.into_inner())
+                        };
                     }
                 };
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
@@ -338,6 +397,9 @@ fn start() {
         }
     }
     tracing::info!(threads, "list calls are written down and translated by threads of ours (VICTORY_THIN=1)");
+    if descriptor_gate() {
+        tracing::info!("thin list translation reserves descriptor space for work the queue needs (VICTORY_THIN_GATE=1)");
+    }
 }
 
 /// The recordings of submitted lists, in order (one that was not begun is left
@@ -370,6 +432,10 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    if descriptor_gate() {
+        let parks = PARKS.swap(0, Relaxed);
+        tracing::info!(parks, "thin recordings deferred since the last frame-rate report");
+    }
 }
 
 #[inline]
@@ -397,9 +463,12 @@ pub(crate) fn for_external(this: This) -> Option<This> {
     let recording = front.recording.as_ref()?;
     let mut inner = held(&recording.inner);
     if inner.scheduled {
-        inner.waiting_for_back = true;
+        recording.waiting_for_back.store(true, Release);
+        if descriptor_gate() {
+            WORK.notify_all();
+        }
         inner = recording.moved.wait_while(inner, |i| i.scheduled).unwrap_or_else(|e| e.into_inner());
-        inner.waiting_for_back = false;
+        recording.waiting_for_back.store(false, Release);
     }
     (inner.back != 0).then_some(inner.back as This)
 }
@@ -953,5 +1022,36 @@ mod tests {
         assert_eq!(slot[1], 99);
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    #[test]
+    fn a_queue_head_can_pass_speculative_recordings_under_descriptor_pressure() {
+        let older = Arc::new(Recording::new(0));
+        let head = Arc::new(Recording::new(0));
+        let mut work = WorkQueue::default();
+        work.parked.extend([older.clone(), head.clone()]);
+        assert!(work.take(true).is_none());
+        head.prefer();
+        if descriptor_gate() {
+            assert!(Arc::ptr_eq(&work.take(true).unwrap(), &head));
+            assert!(work.take(true).is_none());
+        } else {
+            assert!(work.take(true).is_none());
+        }
+        assert!(Arc::ptr_eq(&work.take(false).unwrap(), &older));
+    }
+
+    #[test]
+    fn a_waiting_host_call_or_abandoned_recording_can_leave_the_parked_queue() {
+        let external = Arc::new(Recording::new(0));
+        let abandoned = Arc::new(Recording::new(0));
+        let mut work = WorkQueue::default();
+        work.parked.extend([external.clone(), abandoned.clone()]);
+        assert!(work.take(true).is_none());
+        external.waiting_for_back.store(true, Release);
+        assert!(Arc::ptr_eq(&work.take(true).unwrap(), &external));
+        assert!(work.take(true).is_none());
+        abandoned.abandoned.store(true, Release);
+        assert!(Arc::ptr_eq(&work.take(true).unwrap(), &abandoned));
     }
 }
