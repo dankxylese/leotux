@@ -45,6 +45,17 @@ Nuget shader compiler: NO ACTION — our prefix's d3dcompiler_47.dll is Microsof
 real compiler (sha256-verified vs winetricks' payload, forced native); their claim
 covers only Wine's builtin. dxil.dll unneeded at runtime (vkd3d carries dxil-spirv).
 
+## Scout pull lists (2026-11-28, reports in scratch: xavi-rdna-scout.md, vice-tay-scout.md)
+
+- [ ] X1. THIN_THREADS=14 (Xavi preset, measured +2.8 fps warm on 7900 XT): A/B first (run34), default if it holds.
+- [ ] X2. Descriptor shape-index PADDING MASK (Vice-Tay f07e54a+ce91490, apply clean; 18bc367 manual): identical views stop becoming new shapes — fixes the 2^22-shapes ~30-min / 16.7 GB / fps-decay leak. LONG-SESSION CRITICAL.
+- [ ] X3. Xavi clean picks: 6072c37 (AVX2 Shadow::take), f8eb38d (BufferSweep dedup+span cache), 61477a8 (CPU strides/view_addr shadows), 13e1f5e+b424c8b (DynamicBits packed allocator, 12k locks->1), 8abd367 (coalesce un-guard VirtualProtect — Wine round trips), 5663897 (Batch::last_ahead cache, WIDE_PLAN_STEPS 4096->1024), e1f8b65 (WIDE_JOB 256 KiB).
+- [ ] X4. Vice-Tay tier A/B: 1f69d67 (ticket loose/exact allocations, shadow table lock), 4f2f58f (AMD mul-add zero products — correctness), 3c83a33 (RDNA2 scalar min/max flags), 369f940 (due texture slots one traversal), 3e3fd57 (head blend-shape queued before first dispatch — the heads/faces hitch).
+- [ ] X5. L1 barrier batching (card-memory-waits.md): mapped() fence wait once per submission, not per allocation — ~22 s of map waits -> 6-8 s projected. The biggest single remaining item.
+- SKIP (recorded): Xavi PORT_BUFFERS/INPLACE=2 (opposite memory model to our guards; their own community A/B ~1-3 ms), Vice-Tay Nvidia families (DLSS/frame-gen, NVIDIA memory profiles, heap-identity), paired-lane wave64 (their own #378 shows 32-lane regressions), 83ba8e2 (needs ASK_SPREAD we lack), their Tk launcher/DS4 items, Xavi headline 20.8 (their own 37-min README: 15.35 median declining — best case, not steady state).
+- Vice-Tay's Linux change = the rbtree wineserver: WE ALREADY HAVE IT (nothing to pull).
+- Banding lead (when we hit it): pipeline library x RTV-format mismatch, VICTORY_RTV_FORMAT_LOG=1 to check.
+
 ## Perf levers from our own telemetry (perf-levers.md 2026-11-27; prologue ~75-100 ms/frame, GPU ~0-10 ms)
 
 - [ ] P1. Relay fetch-ahead: fetch landing N while merging N-1; join pieces across
