@@ -2966,9 +2966,11 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned). The lists give theirs back in runs ([`HostHeap::release_many`]);
+    /// this is the single run's, for the tests.
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg(test)]
     pub(crate) fn release(&self, first: u32, n: u32) {
         self.release_many(&[(first, n)]);
     }

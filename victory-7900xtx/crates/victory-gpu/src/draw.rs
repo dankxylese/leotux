@@ -577,9 +577,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        crate::descriptor::release_dynamic_many(&self.dynamic);
     }
 }
 
@@ -599,9 +597,10 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        // (One hold of each heap's lock for the list's runs, not one for
+        // every table made: the frame asks for 12,500 of them.)
+        crate::descriptor::release_dynamic_many(&self.dynamic);
+        self.dynamic.clear();
         self.reserve = (0, 0, 0);
         self.fresh_tables.clear();
         self.recording = 0;

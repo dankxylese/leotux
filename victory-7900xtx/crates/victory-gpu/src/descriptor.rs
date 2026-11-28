@@ -867,16 +867,40 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// Gives back a list's `(title heap, first, count)` runs, one hold of each
+/// heap's dynamic lock per contiguous run of the same heap instead of one
+/// per slot group: a list's tables are cut from one heap, and a frame of the
+/// opening cutscene's 12,500 tables took that lock that many times a frame
+/// each (`HostHeap::release_many`; the recording threads wait on it).
+///
+/// Nothing else changes: the slots are given back as [`release_dynamic`]
+/// gave them, and what a slot's descriptor holds (the null templates of
+/// `descriptor/host.rs`'s `null_at`) is not touched here — a slot given
+/// back is one the next table may make afresh, and one not made is nulled
+/// where it is made.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic_many(entries: &[(usize, u32, u32)]) {
+    if entries.is_empty() {
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
+    // (The entries are pushed in the order the list took them, so a heap's
+    // runs are almost always one after another: one batch for each stretch.)
+    let mut batch: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let heap = entries[i].0;
+        batch.clear();
+        while i < entries.len() && entries[i].0 == heap {
+            batch.push((entries[i].1, entries[i].2));
+            i += 1;
+        }
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_many(&batch);
+        }
     }
 }
 
