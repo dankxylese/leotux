@@ -1149,15 +1149,24 @@ struct SmallStore {
 /// of it.
 fn small_store(code: &[u8], at: usize) -> Option<SmallStore> {
     let mut i = at;
+    let mut vex = false;
     let sized = match *code.get(i)? {
         0x66 => {
             i += 1;
             true
         }
+        // VEX 2-byte prefix: the title's record-copy loop is vectorized —
+        // `c5 fc 11 50 70` = vmovsd [rax+0x70],xmm2 (run56). Only the store
+        // form (VEX.0F 11 /r) is accepted below; a load is not a write.
+        0xc5 => {
+            vex = true;
+            i += 2; // C5 + the VEX payload byte
+            false
+        }
         _ => false,
     };
     let rex = match *code.get(i)? {
-        rex @ 0x40..=0x4f => {
+        rex @ 0x40..=0x4f if !vex => {
             i += 1;
             rex
         }
@@ -1165,19 +1174,27 @@ fn small_store(code: &[u8], at: usize) -> Option<SmallStore> {
     };
     let op = *code.get(i)?;
     let modrm = *code.get(i + 1)?;
-    let imm = match op {
-        0x88 | 0x89 => 0usize,
-        // (`reg` field 0: the only immediate forms of the store; `/7` is
-        // `xbegin` and the rest are not stores.)
-        0xc6 if (modrm >> 3) & 7 == 0 => 1,
-        0xc7 if (modrm >> 3) & 7 == 0 => {
-            if sized {
-                2
-            } else {
-                4
-            }
+    let imm = if vex {
+        // VEX.0F 11 /r: vmovups/vmovsd/vmovdqa store, no immediate.
+        if op != 0x11 {
+            return None;
         }
-        _ => return None,
+        0usize
+    } else {
+        match op {
+            0x88 | 0x89 => 0usize,
+            // (`reg` field 0: the only immediate forms of the store; `/7` is
+            // `xbegin` and the rest are not stores.)
+            0xc6 if (modrm >> 3) & 7 == 0 => 1,
+            0xc7 if (modrm >> 3) & 7 == 0 => {
+                if sized {
+                    2
+                } else {
+                    4
+                }
+            }
+            _ => return None,
+        }
     };
     let (mode, rm) = (modrm >> 6, modrm & 7);
     if mode == 3 || rm == 4 || (mode == 0 && rm == 5) {
@@ -3081,6 +3098,19 @@ mod tests {
             write_skip(45, (2, 0xf0), &[0x88, 0x82, 0x08, 0x00, 0x00, 0x00], 0xf8, 1),
             Some(6)
         );
+    }
+
+    #[test]
+    fn a_vex_store_through_a_small_pointer_is_skipped() {
+        // run56's site: `c5 fc 11 50 70` = vmovsd [rax+0x70],xmm2 with rax = 0
+        // — the title's vectorized record-copy loop through a null object.
+        assert_eq!(write_skip(47, (0, 0), &[0xc5, 0xfc, 0x11, 0x50, 0x70], 0x70, 1), Some(5));
+        // The same store through a header word (a size, not a pointer).
+        assert_eq!(write_skip(48, (0, 0xf0), &[0xc5, 0xfc, 0x11, 0x50, 0x70], 0x160, 1), Some(5));
+        // A VEX *load* (0x10) is not a store: refused.
+        assert_eq!(write_skip(49, (0, 0), &[0xc5, 0xfc, 0x10, 0x50, 0x70], 0x70, 1), None);
+        // A VEX store whose base+disp does not make the fault address: refused.
+        assert_eq!(write_skip(50, (0, 0), &[0xc5, 0xfc, 0x11, 0x50, 0x70], 0x80, 1), None);
     }
 
     #[test]
