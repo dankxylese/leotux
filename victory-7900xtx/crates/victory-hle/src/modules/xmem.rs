@@ -207,6 +207,10 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && placeholder {
         victory_gpu::title_memory_placeholder(at as usize, size);
     }
+    // Its written pages may be asked of Linux directly (`victory_gpu::pagemap`).
+    if !at.is_null() && kind & MEM_WRITE_WATCH != 0 {
+        victory_gpu::memory_watched(at as usize, size);
+    }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)

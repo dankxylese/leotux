@@ -377,7 +377,54 @@ thread_local! {
 /// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    // Under Wine, asked of Linux directly where that is on (`crate::pagemap`):
+    // [`kernel_written_linux`] or the host's `GetWriteWatch` as before.
+    if let Some(pages) = kernel_written_linux(first, last) {
+        return Some(pages);
+    }
     kernel_written_as(first, last, 0)
+}
+
+/// [`kernel_written`] asked of Linux's `PAGEMAP_SCAN` (on under Wine,
+/// `VICTORY_LINUX_SCAN=0` off; [`crate::pagemap`]), the pages found written
+/// and protected again in one step without Wine's lock over the host's
+/// memory tables.
+///
+/// Not taken (and the host asked as before):
+/// - where the range is not one reservation the runtime made write-watched
+///   ([`crate::pagemap::memory_watched`]: what xmem reserved with
+///   `MEM_WRITE_WATCH`, and the upload reservoir). The guards' blocks are
+///   view memory, which is never `MEM_WRITE_WATCH` there (xmem keeps the two
+///   apart), and a heap in place is never registered: so no block we hold
+///   read-only is in a range the scan is taken for;
+/// - what a heap in place pins (`crate::inplace::pinned`: re-protecting a
+///   page the card is pinned to is what the guards forbid, and the scan
+///   protects again);
+/// - where the askings are asked with their watch kept (`no_reset`,
+///   `VICTORY_ASK_NORESET=1`): `PM_SCAN_WP_MATCHING` protects the pages it
+///   found again, which is the reset that switch turns off;
+/// - where the kernel refuses (`-EFAULT`: a hole left by a sub-allocation, a
+///   page not write-protected asynchronously) or native calls are not there:
+///   `None`, and the asking is made as before.
+fn kernel_written_linux(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    if no_reset() || crate::inplace::pinned(first * PAGE, last * PAGE) {
+        return None;
+    }
+    let found = crate::pagemap::written(first * PAGE, last * PAGE)?;
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(0, 1);
+        tally(1, ((last - first) * (PAGE >> 10)) as u64);
+    }
+    let mut pages: Vec<(usize, u16)> = Vec::new();
+    for at in found {
+        let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+        match pages.last_mut() {
+            Some((last, parts)) if *last == page => *parts |= part,
+            _ => pages.push((page, part)),
+        }
+    }
+    Some(pages)
 }
 
 /// Views of the title's physical pages are mapped with the host kernel's
@@ -734,9 +781,22 @@ fn kernel_written_as(first: usize, last: usize, flags: u32) -> Option<Vec<(usize
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
-/// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
-const AHEAD_MAX: usize = (1 << 30) / PAGE;
+/// `VICTORY_AHEAD_GAP_KIB` sets it (default 8 MiB): under Wine an asking
+/// costs by the bytes it walks, not by the call.
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_AHEAD_GAP_KIB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(8 << 20, |k| k << 10) / PAGE
+    })
+}
+/// The most one asking covers (its answer needs 8 bytes per 4 KiB page);
+/// `VICTORY_AHEAD_MAX_MIB` (default 1 GiB).
+fn ahead_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_AHEAD_MAX_MIB").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(1 << 30, |m| m.max(1) << 20) / PAGE
+    })
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -778,8 +838,8 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
+            && pieces[k].0 <= last + ahead_gap()
+            && last.max(pieces[k].1) - first <= ahead_max()
         {
             last = last.max(pieces[k].1);
             k += 1;
@@ -4725,6 +4785,9 @@ pub fn title_memory_regrouped(at: usize, len: usize, section: usize, offset: u64
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // What was write-watched there is none from now on (the direct scan's
+    // reservations, [`crate::pagemap`]).
+    crate::pagemap::memory_released(at, len);
     // What was a placeholder reservation there is none from now on
     // ([`ARENAS`]; with no length, from `at` to the end of the one that
     // holds it: no less than the allocation).
