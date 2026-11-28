@@ -1004,11 +1004,13 @@ struct ChainLoad {
 /// at any width (a 32-bit destination zero-extends it, and a sign extension
 /// of 0 is 0, so the upper half the title would see is 0 too).
 fn chain_load(code: &[u8], at: usize) -> Option<ChainLoad> {
-    // A REX prefix, with X and B clear (`44` REX.R, for a register above r7;
-    // `48` REX.W; `4c` both), or none at all: the `0F` forms are written
-    // without one when their destination is one of the first eight.
+    // A REX prefix, with X clear (no scaled index), R allowed (`44` REX.R,
+    // for a destination above r7), B allowed (the base is any register —
+    // run58's wild load went through r11), W allowed (`48`; `4c` both).
+    // The `0F` forms are written without one when the destination is one of
+    // the first eight.
     let (rex, i) = match *code.get(at)? {
-        rex @ 0x40..=0x4f if rex & 0x03 == 0 => (rex, at + 1),
+        rex @ 0x40..=0x4f if rex & 0x02 == 0 => (rex, at + 1),
         0x40..=0x4f => return None,
         _ => (0, at),
     };
@@ -1099,8 +1101,13 @@ fn skip_null_chain(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
     };
     // The state as well as the bytes: the base is null (or the all-ones
     // sentinel), and the access was to the very address the load makes of it.
+    // A WILD base (non-canonical: its top 16 bits are not the sign extension
+    // of bit 47) can never name memory on any run of this race — the load
+    // faults and Windows reports the all-ones address. The title's other
+    // branch is a null it checks; skipping to that is the same outcome.
     let base = *gpr(context, load.base);
-    if (base != 0 && base != SENTINEL as u64) || base.wrapping_add(load.disp) != p[1] as u64 {
+    let wild = (base << 16) >> 16 != base && p[1] == SENTINEL;
+    if !wild && (base != 0 && base != SENTINEL as u64 || base.wrapping_add(load.disp) != p[1] as u64) {
         return false;
     }
     let Some(n) = count_skip(rip) else {
@@ -3048,6 +3055,22 @@ mod tests {
         // one's.
         assert_eq!(
             chain_skip(41, (0, 0), &[0x44, 0x0f, 0xb7, 0x40, 0x18], 0x18, 1).0,
+            None
+        );
+    }
+
+    #[test]
+    fn a_load_through_a_wild_pointer_is_skipped() {
+        // run58's site: `41 0f b7 43 6c` = movzx eax, WORD [r11+0x6c] with
+        // r11 = 0xff7474823f800000 — a wild, non-canonical pointer, whose
+        // fault Windows reports as the all-ones address.
+        assert_eq!(
+            chain_skip(51, (11, 0xff7474823f800000), &[0x41, 0x0f, 0xb7, 0x43, 0x6c], usize::MAX, 0).0,
+            Some(5)
+        );
+        // A canonical base whose address does not match is still refused.
+        assert_eq!(
+            chain_skip(52, (11, 0x10000), &[0x41, 0x0f, 0xb7, 0x43, 0x6c], usize::MAX, 0).0,
             None
         );
     }
