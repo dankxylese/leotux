@@ -14,7 +14,8 @@
 //! the card holds is compared with what it held 32 bytes at a time, title
 //! memory is read only where they differ, just before the dwords that
 //! change are stored. The pieces of a landing are cut into jobs for a few
-//! threads kept for it ([`Pool`]).
+//! threads kept for it ([`Pool`]): runs of about 256 KiB that end where a
+//! 64 KiB block of title memory does (`VICTORY_LAND_JOB`, in bytes).
 //!
 //! What stays in order: pieces in the same 64 KiB of title memory are in
 //! one job, in the order they were given (two copies may hold the same
@@ -42,8 +43,27 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 pub(crate) const BLOCK: usize = 64 << 10;
 /// The unit title memory is there or not in.
 const PAGE: usize = 4096;
-/// About this many bytes to a job.
+/// About this many bytes to a job (`VICTORY_LAND_JOB` says otherwise, in
+/// bytes: [`job_bytes`]).
 const JOB: usize = 256 << 10;
+
+/// The most bytes one job lands (`VICTORY_LAND_JOB`, in bytes; [`JOB`],
+/// clamped to 64 KiB..4 MiB).
+///
+/// A job never holds pieces of two 64 KiB blocks of title memory, so the
+/// bytes are asked only where a block ends: a landing of the relay's few MB
+/// is a few jobs of this many bytes, and one of hundreds of MB many — on the
+/// threads kept for landing ([`each`]), whose number is
+/// `VICTORY_LAND_THREADS`. Some 18 jobs of 0.16 ms on four threads was the
+/// relay's 26 ms stand at their end (timeline tl.85); pieces of another size
+/// are this knob's question.
+fn job_bytes() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let asked = std::env::var("VICTORY_LAND_JOB").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        asked.map_or(JOB, |bytes| bytes.clamp(BLOCK, 4 << 20))
+    })
+}
 
 /// See the file.
 pub(crate) fn on() -> bool {
@@ -158,7 +178,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "landing per frame (VICTORY_LAND={}, {} threads): which pieces to fetch {:.2} ms, then the fetches (the relay's line); \
          looking through copies in the PC's memory {:.2} ms beside them and {:.2} ms more; merging what was fetched {:.2} ms \
-         ({:.2} ms on all threads, {:.0} jobs), merging the others {:.2} ms ({:.2} on all threads); of the threads' time \
+         ({:.2} ms on all threads, {:.0} jobs of {} KiB, VICTORY_LAND_JOB), merging the others {:.2} ms ({:.2} on all threads); of the threads' time \
          {:.2} ms waiting for the title's bytes going in, {:.2} ms opening or noting guards; then ranges done with {:.2} ms, \
          read-backs and lists {:.2}, the title told {:.2}, the rest {:.2}",
         u8::from(on()),
@@ -169,6 +189,7 @@ pub(crate) fn log(frames: f64) {
         ms(stat::CARD),
         ms(stat::CARD_ALL),
         s[stat::JOBS],
+        job_bytes() >> 10,
         ms(stat::BACK),
         ms(stat::BACK_ALL),
         ms(stat::LOCK),
@@ -521,13 +542,14 @@ pub(crate) fn ordered(pieces: &[Piece]) -> Vec<(usize, usize, usize)> {
 }
 
 /// Pieces (title address, bytes; in [`ordered`]'s order) as jobs: runs of
-/// about [`JOB`] bytes that end where a block ends.
+/// about [`job_bytes`] bytes that end where a block ends.
 pub(crate) fn jobs(pieces: &[(usize, usize)]) -> Vec<std::ops::Range<usize>> {
     let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let most = job_bytes();
     let (mut from, mut bytes) = (0, 0);
     for (i, &(at, len)) in pieces.iter().enumerate() {
         let new_block = i == 0 || pieces[i - 1].0 / BLOCK != at / BLOCK;
-        if bytes >= JOB && new_block {
+        if bytes >= most && new_block {
             out.push(from..i);
             (from, bytes) = (i, 0);
         }

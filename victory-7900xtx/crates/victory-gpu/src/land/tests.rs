@@ -85,7 +85,8 @@ fn a_panicking_job_reaches_the_caller() {
 
 /// The order pieces are landed in holds every byte of every piece, under its
 /// copy, and no other; blocks come in order, pieces of several copies in one
-/// block stay in the order given, and jobs never cut a block.
+/// block stay in the order given, and jobs never cut a block, and hold about
+/// `job_bytes()` bytes (`VICTORY_LAND_JOB`).
 #[test]
 fn ordered_pieces_hold_the_same_bytes() {
     let mut random = Random(99);
@@ -125,6 +126,25 @@ fn ordered_pieces_hold_the_same_bytes() {
             assert_ne!(cut[w[0].end - 1].0 / BLOCK, cut[w[1].start].0 / BLOCK);
         }
     }
+    // A job holds about `job_bytes()` bytes, and no more: pieces of a block
+    // each, in blocks of their own, are cut every that many.
+    let per = job_bytes().div_ceil(BLOCK).max(1);
+    let run: Vec<(usize, usize)> = (0..per * 3 + 2).map(|b| (b * BLOCK, BLOCK)).collect();
+    let (full, rest) = (run.len() / per, run.len() % per);
+    let mut expected = vec![per; full];
+    if rest > 0 {
+        expected.push(rest);
+    }
+    let cut = jobs(&run);
+    assert_eq!(cut.iter().map(|job| job.len()).collect::<Vec<_>>(), expected, "{} bytes to a job", job_bytes());
+    assert!(cut.iter().cloned().flatten().eq(0..run.len()));
+    // Pieces of half a block, two to a block: cut only where a block ends, and
+    // no job holds much more than the bytes asked for.
+    let short: Vec<(usize, usize)> = (0..per * 4).map(|b| (b * BLOCK, BLOCK / 2)).collect();
+    let cut = jobs(&short);
+    assert!(cut.iter().cloned().flatten().eq(0..short.len()));
+    assert!(cut.iter().all(|job| job.clone().map(|i| short[i].1).sum::<usize>() < job_bytes() + BLOCK));
+    assert!(cut.windows(2).all(|w| short[w[0].end - 1].0 / BLOCK < short[w[1].start].0 / BLOCK));
 }
 
 /// Runs join pieces of one copy whose offsets in it touch, across the blocks
