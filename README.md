@@ -40,14 +40,14 @@ Known to be wrong (only what our own runs hit):
 - **Rare title crash**: null dereferences in the title's own streaming code (a spawn descriptor consumed before its
   object is constructed; the upstream "null pointer in own code" race, ~1 in 30 runs). Three survival guards
   (each on unless `0`): `VICTORY_SKIP_NULL_VTABLE` for the vtable-call shape (the load of the register may sit up to
-  16 bytes behind the call, across argument setup only), `VICTORY_SKIP_NULL_CHAIN` for null-base direct-offset
-  loads (`mov`, and `movzx`/`movsx` of a word), and `VICTORY_SKIP_SMALL_WRITE` for a *store* through a small
-  non-null pointer (a size where a pointer belongs) — the fault is skipped with a zero result, decoded fail-closed
-  (only the exact instruction shape, only a null or small base, only a near-null fault address, only in a title
-  image), counted (`NULL_VTABLE_SKIPS` / `NULL_CHAIN_SKIPS` / `WRITE_SKIPS`, printed at exit), reported, and a
-  per-site loop breaker keeps a limping title from spinning in place. `VICTORY_WATCH_RANGE=<base:end>` (hex, one
-  64 KiB block) keeps one block read-only for the whole run and journals every write fault on it (µs, thread,
-  address, qword before and after): the instrument that names the title's writer and its lag.
+  16 bytes behind the call, across argument setup only), `VICTORY_SKIP_NULL_CHAIN` for null-base (or all-ones-sentinel)
+  direct-offset loads (`mov`, and `movzx`/`movsx` of a word or a byte), and `VICTORY_SKIP_SMALL_WRITE` for a *store*
+  through a small non-null pointer (a size where a pointer belongs) — the fault is skipped with a zero result, decoded
+  fail-closed (only the exact instruction shape, only a null, sentinel or small base, only a near-null fault address,
+  only in a title image), counted (`NULL_VTABLE_SKIPS` / `NULL_CHAIN_SKIPS` / `WRITE_SKIPS`, printed at exit),
+  reported, and a per-site loop breaker keeps a limping title from spinning in place. `VICTORY_WATCH_RANGE=<base:end>`
+  (hex, one 64 KiB block) keeps one block read-only for the whole run and journals every write fault on it (µs,
+  thread, address, qword before and after): the instrument that names the title's writer and its lag.
 - **`--console series-s` does not boot here** (stalls before boot compute; the Series-S memory profile it reports
   wedges the title's pool setup). Series X at 4K output is the tested profile; on a 1080p monitor the compositor
   downscale looks native. `VICTORY_OUTPUT` is not used (it upscales from a low internal resolution).

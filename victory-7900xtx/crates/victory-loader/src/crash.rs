@@ -604,6 +604,11 @@ fn in_title_image(at: usize) -> bool {
 /// Below any object the title could have: a read here is a null pointer's.
 const NULL_LIMIT: usize = 0x1_0000;
 
+/// The all-ones address: no mapping is there, and a pointer slot that holds
+/// it holds the sentinel a failed lookup leaves (`(size_t)-1`). A load
+/// through it is the same race as one through a null base.
+const SENTINEL: usize = usize::MAX;
+
 /// Fault addresses the loop breaker tracks: a fixed table, so that the
 /// handler allocates nothing and waits for no lock (the faulting thread may
 /// hold the title's, ours or the heap's).
@@ -967,7 +972,8 @@ struct ChainLoad {
     base: u8,
     /// The offset read, which is the address that faults through a null base.
     disp: u64,
-    /// The bytes the load reads: 8 for `mov`, 2 for `movzx`/`movsx`.
+    /// The bytes the load reads: 8 for `mov`, 2 for `movzx`/`movsx` of a
+    /// word, 1 for one of a byte.
     width: u8,
 }
 
@@ -979,30 +985,38 @@ struct ChainLoad {
 /// offsets forward from the object it should have had; a negative
 /// displacement is not that shape.
 ///
-/// Three forms of it, which are the same fault when the base is null:
+/// Five forms of it, which are the same fault when the base is null or the
+/// all-ones sentinel:
 ///
 /// * `REX.W 8B /r` — `mov reg, [base + disp]`, eight bytes;
 /// * `REX? 0F B7 /r` — `movzx reg, WORD [base + disp]`, two bytes;
-/// * `REX? 0F BF /r` — `movsx reg, WORD [base + disp]`, two bytes.
+/// * `REX? 0F BF /r` — `movsx reg, WORD [base + disp]`, two bytes;
+/// * `REX? 0F B6 /r` — `movzx reg, BYTE [base + disp]`, one byte;
+/// * `REX? 0F BE /r` — `movsx reg, BYTE [base + disp]`, one byte.
 ///
-/// The run44 crash is why the last two are here: its load was
+/// The run44 crash is why the word forms are here: its load was
 /// `44 0f b7 40 18` (`movzx r8d, WORD [rax+0x18]`) with `rax` null, and a
 /// guard that knew only `8B` reported it as a fault to end the process on.
-/// REX.W is not needed for them: `movzx r8d, …` is a 32-bit destination and
-/// still a chain, and the skip writes 0 into the whole register, which is
-/// the value at any width (a 32-bit destination zero-extends it, and a sign
-/// extension of 0 is 0, so the upper half the title would see is 0 too).
+/// The byte forms are the same idiom one width down — the record builder of
+/// the run46 site reads its first field with `0f b6 01` — and, like the word
+/// ones, need no REX.W: `movzx r8d, …` is a 32-bit destination and still a
+/// chain, and the skip writes 0 into the whole register, which is the value
+/// at any width (a 32-bit destination zero-extends it, and a sign extension
+/// of 0 is 0, so the upper half the title would see is 0 too).
 fn chain_load(code: &[u8], at: usize) -> Option<ChainLoad> {
-    let rex = *code.get(at)?;
-    // A REX prefix, with X and B clear: `44` (REX.R, for a register above
-    // r7), `48` (REX.W), `4c` (both).
-    if !matches!(rex, 0x40..=0x4f) || rex & 0x03 != 0 {
-        return None;
-    }
-    let (width, i) = match (*code.get(at + 1)?, *code.get(at + 2)?) {
-        (0x8b, _) if rex & 0x08 != 0 => (8u8, at + 2),
-        // `movzx` and `movsx` of a word: the same shape with two bytes read.
-        (0x0f, 0xb7 | 0xbf) => (2u8, at + 3),
+    // A REX prefix, with X and B clear (`44` REX.R, for a register above r7;
+    // `48` REX.W; `4c` both), or none at all: the `0F` forms are written
+    // without one when their destination is one of the first eight.
+    let (rex, i) = match *code.get(at)? {
+        rex @ 0x40..=0x4f if rex & 0x03 == 0 => (rex, at + 1),
+        0x40..=0x4f => return None,
+        _ => (0, at),
+    };
+    let (width, i) = match (*code.get(i)?, *code.get(i + 1)?) {
+        (0x8b, _) if rex & 0x08 != 0 => (8u8, i + 1),
+        // `movzx` and `movsx`: the same shape with a narrower read.
+        (0x0f, 0xb6 | 0xbe) => (1u8, i + 2),
+        (0x0f, 0xb7 | 0xbf) => (2u8, i + 2),
         _ => return None,
     };
     let modrm = *code.get(i)?;
@@ -1044,11 +1058,12 @@ fn chain_load(code: &[u8], at: usize) -> Option<ChainLoad> {
 /// known.
 ///
 /// Fail-closed, all of: a read (not a write, not an execute); an address
-/// below [`NULL_LIMIT`]; an instruction of exactly the shape [`chain_load`]
-/// decodes; a base register that is exactly 0; a fault address that is
-/// exactly the load's displacement; and `rip` inside a title image the
-/// loader mapped. Anything else returns `false` and is reported as before:
-/// a guard that guesses is worse than a crash that says where it was.
+/// below [`NULL_LIMIT`] or exactly [`SENTINEL`]; an instruction of exactly the
+/// shape [`chain_load`] decodes; a base register that is exactly 0 or exactly
+/// the sentinel; a fault address that is exactly the address the load makes of
+/// it; and `rip` inside a title image the loader mapped. Anything else returns
+/// `false` and is reported as before: a guard that guesses is worse than a
+/// crash that says where it was.
 ///
 /// The site table and its loop breaker are the vtable guard's, keyed by
 /// `rip`: a faulting site is a faulting site, whatever shape it has, and one
@@ -1058,7 +1073,10 @@ fn skip_null_chain(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
     if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
         || record.NumberParameters < 2
         || p[0] != 0
-        || p[1] >= NULL_LIMIT
+        // (Below any object the title could have — or the all-ones address,
+        // which is no mapping at all: the sentinel a failed lookup leaves in
+        // a pointer slot, and the address a load through it faults on.)
+        || (p[1] >= NULL_LIMIT && p[1] != SENTINEL)
     {
         return false;
     }
@@ -1079,9 +1097,10 @@ fn skip_null_chain(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
     let Some(load) = chain_load(&code[..room], 0) else {
         return false;
     };
-    // The state as well as the bytes: the base is null, and the access was
-    // to the very offset the load reads.
-    if *gpr(context, load.base) != 0 || p[1] != load.disp as usize {
+    // The state as well as the bytes: the base is null (or the all-ones
+    // sentinel), and the access was to the very address the load makes of it.
+    let base = *gpr(context, load.base);
+    if (base != 0 && base != SENTINEL as u64) || base.wrapping_add(load.disp) != p[1] as u64 {
         return false;
     }
     let Some(n) = count_skip(rip) else {
@@ -1097,6 +1116,7 @@ fn skip_null_chain(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
     if n == 1 || n.is_multiple_of(4) {
         tracing::warn!(
             site = %locate(rip),
+            base = format_args!("{base:#x}"),
             disp = format_args!("{:#x}", load.disp),
             dst = load.dst,
             bytes = load.width,
@@ -2913,7 +2933,7 @@ mod tests {
         // run44's site: movzx r8d, WORD [rax+0x18] with rax = 0.
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x40, 0x18]), Some((5, 8, 0, 0x18, 2)));
         // The same with a sign extension, with a 64-bit destination, with no
-        // displacement, and with a disp32.
+        // displacement, with a disp32, and without a REX prefix.
         assert_eq!(load(&[0x44, 0x0f, 0xbf, 0x40, 0x18]), Some((5, 8, 0, 0x18, 2)));
         assert_eq!(load(&[0x4c, 0x0f, 0xb7, 0x40, 0x18]), Some((5, 8, 0, 0x18, 2)));
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x02]), Some((4, 8, 2, 0, 2)));
@@ -2921,10 +2941,10 @@ mod tests {
             load(&[0x44, 0x0f, 0xb7, 0x82, 0x18, 0x00, 0x00, 0x00]),
             Some((8, 8, 2, 0x18, 2))
         );
-        // Not one: a byte form, a register as the source, a SIB, RIP-relative
-        // (no base at all), an index register, a base above the first eight,
-        // a negative displacement, and an instruction cut off.
-        assert_eq!(load(&[0x44, 0x0f, 0xb6, 0x40, 0x18]), None);
+        assert_eq!(load(&[0x0f, 0xb7, 0x40, 0x18]), Some((4, 0, 0, 0x18, 2)));
+        // Not one: a register as the source, a SIB, RIP-relative (no base at
+        // all), an index register, a base above the first eight, a negative
+        // displacement, and an instruction cut off.
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0xc0]), None);
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x04, 0x10]), None);
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x05, 0x18, 0, 0, 0]), None);
@@ -2932,6 +2952,58 @@ mod tests {
         assert_eq!(load(&[0x45, 0x0f, 0xb7, 0x40, 0x18]), None);
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x40, 0xf0]), None);
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x80, 0x18]), None);
+        // A 64-bit `mov` still needs its REX.W: `8b 02` is a 32-bit load and
+        // is not this shape.
+        assert_eq!(load(&[0x8b, 0x02]), None);
+    }
+
+    #[test]
+    fn a_chain_load_may_be_a_movzx_or_a_movsx_of_a_byte() {
+        let load = |code: &[u8]| chain_load(code, 0).map(|l| (l.len, l.dst, l.base, l.disp, l.width));
+        // The run46 site's first read: movzx eax, BYTE [rcx], with no REX
+        // prefix, and the sign-extending form of it.
+        assert_eq!(load(&[0x0f, 0xb6, 0x01]), Some((3, 0, 1, 0, 1)));
+        assert_eq!(load(&[0x0f, 0xbe, 0x42, 0x18]), Some((4, 0, 2, 0x18, 1)));
+        assert_eq!(load(&[0x44, 0x0f, 0xb6, 0x42, 0x08]), Some((5, 8, 2, 0x08, 1)));
+        // Not one: a register as the source, and a SIB.
+        assert_eq!(load(&[0x0f, 0xb6, 0xc1]), None);
+        assert_eq!(load(&[0x0f, 0xb6, 0x04, 0x10]), None);
+    }
+
+    #[test]
+    fn a_load_through_the_all_ones_sentinel_is_skipped_as_a_load_of_zero() {
+        let before = NULL_CHAIN_SKIPS.load(Relaxed);
+        // The 14:51 crash's shape, named from the site: movzx eax,BYTE [rcx]
+        // with rcx = -1 — a pointer slot holding the sentinel a failed lookup
+        // leaves — which faults reading 0xffffffffffffffff.
+        let sentinel = usize::MAX;
+        assert_eq!(SENTINEL, sentinel);
+        let (skipped, context) =
+            chain_skip(52, (1, sentinel as u64), &[0x0f, 0xb6, 0x01], sentinel, 0);
+        assert_eq!(skipped, Some(3));
+        assert_eq!(context.Rax, 0);
+        assert!(NULL_CHAIN_SKIPS.load(Relaxed) > before, "skips are counted");
+        // The sentinel with a displacement: the address wraps to a small one,
+        // and the fault must be exactly where the load puts it.
+        assert_eq!(
+            chain_skip(52, (1, sentinel as u64), &[0x0f, 0xb6, 0x41, 0x10], 0xf, 0).0,
+            Some(4)
+        );
+        // Not skipped: a base that is neither null nor the sentinel, the
+        // sentinel's address with the wrong displacement, and an address above
+        // the null page that is no sentinel.
+        assert_eq!(
+            chain_skip(53, (1, 0x1000), &[0x0f, 0xb6, 0x01], sentinel, 0).0,
+            None
+        );
+        assert_eq!(
+            chain_skip(53, (1, sentinel as u64), &[0x0f, 0xb6, 0x01], 0x10, 0).0,
+            None
+        );
+        assert_eq!(
+            chain_skip(53, (1, 0), &[0x0f, 0xb6, 0x81, 0x00, 0x00, 0x01, 0x00], 0x1_0000, 0).0,
+            None
+        );
     }
 
     #[test]
