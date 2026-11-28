@@ -568,6 +568,17 @@ pub(crate) fn sync_heaps() {
                         out.nothing += 1;
                         continue;
                     }
+                    // Renderer port #2's fallback: a record is made from what
+                    // a page's read found only if its words are still the
+                    // ones read and name a view that can be made now; else
+                    // it is dropped and counted (`crate::port_descriptors::
+                    // refused`), never made.
+                    if !samplers
+                        && word(0) == VIEW_TAG
+                        && record_dropped(index, start + u64::from(index) * step, [word(0), word(1), word(2)])
+                    {
+                        continue;
+                    }
                     out.make.push(index);
                     out.kinds[if samplers {
                         3
@@ -1604,6 +1615,114 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
+/// Why a record the heaps' sync would make is not made
+/// ([`record_refusal`]).
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct Refusal {
+    /// Its words are not the ones the page's read gave any more: the title
+    /// rewrote the slot under the read.
+    changed: bool,
+    /// What is wrong with them, for the log.
+    why: &'static str,
+}
+
+/// Whether the record words `record`, read at `handle` out of the title's
+/// heap, name a view this runtime can make now: `None` if they name one,
+/// and why not if they do not.
+///
+/// Records that no store of ours told of are found by looking at their page
+/// (`crate::port_descriptors`'s fallback), which the write watch hands over
+/// some frames after it said the page was written: the title may have
+/// rewritten the slot since, and what the page's read holds then is no
+/// record at all. A host descriptor made from it is made of garbage — a
+/// record word used as a pointer (`View::Shader`'s resource,
+/// `host::make_twinned`) or as an address (a placed view's) — so, before it
+/// is made:
+///
+/// 1. the three words are read again, and must be the ones the page gave
+///    (the title rewrites its heap under our reads; that is the cheapest
+///    and surest sign of it);
+/// 2. `view_at` must resolve them — the store's own test: a table entry at
+///    its generation, a placed view's shape, a constant buffer's address and
+///    size;
+/// 3. every pointer the view carries must be one the store handed out
+///    (`resource::is_resource`, the first word of a resource's object its
+///    table: the same test the store's own paths make before reading a
+///    resource — no registry of our own).
+///
+/// Addresses a view carries are left to the make itself (`shadow::find`,
+/// `resource::texture_at`), which cannot fault on one and makes nothing it
+/// finds no memory for: asking the store for memory here would make it (a
+/// window's copy) for a slot nothing may read, and asking the kernel whether
+/// it is there would cost a `VirtualQuery` (30 µs under Wine) or refuse a
+/// placement whose pages have not arrived yet.
+#[cfg(windows)]
+fn record_refusal(handle: u64, record: [u32; 3]) -> Option<Refusal> {
+    let mut now = [0u32; 3];
+    // SAFETY: three words of ours.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(now.as_mut_ptr().cast::<u8>(), 12) };
+    if !crate::host::read_into(handle as *const u8, bytes) {
+        return Some(Refusal { changed: false, why: "its slot could not be read again" });
+    }
+    if now != record {
+        return Some(Refusal { changed: true, why: "the title rewrote its slot since the page was read" });
+    }
+    let Some(view) = view_at(record[1], record[2]) else {
+        return Some(Refusal { changed: false, why: "its words name no view of ours" });
+    };
+    match record_makes(&view) {
+        Ok(()) => None,
+        Err(why) => Some(Refusal { changed: false, why }),
+    }
+}
+
+/// Whether `view`, resolved from a record's words, is one a descriptor can be
+/// made of: `Ok` if it is, and what is wrong with it if not (the record's
+/// own pointers of step 3 of [`record_refusal`]).
+#[cfg(windows)]
+fn record_makes(view: &View) -> Result<(), &'static str> {
+    use crate::object::This;
+    match view {
+        View::Shader(resource, _) => crate::resource::is_resource(*resource as This)
+            .then_some(())
+            .ok_or("its resource is no live resource of ours"),
+        View::Unordered(resource, counter, _) => {
+            if !crate::resource::is_resource(*resource as This) {
+                return Err("its resource is no live resource of ours");
+            }
+            if *counter != 0 && !crate::resource::is_resource(*counter as This) {
+                return Err("its counter is no live resource of ours");
+            }
+            Ok(())
+        }
+        View::Constant(address, size) => {
+            if *address == 0 || *size == 0 {
+                return Err("its address or size is zero");
+            }
+            Ok(())
+        }
+        View::Placed(_, _, desc) => {
+            if u64::from(desc[10]) | u64::from(desc[11]) << 32 == 0 {
+                return Err("its address is zero");
+            }
+            Ok(())
+        }
+        View::Sampler(_) | View::ConsoleSampler(_) => Ok(()),
+    }
+}
+
+/// [`record_refusal`] for the heaps' sync, which counts and says what it
+/// dropped: whether `index`'s record at `handle` was dropped, not made.
+#[cfg(windows)]
+fn record_dropped(index: u32, handle: u64, record: [u32; 3]) -> bool {
+    let Some(refusal) = record_refusal(handle, record) else {
+        return false;
+    };
+    crate::port_descriptors::refused(index, handle, refusal.why, refusal.changed);
+    true
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     if let Some([lo, hi, size, _]) = words(desc) {
@@ -2079,6 +2198,46 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// A record the fallback found whose resource word is no pointer of ours
+    /// is dropped and counted, never made: making it would use that word as a
+    /// pointer (`host::make_twinned`, `resource::host_copy`), which is how
+    /// runs 44 and 46 crashed (a record word used as one).
+    #[cfg(windows)]
+    #[test]
+    fn a_record_with_a_garbage_view_pointer_is_dropped_and_counted() {
+        // A slot of ours, holding a view record as `record` writes one.
+        let mut slot: [u32; 3] = [0; 3];
+        let at = slot.as_mut_ptr() as u64;
+        record(at, View::Shader(0xdead_0000, None));
+        let words = [slot[0], slot[1], slot[2]];
+        assert_eq!(words[0], VIEW_TAG);
+        assert_eq!(view_at(words[1], words[2]), Some(View::Shader(0xdead_0000, None)), "the words must resolve: the store has the entry");
+        // Its resource word is no resource of ours: not made, and counted.
+        let before = crate::port_descriptors::refused_total();
+        assert!(record_dropped(0, at, words), "a garbage view pointer was made");
+        assert_eq!(crate::port_descriptors::refused_total(), before + 1, "not counted");
+        // A null one, as run44's read at 0x18.
+        record(at, View::Shader(0, None));
+        let null = [slot[0], slot[1], slot[2]];
+        assert!(record_dropped(0, at, null));
+        assert_eq!(crate::port_descriptors::refused_total(), before + 2);
+        // The words the title rewrote since the page's read: not made either,
+        // and said apart (it is the sign the title rewrites its heap under us).
+        record(at, View::Shader(0xdead_0000, None));
+        let read = [slot[0], slot[1], slot[2]];
+        slot[1] = slot[1].wrapping_add(1);
+        assert!(record_dropped(0, at, read), "a record rewritten since the read was made");
+        assert_eq!(crate::port_descriptors::refused_total(), before + 3);
+        // Views that carry an address rather than a pointer are left to the
+        // make itself: a placed view with one and a constant buffer view are
+        // not refused, a constant buffer view of no address is.
+        let mut desc = [0u32; 16];
+        desc[10] = 0x1000;
+        assert!(record_makes(&View::Placed(false, [0; 14], desc)).is_ok());
+        assert!(record_makes(&View::Constant(0x1000, 256)).is_ok());
+        assert!(record_makes(&View::Constant(0, 256)).is_err());
     }
 
     /// A descriptor copied into a placed heap as bytes is mirrored before

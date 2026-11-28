@@ -4746,6 +4746,16 @@ fn make_twinned(
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            // A record's resource word is used as a pointer from here on
+            // (`resource::host_copy` reads the object at it): one that is no
+            // resource of ours names no view this can be made of — a slot the
+            // title rewrote under the sync's read (`descriptor::record_refusal`
+            // drops such a record before it is queued; this is the same test at
+            // the place its words are used).
+            if !crate::resource::is_resource(resource) {
+                crate::port_descriptors::refused_now("its resource is no live resource of ours");
+                return None;
+            }
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
@@ -4835,6 +4845,12 @@ fn make_twinned(
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
+            // As in [`make_twinned`]'s `View::Shader`: a record's resource
+            // word used as a pointer, which must be one of ours.
+            if !crate::resource::is_resource(resource) {
+                crate::port_descriptors::refused_now("its resource is no live resource of ours");
+                return None;
+            }
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {

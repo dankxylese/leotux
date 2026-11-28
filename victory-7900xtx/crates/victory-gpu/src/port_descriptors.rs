@@ -27,10 +27,15 @@
 //! VICTORY_PORT_DESCRIPTORS_EVERY=1`: all of them at every sync, see
 //! [`budget_of`]) are looked at whole, as before; a slot found
 //! with a new view record that no mark told of is made (so it is right from
-//! then on) and counted, with the place in the title's code that last
-//! faulted on its 64 KiB block when the guards saw one ([`faulted`]): a writer
-//! the patches miss shows in the log. Records that are not views (the
-//! allocator's other data) are made as before and counted apart.
+//! then on) and counted — if its words are still the ones the page's read
+//! gave and still name a view this runtime can make
+//! (`descriptor::record_refusal`); else it is dropped and counted ([`refused`]),
+//! never made, since a record made of words the title has rewritten since is a
+//! host descriptor of garbage (a record word used as a pointer: run44, run46)
+//! — with the place in the title's code that last faulted on its 64 KiB block
+//! when the guards saw one ([`faulted`]): a writer the patches miss shows in
+//! the log. Records that are not views (the allocator's other data) are made as
+//! before and counted apart.
 //!
 //! Assumption: a slot whose view record the title overwrote with other data
 //! (not a view) and no mark told of keeps showing its old view on the host
@@ -370,6 +375,49 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     }
 }
 
+/// The fallback found a record at `handle` and will not make it: `why` says
+/// what is wrong with its words, `changed` whether they are no longer the
+/// ones the page's read gave (the title rewrote the slot under it). Counted,
+/// and said as often as [`missed`] says its kind: a record made of words that
+/// are no view of ours is a host descriptor of garbage (the run44/run46
+/// crashes were a record word used as a pointer).
+pub(crate) fn refused(index: u32, handle: u64, why: &'static str, changed: bool) {
+    let n = REFUSED[0].fetch_add(1, Relaxed);
+    if changed {
+        REFUSED[1].fetch_add(1, Relaxed);
+    }
+    REFUSED_ALL.fetch_add(1, Relaxed);
+    if n < 20 || n.is_power_of_two() {
+        tracing::warn!(
+            slot = index,
+            handle = format_args!("{handle:#x}"),
+            %why,
+            changed,
+            "renderer port 2: a record the fallback found was not made (dropped); its words are no view of ours"
+        );
+    }
+}
+
+/// Since the start: records the fallback would have made and did not
+/// ([`refused`], the test of it).
+#[cfg(all(test, windows))]
+pub(crate) fn refused_total() -> u64 {
+    REFUSED_ALL.load(Relaxed)
+}
+
+/// A record whose resource word was no live resource of ours, refused where
+/// its words are used (`descriptor::host::make_twinned`): counted with the
+/// records the sync drops before queuing ([`refused`]), said on the same
+/// terms. Only a resource released between the sync's look and the make
+/// reaches here.
+pub(crate) fn refused_now(why: &'static str) {
+    let n = REFUSED[0].fetch_add(1, Relaxed);
+    REFUSED_ALL.fetch_add(1, Relaxed);
+    if n < 20 || n.is_power_of_two() {
+        tracing::warn!(%why, "renderer port 2: a record was not made (dropped at the making); its resource went");
+    }
+}
+
 /// The runtime's own `memcpy` and `memmove` ([`import`]).
 static REAL: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 
@@ -509,6 +557,13 @@ static TAKEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub(crate) static CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Since the start: view records the fallback found that no mark told of.
 static MISSED_ALL: AtomicU64 = AtomicU64::new(0);
+/// Since the last line: records the fallback would have made and did not
+/// (their words were no view of ours any more, or named none it could make),
+/// and of them those whose words had changed since the page was read
+/// ([`refused`]).
+static REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the start: records the fallback would have made and did not.
+static REFUSED_ALL: AtomicU64 = AtomicU64::new(0);
 /// Since the start: the missed records by the place that last faulted on their block.
 static WRITERS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 /// Since the start: slots taken, of them marked by our calls; pages checked.
@@ -522,6 +577,7 @@ pub(crate) fn line(frames: f64) {
     let [taken, takings, ns] = [0, 1, 2].map(|i| TAKEN[i].swap(0, Relaxed));
     let ours = MARKED_BY_US.swap(0, Relaxed);
     let [pages, missed, other, pending, check_ns, tabled] = [0, 1, 2, 3, 4, 5].map(|i| CHECKED[i].swap(0, Relaxed));
+    let [dropped, rewritten] = [0, 1].map(|i| REFUSED[i].swap(0, Relaxed));
     let copies = [0, 1].map(|i| COPIES[i].swap(0, Relaxed));
     let title_copies = [0, 1].map(|i| TITLE_COPIES[i].swap(0, Relaxed));
     ALL[0].fetch_add(taken, Relaxed);
@@ -540,7 +596,8 @@ pub(crate) fn line(frames: f64) {
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
          of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; its own memcpy's table copies {:.0}, {:.0} slots they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
-         since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed; their writers: {}",
+         of those found and not made (dropped: their words are no view of ours now) {:.2}, {:.2} of them rewritten since the page was read; \
+         since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed, {} found and not made; their writers: {}",
         taken as f64 / frames,
         ours as f64 / frames,
         IMAGE[2].load(Relaxed),
@@ -556,10 +613,13 @@ pub(crate) fn line(frames: f64) {
         other as f64 / frames,
         pending as f64 / frames,
         check_ns as f64 / 1e6 / frames,
+        dropped as f64 / frames,
+        rewritten as f64 / frames,
         ALL[0].load(Relaxed),
         ALL[1].load(Relaxed),
         ALL[2].load(Relaxed),
         MISSED_ALL.load(Relaxed),
+        REFUSED_ALL.load(Relaxed),
         if writers.is_empty() { "none".into() } else { writers }
     );
 }
