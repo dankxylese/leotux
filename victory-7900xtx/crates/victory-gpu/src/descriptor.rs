@@ -1094,9 +1094,12 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
+    /// The shapes of views of placed memory, and where each is by its
+    /// hash ([`shape_key`]): keyed by the shape itself the index held a
+    /// second copy of each, 2.4 million of them (some 900 MB with the list)
+    /// 18 minutes into the world.
     shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    shape_index: std::collections::BTreeMap<u64, u32>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
@@ -1196,6 +1199,11 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     )
 }
 
+fn shape_key(shape: &Shape) -> u64 {
+    use std::hash::BuildHasher;
+    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(shape)
+}
+
 /// The record words that name the view of placed memory at `address` with
 /// shape number `shape`.
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
@@ -1206,16 +1214,25 @@ impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
-        if let Some(&at) = self.shape_index.get(&shape) {
-            return Some(at);
+        let key = shape_key(&shape);
+        if let Some(&at) = self.shape_index.get(&key) {
+            // of two shapes with one hash the second is a table entry, as
+            // when the shapes are full.
+            return (self.shapes[at as usize] == shape).then_some(at);
         }
         if self.shapes.len() >= SHAPES {
             return None;
         }
         let at = self.shapes.len() as u32;
         self.shapes.push(shape);
-        self.shape_index.insert(shape, at);
+        self.shape_index.insert(key, at);
         Some(at)
+    }
+
+    /// The number of `shape` if it is there already.
+    fn known_shape(&self, shape: &Shape) -> Option<u32> {
+        let &at = self.shape_index.get(&shape_key(shape))?;
+        (self.shapes[at as usize] == *shape).then_some(at)
     }
 
     /// The view of placed memory [`placed_words`] named.
@@ -1274,7 +1291,7 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
+                    let known = views_read().known_shape(&shape);
                     let shape = known.or_else(|| views_write().shape(shape));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
@@ -1328,7 +1345,7 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
             + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + views.shape_index.len() as u64 * size_of::<(u64, u32)>() as u64 * 3 / 2,
         constants,
         placed,
         views.shapes.len() as u64,
