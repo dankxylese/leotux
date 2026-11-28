@@ -2740,7 +2740,7 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
+        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped_now(&host.device))
     {
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
         texture = None;
