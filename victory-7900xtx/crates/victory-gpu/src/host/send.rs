@@ -60,9 +60,21 @@ pub(crate) fn words_under() -> bool {
     *ON.get_or_init(|| own() && std::env::var_os("VICTORY_UNDER_WORDS").is_none_or(|v| v != "0"))
 }
 
+/// The scatter: `pairs` holds `(offset in the copy, word)` one after the other,
+/// and each thread stores one word at its offset in `card`.
+///
+/// Bounds: the pairs of a dispatch are whole and inside `pairs` (`at` and
+/// `count` come from [`take`]'s packing of complete runs, and the dispatch is
+/// cut at what a dispatch can hold), and a pair's offset is checked against the
+/// copy's own `size` here as well. A wrong offset writes into another buffer,
+/// so the shader does not take the packing's word for it. The guards are one
+/// statement each: HLSL does not promise that `||` short-circuits, and
+/// `size - p.x` underflows into a bound that passes where it is not evaluated
+/// alone. A word's store is aligned at a word's offset, and a copy is whole
+/// pages (so `size >= 4` and `size - 4` exists).
 const SCATTER: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
-cbuffer Part : register(b0) { uint at; uint count; };
+#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), UAV(u0)"
+cbuffer Part : register(b0) { uint at; uint count; uint size; };
 ByteAddressBuffer pairs : register(t0);
 RWByteAddressBuffer card : register(u0);
 [RootSignature(RS)]
@@ -70,6 +82,9 @@ RWByteAddressBuffer card : register(u0);
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= count) return;
     uint2 p = pairs.Load2(at + id.x * 8u);
+    if (p.x >= size) return;
+    if (size - p.x < 4u) return;
+    if ((p.x & 3u) != 0u) return;
     card.Store(p.x, p.y);
 }
 "#;
@@ -172,8 +187,9 @@ pub(super) fn give_back(memory: Memory) {
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
-/// microseconds of taking them out of the CPU sides.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// runs stored as pairs, dispatches that stored them, microseconds of taking
+/// them out of the CPU sides.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
 /// bytes), and its pairs (where in the memory, how many).
@@ -202,6 +218,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
+    let mut pair_runs = 0u64;
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
         for &(a, b) in ranges.iter().filter(|r| !short(r)) {
@@ -209,6 +226,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             at += ((b - a) as u64).next_multiple_of(16);
         }
         let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        pair_runs += ranges.iter().filter(|r| short(r)).count() as u64;
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }
@@ -252,6 +270,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    STATS[4].fetch_add(pair_runs, Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies, used: at })
@@ -299,6 +318,7 @@ impl Own {
             }
         }
         // SAFETY: the caller's; live objects.
+        let mut dispatches = 0u64;
         unsafe {
             if !first.is_empty() {
                 list.ResourceBarrier(&first);
@@ -311,14 +331,19 @@ impl Own {
                 list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                    // What a pair's offset is checked against in the shader:
+                    // the copy's own bytes, past which a wrong offset would
+                    // write into another buffer's.
+                    let size = u32::try_from(shadow.width()).unwrap_or(u32::MAX);
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
                     let (at, words) = copy.pairs;
                     let mut done = 0;
                     while done < words {
                         let n = (words - done).min(MOST);
-                        let constants = [at as u32 + done * 8, n];
-                        list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                        let constants = [at as u32 + done * 8, n, size];
+                        list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
                         list.Dispatch(n.div_ceil(64), 1, 1);
+                        dispatches += 1;
                         done += n;
                     }
                 }
@@ -327,6 +352,7 @@ impl Own {
                 list.ResourceBarrier(&last);
             }
         }
+        STATS[5].fetch_add(dispatches, Ordering::Relaxed);
     }
 
     /// The memory and the bytes of it used.
@@ -337,5 +363,114 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SHORT, short};
+
+    /// What the shader stores for a pair at `offset` of a copy of `size` bytes:
+    /// its three guards, one statement each, as the HLSL has them.
+    fn stores(offset: u32, size: u32) -> bool {
+        if offset >= size {
+            return false;
+        }
+        if size - offset < 4 {
+            return false;
+        }
+        offset % 4 == 0
+    }
+
+    #[test]
+    fn short_runs_are_whole_words_of_at_most_short() {
+        assert!(short(0, 4), "a word");
+        assert!(short(2 * 65536, SHORT), "a full short run");
+        assert!(!short(0, SHORT + 4), "longer than short");
+        assert!(!short(2, 4), "an offset off the words");
+        assert!(!short(0, 6), "part of a word");
+        // Nothing to send: no words, so no dispatch and no copy.
+        assert!(short(0, 0));
+        // Every run `short` sends is inside the copy at whole words.
+        for (at, len) in [(0usize, 4usize), (65536 + 4, 12), (131072, SHORT)] {
+            assert!(short(at, len));
+            assert!(at % 4 == 0 && len % 4 == 0 && len >= 4);
+        }
+    }
+
+    /// The packing and the scatter, end to end on the CPU: `take` writes one
+    /// `(offset, word)` pair a word of the run into the submission's memory,
+    /// and the shader reads them the way `Load2` does and stores each at its
+    /// offset. What lands is the source's word, nothing beside the runs moves,
+    /// and the last pair a dispatch reads is the last one packed.
+    #[test]
+    fn pairs_store_each_word_of_a_run_and_nothing_beside_it() {
+        const PAGE: usize = 65536;
+        let size = 4 * PAGE;
+        let source: Vec<u8> = (0..size)
+            .map(|i| (i.wrapping_mul(13) & 0xFF) as u8)
+            .collect();
+        let runs = [
+            (0usize, 4usize),
+            (PAGE + 4, PAGE + 16),
+            (2 * PAGE, 2 * PAGE + SHORT),
+        ];
+        let mut words = 0usize;
+        for &(a, b) in &runs {
+            assert!(short(a, b - a), "run {a}..{b} ({} bytes)", b - a);
+            words += (b - a) / 4;
+        }
+
+        // As `take` packs a copy's runs: offset and word, back to back, from
+        // the copy's own bytes.
+        let mut pairs: Vec<u8> = vec![0; words * 8];
+        let mut at = 0usize;
+        for &(a, b) in &runs {
+            for offset in (a..b).step_by(4) {
+                let word = u32::from_le_bytes(source[offset..offset + 4].try_into().unwrap());
+                pairs[at..at + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+                pairs[at + 4..at + 8].copy_from_slice(&word.to_le_bytes());
+                at += 8;
+            }
+        }
+        assert_eq!(at, words * 8, "the packing ends where the words do");
+
+        // The shader, over those bytes: thread `i` takes `pairs.Load2(at + i*8)`
+        // for `count` threads, `at` the copy's byte offset into the memory.
+        let mut card = vec![0xEEu8; size];
+        let (pairs_at, count, card_size) = (0usize, words as u32, size as u32);
+        for i in 0..count as usize {
+            let lane = pairs_at + i * 8;
+            assert!(
+                lane + 8 <= pairs.len(),
+                "a dispatch reads only what was packed"
+            );
+            let offset = u32::from_le_bytes(pairs[lane..lane + 4].try_into().unwrap());
+            let word = u32::from_le_bytes(pairs[lane + 4..lane + 8].try_into().unwrap());
+            if !stores(offset, card_size) {
+                continue;
+            }
+            let offset = offset as usize;
+            card[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+
+        for &(a, b) in &runs {
+            assert_eq!(&card[a..b], &source[a..b], "the run's words, word for word");
+        }
+        let mut beside = card.clone();
+        for &(a, b) in &runs {
+            beside[a..b].fill(0xEE);
+        }
+        assert!(
+            beside.iter().all(|&b| b == 0xEE),
+            "nothing beside the runs moved"
+        );
+
+        // A pair off the copy (a wrong offset) is refused, not stored past it:
+        // the guards a shader has where the packing was wrong.
+        assert!(!stores(card_size, card_size));
+        assert!(!stores(card_size - 3, card_size), "a word over the end");
+        assert!(!stores(2, card_size), "an offset off the words");
+        assert!(stores(card_size - 4, card_size), "the copy's last word");
     }
 }

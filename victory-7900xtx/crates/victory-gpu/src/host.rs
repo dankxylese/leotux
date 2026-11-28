@@ -4310,11 +4310,13 @@ fn late_line(frames: f64) {
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
-                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
+                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters of {:.0} runs, in {:.0} dispatches; {:.2} ms \
                  taking them out of the CPU sides",
                 t[0] / (1 << 20) as f64,
                 t[1],
                 t[2],
+                t[4],
+                t[5],
                 t[3] / 1000.0,
             );
         }
