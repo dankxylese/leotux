@@ -381,6 +381,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "seccommit-probe"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
