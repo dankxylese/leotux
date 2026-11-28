@@ -9700,7 +9700,21 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        for (from, to) in runs.iter() {
+        // (The summaries first, under one read of the journal for the copy's
+        // runs instead of one a run — `crate::watch::Read` — and it ends
+        // before the notes are taken: a copy's notes are never held while the
+        // journal's lock is waited for.)
+        let mut keep: Vec<(usize, usize)> = Vec::with_capacity(runs.0.len());
+        {
+            let journal = crate::watch::read();
+            for (from, to) in runs.iter() {
+                if !(crate::watch::light() && shadow.nothing_new_fast(&journal, from, to - from)) {
+                    keep.push((from, to));
+                }
+            }
+        }
+        for (from, to) in keep {
+            // The summaries could not answer: asked of the notes, as before.
             if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
                 Self::update(&shadow, from, to);
             }
@@ -9864,14 +9878,25 @@ impl Batch {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
             let all: usize = spans.iter().map(|s| s.1 .0.len()).sum();
-            for (shadow, runs) in &mut spans {
-                let mut keep = Vec::with_capacity(runs.0.len());
-                for (from, to) in std::mem::take(&mut runs.0) {
-                    if !shadow.nothing_new(from, to - from) {
-                        keep.push((from, to));
+            // One read of the journal for every span of the flush
+            // (`crate::watch::Read`): each take of it is one the recording
+            // threads wait for. It ends before the notes of any copy are
+            // taken (the order every refresh keeps).
+            {
+                let journal = crate::watch::read();
+                for (shadow, runs) in &mut spans {
+                    let mut keep = Vec::with_capacity(runs.0.len());
+                    for (from, to) in std::mem::take(&mut runs.0) {
+                        if !shadow.nothing_new_fast(&journal, from, to - from) {
+                            keep.push((from, to));
+                        }
                     }
+                    runs.0 = keep;
                 }
-                runs.0 = keep;
+            }
+            // What the summaries could not answer: asked of the notes.
+            for (shadow, runs) in &mut spans {
+                runs.0.retain(|&(from, to)| !shadow.nothing_new(from, to - from));
             }
             spans.retain(|s| !s.1.is_empty());
             #[cfg(feature = "diagnostics")]
@@ -10050,14 +10075,25 @@ impl Batch {
             // another not, and only the clean ones are dropped.)
             #[cfg(feature = "diagnostics")]
             let before: usize = self.refreshes.iter().map(|r| r.1 .0.len()).sum();
-            for (shadow, runs) in &mut self.refreshes {
-                let mut keep = Vec::with_capacity(runs.0.len());
-                for (from, to) in std::mem::take(&mut runs.0) {
-                    if !shadow.nothing_new(from, to - from) {
-                        keep.push((from, to));
+            // One read of the journal for the flush's spans
+            // (`crate::watch::Read`): thousands of them a frame, and each take
+            // of it is one the recording threads wait for. It ends before any
+            // copy's notes are taken.
+            {
+                let journal = crate::watch::read();
+                for (shadow, runs) in &mut self.refreshes {
+                    let mut keep = Vec::with_capacity(runs.0.len());
+                    for (from, to) in std::mem::take(&mut runs.0) {
+                        if !shadow.nothing_new_fast(&journal, from, to - from) {
+                            keep.push((from, to));
+                        }
                     }
+                    runs.0 = keep;
                 }
-                runs.0 = keep;
+            }
+            // What the summaries could not answer: asked of the notes.
+            for (shadow, runs) in &mut self.refreshes {
+                runs.0.retain(|&(from, to)| !shadow.nothing_new(from, to - from));
             }
             self.refreshes.retain(|r| !r.1.is_empty());
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
