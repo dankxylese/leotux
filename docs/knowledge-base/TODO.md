@@ -60,6 +60,17 @@ covers only Wine's builtin. dxil.dll unneeded at runtime (vkd3d carries dxil-spi
 - Vice-Tay's Linux change = the rbtree wineserver: WE ALREADY HAVE IT (nothing to pull).
 - Banding lead (when we hit it): pipeline library x RTV-format mismatch, VICTORY_RTV_FORMAT_LOG=1 to check.
 
+## Mirror sweep yield (pr-mirror-sweep.md, 305 PR heads; sequence AFTER the born merge — same files)
+
+- [ ] M1. #475 PAGEMAP_SCAN from the runtime (kernel write-watch asks past Wine's VM lock, ~20 ms/GB walk avoided; new wine.rs+pagemap.rs; take #475's wine.rs only, #129/#166 create it differently).
+- [ ] M2. #469 translator v2 (17 commits: helper-lane readfirstlane, g16 gradients, annotateHandle AMD crash fix, decode fixes; rebase translator version onto ours, one bump with the fxceless/born line).
+- [ ] M3. #405 SCALAR_SPLITS to every widen caller + divergent-branch scalars + RDNA2 fuzz oracle harness.
+- [ ] M4. #338 built-in shaders' root signatures serialized (vkd3d E_FAIL insurance; rootstring.rs; touches our ambient.rs).
+- [ ] M5. #205 host RAM footprint (VM decommit + ram_trim.rs + trims; heavy rebase, land after #72; measure RSS on a matched run).
+- [ ] M6. #72 opt-in 90/85% LRU VRAM GC + upload pool + retry-on-evict (off by default).
+- [ ] M7. Cheap follow-ons: #334 (DXBC hashing), #81 (wave64 unknown block index), #410 (operandless VOP1 decode + invalidation), #476/#474 scratch chunks (take one — shared membench.rs).
+- Mirror otherwise confirmed redundant (305 heads swept; the 167 remainder are Windows-side D3D12-layer work vkd3d replaces for us; 13 shader decode hardenings catalogued as a batch if a decode-side crash appears).
+
 ## Perf levers from our own telemetry (perf-levers.md 2026-11-27; prologue ~75-100 ms/frame, GPU ~0-10 ms)
 
 - [ ] P1. Relay fetch-ahead: fetch landing N while merging N-1; join pieces across
