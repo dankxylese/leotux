@@ -49,6 +49,9 @@ fi
 # POISON here: the kernel's by-address write tracking misses writes through the mmap
 # views, so 10+ GB/frame reads as changed (run14/15: 0.2-0.5 fps, 793 slow kernel
 # askings/frame). The rbtree server already covers the map/unmap cost it exists for.
+# LAND_BEFORE_REMAP=0 (run36->37 A/B): born's remap settle point sat on the guard
+# lock and inflated the whole frame (80.4 med/p90 195/stdev 46 -> 66.2/78/25).
+# WINDOWS_BAR_MB=4096: upstream-measured -3.4 ms; ridden since run35 without harm.
 defaults VICTORY_LOG=info "VICTORY_LOG_FILE=Z:\\home\\manse\\A.Projects\\GTA6-Emulation\\LeoTux-logs\\victory-trace.log" \
          VICTORY_WINE_MAP=0 \
          VICTORY_PORT_HOME=1 \
@@ -56,6 +59,8 @@ defaults VICTORY_LOG=info "VICTORY_LOG_FILE=Z:\\home\\manse\\A.Projects\\GTA6-Em
          VICTORY_REFRESH_EPOCH=1 \
          VICTORY_REFRESH_RUNS=1 \
          VICTORY_TEXTURE_MAX=0 \
+         VICTORY_LAND_BEFORE_REMAP=0 \
+         VICTORY_WINDOWS_BAR_MB=4096 \
          VICTORY_NO_WATCHDOG=1 \
          VICTORY_SKIP_INT3=1 \
          VICTORY_HAIR=1 \
