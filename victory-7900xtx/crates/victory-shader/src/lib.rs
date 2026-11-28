@@ -40,7 +40,9 @@ pub mod structure;
 /// packed as 16-bit pairs, `annotateHandle` kept block-local, export target 16
 /// as `pos4`, and a scalar written in a lane-divergent compute branch reaching
 /// every lane after the join (`VICTORY_SCALAR_SPLITS`, on) — composed with
-/// 0x4c00_0005's rules above, all of which stay.)
+/// 0x4c00_0005's rules above, all of which stay. The operandless VOP1 decode
+/// and the EXEC destination of VOP3 CMPX (#410) change translations too, and
+/// ride this same bump.)
 pub const TRANSLATOR_VERSION: u32 = 0x4c00_0006;
 
 pub use dxbc::{Container, FourCC, Part};

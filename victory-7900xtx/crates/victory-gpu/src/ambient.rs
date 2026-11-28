@@ -322,7 +322,7 @@ void keep(uint3 at : SV_DispatchThreadID) {
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        c = (c.x != c.x || c.y != c.y || c.z != c.z) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
@@ -517,11 +517,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 written = max(was, found * least);
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
+#ifdef STATS
         uint ignored;
         stats.InterlockedAdd(0, 1, ignored);
         stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
         stats.InterlockedAdd(8, uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
         stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
+#endif
     }
 }
 #endif
@@ -557,10 +559,14 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
-        // SAFETY: the root signature is inside the shader; plain creations.
+        // SAFETY: plain creations.
         unsafe {
             if root.is_none() {
-                root = Some(device.CreateRootSignature(0, &code)?);
+                // The blob's own signature first: only where the host
+                // refuses it (Wine, E_FAIL) is the description read from
+                // the source's `RS` and serialized here used, as the
+                // title's own signatures are. Every pass shares it.
+                root = Some(crate::rootstring::make(device, SOURCE, &code)?);
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),

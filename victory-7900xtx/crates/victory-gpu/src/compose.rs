@@ -84,11 +84,15 @@ impl Composer {
         );
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
+            let device = &host.device;
             let bytes = |b: &ID3DBlob| {
                 std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
             };
-            let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            // The vertex blob's own signature first: only where the host
+            // refuses it (Wine, E_FAIL) is the description read from the
+            // source's `RS` serialized instead, as the title's own
+            // signatures are.
+            let root: ID3D12RootSignature = crate::rootstring::make(device, SOURCE, bytes(&vs))?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),

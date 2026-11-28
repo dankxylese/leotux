@@ -146,8 +146,18 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
+/// For tests (the memory bench, `membench`): the free physical RAM that
+/// [`available_physical_ram`] tells, plus one; 0 (the default): the
+/// system's. What is kept by free RAM (`ram_idle_ms`) is looked at with it.
+#[cfg(test)]
+pub(crate) static FREE_RAM_SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
 pub(crate) fn available_physical_ram() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(said) = FREE_RAM_SAID.load(Ordering::Relaxed).checked_sub(1) {
+        return Some(said);
+    }
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
@@ -668,6 +678,10 @@ pub(crate) fn ram_sample() -> Option<(u64, u64, u64, u64, u64, u64)> {
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return None;
     }
+    #[cfg(test)]
+    if let Some(said) = FREE_RAM_SAID.load(Ordering::Relaxed).checked_sub(1) {
+        m.ullAvailPhys = said;
+    }
     let mut c = PROCESS_MEMORY_COUNTERS {
         cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
         ..Default::default()
@@ -684,6 +698,28 @@ pub(crate) fn ram_sample() -> Option<(u64, u64, u64, u64, u64, u64)> {
         m.ullTotalPhys,
         m.ullTotalPageFile,
     ))
+}
+
+/// The RAM band of the once-a-second sweep ([`sweep`]), kept between sweeps.
+static TRIM_BAND: std::sync::Mutex<RamBand> = std::sync::Mutex::new(RamBand::Calm);
+
+/// Whether the sweep lets idle caches go by the RAM band ([`ram_band`]: free RAM,
+/// commit headroom, this process's private bytes and working set): idle scratch
+/// chunks down to [`SPARE_MOST`] and host lists idle in the pool for 10 s
+/// (`Watch`), all idle chunks and lists idle for 2 s (`High`). Before, idle
+/// scratch was let go only with `VICTORY_RESIDENCY=1` and pooled lists never.
+/// On by default; `VICTORY_PRESSURE_TRIM=0`: as before.
+fn trim_band() -> RamBand {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PRESSURE_TRIM").is_none_or(|v| v != "0")) {
+        return RamBand::Calm;
+    }
+    let mut band = TRIM_BAND.lock().unwrap_or_else(|e| e.into_inner());
+    // (a failed sample keeps the last band)
+    if let Some((working, private, free, commit, total, limit)) = ram_sample() {
+        *band = ram_band(*band, working, private, free, commit, total, limit);
+    }
+    *band
 }
 
 /// How many references are held on a host object (its COM count): ours
@@ -727,8 +763,16 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    let band = trim_band();
+    if crate::residency::pressured() || band == RamBand::High {
         trim_spare_chunks();
+    } else if band == RamBand::Watch {
+        trim_spare_chunks_to(SPARE_MOST);
+    }
+    match band {
+        RamBand::Calm => {}
+        RamBand::Watch => crate::list::let_go_idle(10_000),
+        RamBand::High => crate::list::let_go_idle(2_000),
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -1805,10 +1849,12 @@ impl PlanePass {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
+        // The blob's own signature first: only where the host refuses it
+        // (Wine, E_FAIL) is the description read from the source's `RS` and
+        // serialized here used, as the title's own signatures are. The
         // description points at live data and never releases its pointer.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let root: ID3D12RootSignature = crate::rootstring::make(device, source, &ps)?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -2329,13 +2375,23 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 /// Lets go of the scratch chunks kept idle, when the system is short of
 /// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
 fn trim_spare_chunks() {
+    trim_spare_chunks_to(0);
+}
+
+/// [`trim_spare_chunks`] down to `limit` bytes: those kept longest go first.
+fn trim_spare_chunks_to(limit: u64) {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
+        let (mut n, mut bytes) = (0, spare.bytes);
+        while bytes > limit && n < spare.kept.len() {
+            bytes -= spare.kept[n].1;
+            n += 1;
+        }
+        if n == 0 {
             return;
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        spare.bytes = bytes;
+        spare.kept.drain(..n).collect()
     };
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
@@ -4339,6 +4395,8 @@ pub(crate) mod upcheck;
 pub(crate) mod rtstamps;
 #[cfg(test)]
 mod rtbench;
+#[cfg(test)]
+mod membench;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
@@ -4851,9 +4909,11 @@ impl Host {
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the shader contains its root signature and its bytes live
-        // through pipeline creation.
+        // through pipeline creation. Where the host refuses the signature
+        // inside them (Wine, E_FAIL), the description read from the source's
+        // `RS` is serialized instead (see `crate::rootstring`).
+        let root = crate::rootstring::make(&self.device, CARD_COMPARE, &bytes)?;
         unsafe {
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, &bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -5427,6 +5487,9 @@ impl Host {
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            // (A local of this thread: the memory bench reads its size here.)
+            #[cfg(test)]
+            membench::RELAY_FETCH.store(size, Ordering::Relaxed);
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));

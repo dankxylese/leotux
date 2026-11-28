@@ -252,10 +252,27 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and since when it waits ([`crate::host::moment`]).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
+
+/// Lets go of the host lists that have waited in the pool for `ms` and two
+/// frames, under memory pressure (`host::trim_band`): [`fresh_list`] takes the
+/// one given last, so those that waited longest are the ones no frame needs.
+#[cfg(windows)]
+pub(crate) fn let_go_idle(ms: u64) {
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let (lists, bytes) = &mut *idle;
+        let n = lists.iter().take_while(|i| crate::host::long_ago(i.2, ms, 2)).count();
+        let gone: Vec<Idle> = lists.drain(..n).collect();
+        *bytes -= gone.iter().map(|i| i.1).sum::<u64>();
+        gone
+    };
+    // Dropped outside the lock.
+    drop(gone);
+}
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -280,6 +297,14 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+
+/// For the memory bench (`crate::host::membench`): the host lists idle in
+/// [`IDLE`] and the scratch bytes they keep.
+#[cfg(all(windows, test))]
+pub(crate) fn idle() -> (usize, u64) {
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    (idle.0.len(), idle.1)
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -320,13 +345,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => new_host_list(),
     }
 }
@@ -353,7 +378,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, crate::host::moment()));
             idle.1 += bytes;
         }
     }

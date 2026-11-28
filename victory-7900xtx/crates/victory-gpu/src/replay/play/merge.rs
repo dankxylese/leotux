@@ -174,7 +174,11 @@ impl Player {
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            // The blob's own signature first: only where the host refuses
+            // it (Wine, E_FAIL) is the description read from the source's
+            // `RS` and serialized here used, as the title's own signatures
+            // are.
+            let root: ID3D12RootSignature = crate::rootstring::make(&self.device, SOURCE, bytes)?;
             let pso =
                 self.device
                     .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
