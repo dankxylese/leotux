@@ -26,20 +26,33 @@
 //! it has nothing). `VICTORY_VIEW_GUARD=0`: each address for itself, as
 //! before.
 //!
-//! The sets above are the guards' state, and it can be sharded by address:
-//! one [`Guards`] and one mutex for each hash of the 64 MiB region a block
-//! lies in (8 of them, `VICTORY_GUARDS_SHARDED=1`; unset or `0` keeps the one
-//! mutex, which is the default — see [`sharded`]). An asker walks its range in
-//! address order and holds one shard's lock at a time ([`Segments`]), so
-//! askers over different heaps never queue on the same mutex, and no thread
-//! waits for a second shard while holding one — no order between them has to
-//! be kept. What Windows is asked about a range (what is committed there,
-//! where its views end) is asked with no lock held; a change of a block's
-//! protection, and the note of what it means (guarded, clean, open), is made
-//! under its shard's lock, as one step — never with one of the two without
-//! the other, which would either lose a write of the title's or leave a fault
-//! nobody takes. One ask makes one call for each run of blocks that follow one
-//! another, where it made one for each block.
+//! The sets above are the guards' state, and it is sharded by address: one
+//! [`Guards`] and one mutex for each hash of the 64 MiB region a block lies in
+//! (8 of them, which is the default; `VICTORY_GUARDS_SHARDED=0` keeps the one
+//! mutex — see [`sharded`]). An asker walks its range in address order and
+//! holds one shard's lock at a time ([`Segments`]), so askers over different
+//! heaps never queue on the same mutex, and no thread waits for a second
+//! shard while holding one — no order between them has to be kept. What
+//! Windows is asked about a range (what is committed there, where its views
+//! end) is asked with no lock held; a change of a block's protection, and the
+//! note of what it means (guarded, clean, open), is made under its shard's
+//! lock, as one step — never with one of the two without the other, which
+//! would either lose a write of the title's or leave a fault nobody takes.
+//! One ask makes one call for each run of blocks that follow one another,
+//! where it made one for each block.
+//!
+//! The one thing no single shard can decide alone is a page the title shows at
+//! more than one address: a block is clean only while *every* view of its page
+//! is read-only, and those views lie in as many shards. So the page's views
+//! are taken together in one step over all of them ([`ViewsStep`], taken
+//! before any shard's lock and given back after the last): [`cover_here`]
+//! makes each view read-only and only then notes the block clean, and
+//! [`open_fault`] tells every view written and only then gives the write
+//! access back — neither in between the other's halves. That step is taken for
+//! the pages shown at more than one address only (some per cent of the blocks a
+//! frame guards, see the "guards over several views of a page" line); a page
+//! shown once is guarded, opened and unguarded by its own shard's lock alone,
+//! as it was with one mutex.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
@@ -323,7 +336,23 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
-    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+    // (The shards in use, one at a time: the guards' blocked time as it is
+    // spread, which is what the sharding is for.)
+    let shards: Vec<String> = (0..shard_count())
+        .map(|shard| {
+            let [n, ns] = [0, 1].map(|i| SHARD_WAITS[shard][i].swap(0, std::sync::atomic::Ordering::Relaxed));
+            format!("{shard}: {:.2} ms/{}", ns as f64 / 1e6 / frames, n as f64 / frames)
+        })
+        .collect();
+    format!(
+        "ranges held {}, journal read {}, journal noted in {}, guards {}; guards by shard (blocked ms and waits per frame) [{}]: {}",
+        of(0),
+        of(1),
+        of(2),
+        of(3),
+        if sharded() { "8 shards" } else { "1" },
+        shards.join(", ")
+    )
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -1849,6 +1878,29 @@ static PUBLISHED: Bits = Bits::new();
 /// no view.
 static PROTECTED: Bits = Bits::new();
 
+/// The blocks guarded together with the other views of their page
+/// (`Guards::aliased`: set and cleared with it, under that block's shard's
+/// lock). What a range of blocks with any of them set is asked of before it
+/// is opened ([`open_fault`]) or unguarded ([`views_mapped`]): the views of
+/// the page are other shards' state, so the step over them
+/// ([`ViewsStep`]) is taken for exactly these. Over the blocks of a range it
+/// is a few words, where the census of views would be a look at every page.
+static ALIASED: Bits = Bits::new();
+
+/// `block` is guarded together with the other views of its page: `g`'s set
+/// and [`ALIASED`] in one step, under that state's lock.
+fn alias_noted(g: &mut Guards, block: usize) {
+    g.aliased.insert(block);
+    ALIASED.set(block);
+}
+
+/// Not guarded together with them any more: both in one step, as
+/// [`alias_noted`].
+fn alias_forgotten(g: &mut Guards, block: usize) {
+    g.aliased.remove(block);
+    ALIASED.clear(block);
+}
+
 /// The blocks the title's bytes were put in beside their guards
 /// ([`put_beside`]) and that no asking has told as written since. Such a
 /// block is as it was else: read-only, clean, and an asking that finds its
@@ -2793,19 +2845,30 @@ const SHARDS: usize = 1 << SHARD_BITS;
 /// See [`SHARDS`].
 const SHARD_BITS: usize = 3;
 
-/// The sharding in use (`VICTORY_GUARDS_SHARDED=1`: [`SHARDS`]; unset or `0`:
+/// Since the last line, for each shard: acquisitions of its lock that had to
+/// wait, and the nanoseconds they waited. What the sharded guards' line prints
+/// one shard at a time (`lock_waits`), so that a run can read the one mutex's
+/// 106 to 125 ms a frame of blocked time against the eight it is spread over
+/// (some 15 ms a shard, if the askers are as spread as their heaps).
+#[cfg(feature = "diagnostics")]
+static SHARD_WAITS: [[std::sync::atomic::AtomicU64; 2]; SHARDS] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; SHARDS];
+
+/// The sharding in use ([`SHARDS`], which is the default; `VICTORY_GUARDS_SHARDED=0`:
 /// one, the mutex of before).
 ///
-/// **Default: one mutex, the state sharded only behind the switch.** The
-/// sharded path is not trusted yet: with it on, two of the asker tests that
-/// pit writes against askings through several views of one page
-/// (`watch::many_askers_tests`, view memory) lose a write now and then — a
-/// page made clean at one view while another is writable, which the aliased
-/// cover of [`cover_here`] has to keep from happening and does not, in a
-/// window this change opened (the one mutex of before held the cover and the
-/// protection in one step). What is safe and stays on either way: the runs of
-/// one ask are one `VirtualProtect` each, and what Windows is asked about a
-/// range is asked with no lock held.
+/// **Default: eight shards.** The one mutex was the frame's governor: 106 to
+/// 125 ms of blocked time a frame over all threads at 70 to 80 ms a frame
+/// (some 1.5 threads queued), 295 to 376 µs an acquisition (born-regression
+/// dig, run35/run36) — while what it guards is keyed by block and splits where
+/// [`Blocks`] already splits its words. At eight shards the serialized guard
+/// time is some 15 ms a shard a frame. The multi-view window that kept it off
+/// is closed: the views of a page shown at more than one address are taken in
+/// one step ([`ViewsStep`], [`cover_here`], [`open_fault`]), so a block is
+/// never noted clean while a view of its page is writable, as the one mutex
+/// kept from happening. What is safe either way and stays: the runs of one ask
+/// are one `VirtualProtect` each, and what Windows is asked about a range is
+/// asked with no lock held.
 ///
 /// Read once: which shard a block's state lives in cannot change while any of
 /// it is noted. (So not [`crate::toggled!`], which [`crate::ab`] may turn
@@ -2813,7 +2876,7 @@ const SHARD_BITS: usize = 3;
 fn sharded() -> bool {
     static ON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if std::env::var_os("VICTORY_GUARDS_SHARDED").is_some_and(|v| v == "1") { SHARDS } else { 1 }
+        if std::env::var_os("VICTORY_GUARDS_SHARDED").is_some_and(|v| v == "0") { 1 } else { SHARDS }
     }) > 1
 }
 
@@ -2881,6 +2944,62 @@ fn segments(first: usize, last: usize) -> Segments {
 /// with the one mutex).
 fn segments_with(first: usize, last: usize, shards: usize) -> Segments {
     Segments { at: first, last: last.max(first), shards }
+}
+
+/// The step in which the views of a page are taken together.
+///
+/// A block is clean — known by its bit, and its copies skipped — only while
+/// every view of its page is read-only, and those views lie in as many shards
+/// as their addresses hash to. So what one shard's lock cannot hold in one
+/// step is taken here instead: [`cover_here`] makes every view read-only and
+/// *then* notes the block clean, [`open_fault`] tells every view written and
+/// *then* gives the write access back. Held before the first shard's lock and
+/// given back after the last (they are still taken one at a time, so no order
+/// between the shards has to be argued for), it is to those two what the one
+/// mutex of before was: neither can come between the other's halves.
+///
+/// Taken for the pages the title shows at more than one address only — the
+/// blocks [`ALIASED`] has: a page shown once is guarded, opened and unguarded
+/// by its own shard's lock alone. Those are a small part of what a frame
+/// guards (the "guards over several views of a page" line counts them), so
+/// the step costs the sharding nothing measurable.
+///
+/// Taken by a thread that already holds it it is nothing (the fault handler
+/// runs inside it when a write of our own through a guarded range faults; the
+/// handler may not wait for a lock this thread holds): see [`ViewsStep::take`].
+static VIEWS_STEP: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// This thread is in [`VIEWS_STEP`] (see [`ViewsStep::take`]).
+    static IN_VIEWS_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`VIEWS_STEP`], held; nothing where this thread holds it already.
+struct ViewsStep(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl ViewsStep {
+    fn take() -> ViewsStep {
+        if IN_VIEWS_STEP.try_with(|in_it| in_it.get()).unwrap_or(false) {
+            return ViewsStep(None);
+        }
+        let held = VIEWS_STEP.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = IN_VIEWS_STEP.try_with(|in_it| in_it.set(true));
+        ViewsStep(Some(held))
+    }
+}
+
+impl Drop for ViewsStep {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            let _ = IN_VIEWS_STEP.try_with(|in_it| in_it.set(false));
+        }
+    }
+}
+
+/// [`ViewsStep`], held where some block of `[first, last)` is guarded together
+/// with the other views of its page ([`ALIASED`]); nothing where none is.
+fn views_step_over(first: usize, last: usize) -> Option<ViewsStep> {
+    (view_guard() && ALIASED.any(first, last)).then(ViewsStep::take)
 }
 
 thread_local! {
@@ -2988,7 +3107,7 @@ impl Drop for Held {
         for &block in &mine {
             self.protected.remove(block);
             self.clean.remove(block);
-            self.aliased.remove(block);
+            alias_forgotten(self, block);
             PUBLISHED.clear(block);
             PROTECTED.clear(block);
         }
@@ -3007,7 +3126,10 @@ impl Drop for Held {
 }
 
 impl Guards {
-    /// Holds this shard's lock: tried at once, waited for counted.
+    /// Holds this shard's lock: tried at once, waited for counted — in the
+    /// one line [`lock_waits`] prints and in this shard's own ([`SHARD_WAITS`]:
+    /// the one mutex's blocked time, spread over the shards, is what a run
+    /// reads to see the sharding pay).
     fn lock(shard: usize) -> Held {
         // (One shard at a time, and never the one this thread holds: a
         // second would wait for itself. Nothing takes two at once.)
@@ -3015,7 +3137,18 @@ impl Guards {
         let slot = &GUARDS[shard];
         let guard = match slot.try_lock() {
             Ok(g) => g,
-            Err(_) => waited(3, || slot.lock().unwrap_or_else(|e| e.into_inner())),
+            Err(_) => {
+                #[cfg(feature = "diagnostics")]
+                let began = std::time::Instant::now();
+                let g = waited(3, || slot.lock().unwrap_or_else(|e| e.into_inner()));
+                #[cfg(feature = "diagnostics")]
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    SHARD_WAITS[shard][0].fetch_add(1, Relaxed);
+                    SHARD_WAITS[shard][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+                }
+                g
+            }
         };
         let _ = GUARDS_HELD.try_with(|h| h.set(Some(shard)));
         Held { shard, guard: Some(guard) }
@@ -3650,16 +3783,6 @@ fn set_read_only(from: usize, to: usize) -> bool {
 
 /// Makes the runs of one shard read-only and notes them guarded and clean,
 /// leaving out any that fail and noting those not committed (unmapped)
-/// absent. The same physical pages at every other view of them are made
-/// read-only too ([`cover_runs`]): a write through one of those is this
-/// memory written, and only a fault can say so.
-///
-/// The questions are asked with no lock held ([`survey`], which changes
-/// nothing); the answer is noted, and Windows asked, under the shard's lock.
-/// One call for each run of blocks one view holds, where there was one for
-/// each block.
-/// Makes the runs of one shard read-only and notes them guarded and clean,
-/// leaving out any that fail and noting those not committed (unmapped)
 /// absent; and covers them ([`cover_here`]): the same physical pages at every
 /// other view of them are made read-only too, a write through one of those
 /// being this memory written. `covers`: blocks of the same shard that are
@@ -3668,12 +3791,14 @@ fn set_read_only(from: usize, to: usize) -> bool {
 /// at again.
 ///
 /// The questions are asked with no lock held ([`survey`], which changes
-/// nothing); the answer is noted, and Windows asked, under the shard's lock —
-/// one step with the cover, as it was before the state was sharded, so that
-/// nothing is seen half done: a block read-only and taken for clean while
-/// another view of its page is writable is a write lost, and one read-only
-/// and taken for nothing of ours is a fault nobody takes. One call for each
-/// run of blocks one view holds, where there was one for each block.
+/// nothing); the answer is noted, and Windows asked, under the shard's lock.
+/// The cover of a block whose page is shown elsewhere takes that page's views,
+/// which are other shards', so it is a step of its own ([`ViewsStep`]) after
+/// this shard's lock is given back — but a block is not noted clean before it,
+/// so nothing is seen half done: a block read-only and taken for clean while
+/// another view of its page is writable is a write lost, and one read-only and
+/// taken for nothing of ours is a fault nobody takes. One call for each run of
+/// blocks one view holds, where there was one for each block.
 fn apply_runs(shard: usize, runs: &[(usize, usize)], covers: &[(usize, usize)]) {
     if runs.is_empty() && covers.is_empty() {
         return;
@@ -3683,49 +3808,95 @@ fn apply_runs(shard: usize, runs: &[(usize, usize)], covers: &[(usize, usize)]) 
         crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
     }
     let surveyed: Vec<Surveyed> = runs.iter().map(|&(from, to)| survey(from, to)).collect();
-    let mut g = Guards::lock(shard);
-    for said in &surveyed {
-        // Not committed: a hole, and nothing to protect.
-        for &(from, to) in &said.absent {
-            for block in from..to {
-                g.protected.remove(block);
-                g.clean.remove(block);
-                PROTECTED.clear(block);
+    // Blocks of this shard's that are read-only by our hand but not noted
+    // clean here: their page is shown at other addresses, and its other views
+    // are not read-only yet — taken with them below, in one step
+    // ([`cover_here`]). Nothing is noted clean at one view before every view
+    // of its page is read-only, and that step is where both halves happen.
+    let mut viewed: Vec<usize> = Vec::new();
+    {
+        let mut g = Guards::lock(shard);
+        for said in &surveyed {
+            // Not committed: a hole, and nothing to protect.
+            for &(from, to) in &said.absent {
+                for block in from..to {
+                    g.protected.remove(block);
+                    g.clean.remove(block);
+                    PROTECTED.clear(block);
+                }
+                g.absent.insert_all(from..to);
             }
-            g.absent.insert_all(from..to);
-        }
-        for &block in &said.held {
-            g.held.insert(block);
-        }
-        // Committed and no view: someone else's memory, left as it is.
-        for &(from, to) in &said.foreign {
-            for block in from..to {
-                PROTECTED.clear(block);
+            for &block in &said.held {
+                g.held.insert(block);
             }
-        }
-        for &(from, to) in &said.view {
-            // Ahead of the protection (`PROTECTED`), as it was before: a
-            // fault that comes once the page is read-only waits for this
-            // shard's lock, and finds the block noted.
-            for block in from..to {
-                PROTECTED.set(block);
-            }
-            if set_read_only(from, to) {
-                // (After the call, not before: a store of the title's that
-                // lands while Windows is asked — the page writable until the
-                // last moment of it — would be taken for clean otherwise.)
-                g.protected.insert_all(from..to);
-                g.clean.insert_all(from..to);
-            } else {
+            // Committed and no view: someone else's memory, left as it is.
+            for &(from, to) in &said.foreign {
                 for block in from..to {
                     PROTECTED.clear(block);
                 }
             }
+            for &(from, to) in &said.view {
+                // Ahead of the protection (`PROTECTED`), as it was before: a
+                // fault that comes once the page is read-only waits for this
+                // shard's lock, and finds the block noted.
+                for block in from..to {
+                    PROTECTED.set(block);
+                }
+                if set_read_only(from, to) {
+                    // (After the call, not before: a store of the title's that
+                    // lands while Windows is asked — the page writable until
+                    // the last moment of it — would be taken for clean
+                    // otherwise.)
+                    g.protected.insert_all(from..to);
+                    seen_elsewhere(&mut g, from, to, &mut viewed);
+                } else {
+                    for block in from..to {
+                        PROTECTED.clear(block);
+                    }
+                }
+            }
+        }
+        // (Blocks of the plan read-only by our hand already and not clean:
+        // guarded by way of another view of their page, or not clean because
+        // one could not be made so — looked at again.)
+        for &(from, to) in covers {
+            seen_elsewhere(&mut g, from, to, &mut viewed);
         }
     }
-    let mut all = runs.to_vec();
-    all.extend_from_slice(covers);
-    cover_here(&mut g, shard, &all);
+    cover_here(shard, &viewed);
+}
+
+/// Of this shard's blocks `[from, to)`, those read-only by our hand: the ones
+/// whose page the title shows at another address are noted guarded together
+/// with those views (`alias_noted`, so that an open of any of them tells every
+/// view written, even before the cover below has been made), and go in
+/// `viewed`, to be taken with them by [`cover_here`]; the rest are noted clean,
+/// as one view's page needs no other to be read-only with it.
+///
+/// The census of views is read under the shard's lock (`g`), as it was before
+/// the state was sharded, and after the protection that `PROTECTED` was noted
+/// ahead of — so that a view of the page mapped meanwhile is seen by one of
+/// the two ([`views_mapped`] looks for `PROTECTED` on the views it is told of
+/// after the census has them; this looks at the census after `PROTECTED`).
+/// `[from, to)` in address order, within this shard.
+fn seen_elsewhere(g: &mut Guards, from: usize, to: usize, viewed: &mut Vec<usize>) {
+    let mut shown = elsewhere(from * BLOCK, (to - from) * BLOCK).into_iter().peekable();
+    for block in from..to {
+        if !g.protected.contains(block) {
+            continue;
+        }
+        // (Both in address order: a page shown elsewhere is passed as the
+        // blocks are.)
+        while shown.peek().is_some_and(|(page, _)| page / BLOCK < block) {
+            shown.next();
+        }
+        if shown.peek().is_some_and(|(page, _)| page / BLOCK == block) {
+            alias_noted(g, block);
+            viewed.push(block);
+        } else {
+            g.clean.insert(block);
+        }
+    }
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -3744,46 +3915,45 @@ fn view_guard() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Of the blocks of `runs`, those read-only by our hand: every other view of
-/// their pages is made read-only too, and the block is told clean. Where one
-/// cannot be (the kernel writes through it now, the runtime is changing it, or
-/// it is another shard's state — not this lock's to take), a write through it
-/// would not be seen: the block is not clean, and told as written at every
-/// asking, until it can.
+/// Of the blocks of `viewed` (this shard's), those read-only by our hand whose
+/// page the title shows at other addresses: every other view of the page is
+/// made read-only too, and the block is then noted clean — both halves in one
+/// [`ViewsStep`], which no open of any of those views can come between (it is
+/// the step the one mutex of before took them in).
 ///
-/// Under the shard's lock, `g`, with the census of views read under it as it
-/// was before the state was sharded (the census takes no lock of ours).
-fn cover_here(g: &mut Guards, shard: usize, runs: &[(usize, usize)]) {
-    for &(from, to) in runs {
-        for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
-            let block = page / BLOCK;
-            if !g.protected.contains(block) {
-                continue; // not there, or not ours to guard
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            g.aliased.insert(block);
-            let others: Vec<usize> = others.into_iter().map(|other| other / BLOCK).collect();
-            let mut covered = true;
-            for &other in &others {
-                covered &= protect_alias(g, shard, other);
-            }
-            // (The copy about to be taken is what makes it clean again, and
-            // it reads the block after this.)
-            let covered = covered && others.iter().all(|other| g.protected.contains(*other));
-            if covered {
-                g.clean.insert(block);
-            } else {
-                g.clean.remove(block);
+/// Where one view cannot be made read-only (the kernel writes through it, the
+/// runtime is changing it, a heap in place must stay writable, or it is memory
+/// of our own), a write through it would not be seen: the block is not clean,
+/// and is told as written at every asking, until it can be.
+///
+/// Called with no shard's lock held: the step takes them one at a time itself
+/// (the block's own state may be of any shard, as its other views' are).
+fn cover_here(shard: usize, viewed: &[usize]) {
+    for &block in viewed {
+        // The state may have moved since the plan: another asking, or a write
+        // of the title's, may have opened it.
+        if !Guards::lock(shard).protected.contains(block) {
+            continue;
+        }
+        let _step = ViewsStep::take();
+        #[cfg(feature = "diagnostics")]
+        ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut covered = true;
+        for (page, others) in elsewhere(block * BLOCK, BLOCK) {
+            debug_assert_eq!(page / BLOCK, block);
+            for other in others {
+                covered &= protect_alias(other / BLOCK);
             }
         }
-    }
-    // (The rest are shown nowhere else: clean, if they are ours still.)
-    for &(from, to) in runs {
-        for block in from..to {
-            if g.protected.contains(block) && !g.aliased.contains(block) {
-                g.clean.insert(block);
-            }
+        let mut g = Guards::lock(shard);
+        if !g.protected.contains(block) {
+            continue;
+        }
+        alias_noted(&mut g, block);
+        if covered {
+            g.clean.insert(block);
+        } else {
+            g.clean.remove(block);
         }
     }
 }
@@ -3791,17 +3961,17 @@ fn cover_here(g: &mut Guards, shard: usize, runs: &[(usize, usize)]) {
 /// Makes `block` read-only: another view of a page a copy is about to take
 /// through its own, so that a write through this one faults too. It is not
 /// noted clean: the copies of title memory at this view have not taken the
-/// page ([`guard`] tells such a block as written, then notes it clean).
-/// One that is clean stays so: had the page been written since its copies
-/// took it, [`open`] would have opened it. Whether it is read-only now.
-fn protect_alias(g: &mut Guards, shard: usize, block: usize) -> bool {
+/// page ([`guard`] tells such a block as written, then notes it clean). One
+/// that is clean stays so: had the page been written since its copies took it,
+/// [`open_fault`] would have opened it.
+///
+/// *Whether it is read-only by our hand now* — its own shard's lock taken for
+/// the look and the call (one at a time: the caller holds [`ViewsStep`], which
+/// takes no two).
+fn protect_alias(block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    if shard_of(block) != shard {
-        // (Another shard's state, and not this lock's to take: not covered
-        // here, and the block is told as written until it is.)
-        return false;
-    }
-    g.aliased.insert(block);
+    let mut g = Guards::lock(shard_of(block));
+    alias_noted(&mut g, block);
     if g.protected.contains(block) {
         return true;
     }
@@ -3851,6 +4021,13 @@ fn protect_alias(g: &mut Guards, shard: usize, block: usize) -> bool {
 /// before the first may be written (a write through one is a write of the
 /// others' bytes), and Windows is asked for one run of blocks that follow one
 /// another where it was asked for each.
+///
+/// Blocks of a page the title shows at more than one address are a guarded
+/// view's: what calls this with such blocks holds the views' step
+/// ([`ViewsStep`], [`views_mapped`], [`title_memory_regrouped`]), so that no
+/// cover of theirs notes the page clean once it is writable here.
+/// ([`Held`]'s end calls it with memory of our own, which is no view of the
+/// title's and has no other view to tell.)
 fn unguard_blocks(blocks: &[usize]) {
     if blocks.is_empty() {
         return;
@@ -3994,73 +4171,98 @@ fn open(at: usize, end: usize) -> usize {
 /// too. Returns how many blocks of the range were guarded, whether the
 /// faulting block was noted, and the parts noted as the kernel's.
 ///
-/// One step for each part of the range: what is guarded there, the other
-/// views of their pages told their bytes change, and the write access given
-/// back — all under that shard's lock, as it was before the state was
-/// sharded. Nothing is seen half done: a copy told a block is clean must not
-/// find a view of its page writable, and a block opened and not yet told does
-/// not rest, so the next asking guards it again and the title faults on it
-/// once more (run25's guard faults, +95 % on a +40 % workload).
+/// Two steps for each part of the range, one shard's lock at a time: every
+/// view of the pages opened there is told its bytes change (its `clean` taken
+/// from its own shard's state, whether that is this shard or another), and
+/// only then is the write access given back ([`make_writable`], with that
+/// shard's lock held, as before). A page the title shows at more than one
+/// address is taken in one [`ViewsStep`] with all its views, so that no cover
+/// of it comes between the two — a copy told a block is clean must not find a
+/// view of its page writable. (A page shown once needs none of that: its
+/// block is the only view, and the two steps are this shard's alone.) A block
+/// opened and not yet told does not rest, so the next asking guards it again
+/// and the title faults on it once more (run25's guard faults, +95 % on a
+/// +40 % workload).
 fn open_fault(at: usize, end: usize, fault: Option<usize>, kernel: bool) -> (usize, bool, Vec<(usize, usize, usize)>) {
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return (0, false, Vec::new());
     }
     let one = open_one_view();
+    // (Only a range with a block guarded together with the other views of its
+    // page needs the step: it is the one whose other views are another shard's
+    // state.)
+    let _views = views_step_over(first, last);
     let mut here = 0;
     let mut faulted = false;
     let mut kernel_noted: Vec<(usize, usize, usize)> = Vec::new();
-    // Blocks of another shard's that are read-only by our hand and are other
-    // views of the pages opened here: opened one at a time after (only with
-    // the state sharded, and a page's views are one region's but by the hash
-    // of two).
-    let mut strays: Vec<usize> = Vec::new();
     for (shard, from, to) in segments(first, last) {
-        let mut g = Guards::lock(shard);
-        let mine: Vec<usize> = g.protected.range(from..to).collect();
+        // What this part of the range has guarded, and every view of the pages
+        // of those: the pages' other views are read-only too, and their copies
+        // are this memory's (the census has them; it takes no lock of ours).
+        let (mine, mut told) = {
+            let g = Guards::lock(shard);
+            let mine: Vec<usize> = g.protected.range(from..to).collect();
+            let mut told = mine.clone();
+            for block in g.aliased.range(from..to) {
+                for other in crate::inplace::pages_of(block * BLOCK) {
+                    told.push(other / BLOCK);
+                }
+            }
+            (mine, told)
+        };
+        told.sort_unstable();
+        told.dedup();
         let mine_len = mine.len();
         here += mine_len;
-        let mut open: Vec<usize> = mine;
-        // The other views of their pages: told their bytes change before any
-        // of it is writable, and opened too where they are read-only by our
-        // hand and this shard's.
-        let aliased: Vec<usize> = g.aliased.range(from..to).collect();
-        for block in aliased {
-            g.aliased.remove(block);
-            for other in crate::inplace::pages_of(block * BLOCK) {
-                let other = other / BLOCK;
-                if one {
-                    // (Before the first can be written: its bytes change.)
-                    g.clean.remove(other);
-                    PUBLISHED.clear(other);
-                    continue;
-                }
-                g.aliased.remove(other);
-                if !(first..last).contains(&other) && g.protected.contains(other) {
-                    if shard_of(other) == shard {
-                        open.push(other);
-                    } else {
-                        strays.push(other);
-                    }
+        // (Their bytes change, and before the first of them can be written:
+        // each in its own shard's state, one lock at a time. What was guarded
+        // together with them is not from now on — a cover says so again, and
+        // until then these pages are told written at every asking.)
+        for (shard_of_block, group) in by_shard(told.clone()) {
+            let mut g = Guards::lock(shard_of_block);
+            for block in group {
+                g.clean.remove(block);
+                PUBLISHED.clear(block);
+                if !one {
+                    alias_forgotten(&mut g, block);
                 }
             }
         }
-        open.sort_unstable();
-        open.dedup();
+        let mut open: Vec<usize> = mine;
+        if !one {
+            // (And opened where we hold them read-only: a write through any
+            // view of the page is this memory written.)
+            for (shard_of_block, group) in by_shard(told) {
+                let g = Guards::lock(shard_of_block);
+                open.extend(group.into_iter().filter(|block| g.protected.contains(*block)));
+            }
+            open.sort_unstable();
+            open.dedup();
+        }
         #[cfg(feature = "diagnostics")]
         ALIASES[1].fetch_add(open.len().saturating_sub(mine_len) as u64, std::sync::atomic::Ordering::Relaxed);
-        for &block in &open {
-            g.protected.remove(block);
-            g.clean.remove(block);
-            PUBLISHED.clear(block);
+        for (shard_of_block, group) in by_shard(open) {
+            let mut g = Guards::lock(shard_of_block);
+            for &block in &group {
+                g.protected.remove(block);
+                g.clean.remove(block);
+                alias_forgotten(&mut g, block);
+                PUBLISHED.clear(block);
+            }
+            make_writable(&group);
+            if let Some(block) = fault.filter(|block| group.binary_search(block).is_ok()) {
+                g.opened(block);
+                faulted = true;
+            }
         }
-        make_writable(&open);
         // (The runtime's own kernel write, in this same step and after the
         // write access is back: Windows takes a `PAGE_GUARD` off with
         // `PAGE_READWRITE`, so a page still read-only by our hand would be
         // left open and taken for clean — and one guarded again before the
         // kernel is let in would make its write fail.)
         if kernel {
+            let mut g = Guards::lock(shard);
             let (from_at, to_at) = ((from * BLOCK).max(at), (to * BLOCK).min(end));
             crate::census::disarm(from_at, to_at - from_at);
             // Nothing known of them stands while they are left alone.
@@ -4073,23 +4275,6 @@ fn open_fault(at: usize, end: usize, fault: Option<usize>, kernel: bool) -> (usi
             }
             g.kernel.push((from, to));
             kernel_noted.push((shard, from, to));
-        }
-        if let Some(block) = fault.filter(|block| open.binary_search(block).is_ok()) {
-            g.opened(block);
-            faulted = true;
-        }
-    }
-    if !strays.is_empty() {
-        strays.sort_unstable();
-        strays.dedup();
-        for (shard, group) in by_shard(strays) {
-            let mut g = Guards::lock(shard);
-            for &block in &group {
-                g.protected.remove(block);
-                g.clean.remove(block);
-                PUBLISHED.clear(block);
-            }
-            make_writable(&group);
         }
     }
     (here, faulted, kernel_noted)
@@ -4259,6 +4444,10 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if !ranges.iter().any(|&(at, n)| PROTECTED.any(at / BLOCK, (at + n).div_ceil(BLOCK))) {
         return;
     }
+    // (The step the views of a page are guarded in: no cover of theirs comes
+    // between what is read below and the write access given back, and none
+    // notes a block clean once one of its page's views is writable again.)
+    let _step = ViewsStep::take();
     // All of them, once one is guarded: another may have been made clean
     // since that look, relying on those that are opened here. And all
     // together: none may be writable while another is clean (who asks about
@@ -4287,6 +4476,11 @@ pub fn title_memory_splitting(at: usize, len: usize) {
     if others.is_empty() {
         return;
     }
+    // (One step: what is told written below and the write access given back
+    // cannot come between a cover's protection of these pages and its note of
+    // clean — nor can that cover see a page clean once a view of it is
+    // writable here.)
+    let _step = ViewsStep::take();
     // (The view itself too: the part that stays is read-only until then. And
     // all of them told as written before the first is writable.)
     for (shard, group) in by_shard(others.iter().map(|other| other / BLOCK).collect()) {
@@ -4769,8 +4963,10 @@ pub fn title_memory_regrouped(at: usize, len: usize, section: usize, offset: u64
         }
         if !refused.is_empty() {
             // As a write would leave them: open, and their pages not clean at
-            // any other view.
+            // any other view. (In one step, so that no cover of them notes one
+            // clean once one of its page's views is writable again.)
             refused.sort_unstable();
+            let _step = ViewsStep::take();
             unguard_blocks(&refused);
         }
     }
@@ -4905,7 +5101,7 @@ fn title_memory_changed(at: usize, len: usize) {
         }
         let aliased: Vec<usize> = g.aliased.range(from..to).collect();
         for block in aliased {
-            g.aliased.remove(block);
+            alias_forgotten(&mut g, block);
         }
         // (Nor stays a block opened for writing there: born `ed8e4cc`.)
         forget_opened(&mut g, from..to);
@@ -5437,13 +5633,13 @@ mod tests {
                 g.clean.remove(block);
                 g.absent.remove(block);
                 g.held.remove(block);
-                g.aliased.remove(block);
+                alias_forgotten(&mut g, block);
             }
             for block in g.clean.range(from..to).chain(g.absent.range(from..to)).chain(g.held.range(from..to)).chain(g.aliased.range(from..to)).collect::<Vec<_>>() {
                 g.clean.remove(block);
                 g.absent.remove(block);
                 g.held.remove(block);
-                g.aliased.remove(block);
+                alias_forgotten(&mut g, block);
             }
             for block in g.foreign.range(from..to).copied().collect::<Vec<_>>() {
                 g.foreign.remove(&block);
@@ -6741,7 +6937,8 @@ mod tests {
     }
 
     fn aliased_insert(block: usize) {
-        guards_at(block * BLOCK).aliased.insert(block);
+        let mut g = guards_at(block * BLOCK);
+        super::alias_noted(&mut g, block);
     }
 
     fn put_beside_once(block: usize, byte: u8) {
