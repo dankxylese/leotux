@@ -6,7 +6,7 @@ distro Wine — **no Proton build**.
 
 **No game files are in this repository.** You need your own copy of the game.
 
-## Where it stands (2026-11-27)
+## Where it stands (2026-11-28)
 
 Tested on one machine: Ryzen 7 5800X3D, 32 GB RAM, Radeon RX 7800 XT 16 GB (RADV, Mesa 26.2.6),
 EndeavourOS (Arch) with the CachyOS kernel 7.3.3. The reference scene is the prologue (it renders
@@ -16,7 +16,7 @@ real world content and is 1-to-1 comparable between runs).
 |---|---|
 | Boot, menus, intro video | 30 fps, the title's own cap (no rubber-banding: joins are world-only) |
 | From the start to the world | about 20-30 s |
-| Prologue, in-world | 15-19 fps, 66.2 ms a frame median (p90 78.8) |
+| Prologue, in-world | 14-15 fps, 67-69 ms a frame median (p90 ~79), frame-time stdev ~11 |
 | Faces and mouths | **working** — skin on every run, lips follow the dialogue |
 | Shaders and pipelines | pre-computed before the title starts (`warm-up.sh`: every shader translated once, every pipeline earlier runs drew with made ahead, with a progress window — the title does not stall on them) |
 
@@ -29,13 +29,14 @@ they used to be read as floats through integer views, which computes zeros: a fa
 
 Known to be wrong (only what our own runs hit):
 
-- **The frame is the layer's memory overlay, not the GPU**: ~23 ms uploading pages the title wrote and ~20 ms
-  reading back what shaders wrote, of a ~66 ms frame, with the GPU idle for most of it. The read-back was ~49 ms
+- **The frame is the layer's memory overlay, not the GPU**: ~21 ms uploading pages the title wrote and ~20 ms
+  reading back what shaders wrote, of a ~68 ms frame, with the GPU idle for most of it. The read-back was ~49 ms
   until shaders' writes into write-combined title memory were left on the card (`VICTORY_WC_NO_BACK`, on by
-  default); what is left: ~22 s a run of one-fence-wait-per-allocation page-ins of new card memory (the
-  world-load frame's few-second dip; a batched wait is being written), ~21 GB a frame re-inspected to find
-  ~90 MB of writes, and fetches of ranges the title's CPU never reads. Being worked on
-  (docs/knowledge-base/TODO.md); 30 fps is the target.
+  default). What is left: the uploads move ~90 MB a frame because one ~480-byte constant-buffer fill dirties a
+  whole 64 KiB copy unit; ~22 s a run of one-fence-wait-per-allocation page-ins of new card memory (the
+  world-load frame's few-second dip; a batched wait is being written); and refreshes that re-inspect
+  ~21 GB a frame to find those writes — epoch summaries now answer ~4 GB a frame of that in O(1)
+  (`VICTORY_REFRESH_EPOCH`), with the rest being dug into (docs/knowledge-base/TODO.md). 30 fps is the target.
 - **Rare title crash**: null dereferences in the title's own streaming code (a spawn descriptor consumed before its
   object is constructed; the upstream "null pointer in own code" race, ~1 in 30 runs). Two survival guards
   (each on unless `0`): `VICTORY_SKIP_NULL_VTABLE` for the vtable-call shape and `VICTORY_SKIP_NULL_CHAIN` for
@@ -111,7 +112,7 @@ from, what was merged and how conflicts were resolved is in its `UPSTREAM.md`.
 
 | Tree | What it is | State here |
 |---|---|---|
-| `victory-7900xtx` (default) | [avatarmanz's RDNA 3 fork](https://github.com/avatarmanz/VIctory-7900XTX) + [zeex64's Linux work](https://github.com/zeex64/VIctory-7900XTX) + PR [#440](https://github.com/avatarmanz/VIctory-7900XTX/pull/440) and its mouths-fix advance + [Belobug#477](https://github.com/Belobug/VIctory-Belobug-AMD/pull/477) (`VICTORY_WC_NO_BACK`) + ours (a staged read-back relay, the port-1 home decoupled, the null-vtable guard) | 17-19 fps in the prologue with faces and mouths working |
+| `victory-7900xtx` (default) | [avatarmanz's RDNA 3 fork](https://github.com/avatarmanz/VIctory-7900XTX) + [zeex64's Linux work](https://github.com/zeex64/VIctory-7900XTX) + PR [#440](https://github.com/avatarmanz/VIctory-7900XTX/pull/440) and its mouths-fix advance + [Belobug#477](https://github.com/Belobug/VIctory-Belobug-AMD/pull/477) (`VICTORY_WC_NO_BACK`) + ours (a staged read-back relay, the port-1 home decoupled, refresh epochs and disjoint runs, guards-v2, the null-vtable and null-chain guards) | 14-15 fps in the prologue with faces and mouths working |
 | `victory`, `scarlight` | older Belobug and [Scarlight](https://github.com/pablogonz12/Scarlight) trees | kept for reference |
 
 `victory-belobug` and `victory-dexnom` were dropped here (2026-11-27): both were far behind
@@ -124,8 +125,10 @@ crash reports and stack dumps in that log, the 1.0.2.1 int3 assert stepped over 
 write-watched pages that Wine refuses to write, the early pipeline list kept without a host pipeline library, and
 [KLBF Lab](https://github.com/PastiiJay/klbf-lab)'s half-wave port for 64-lane AMD hosts (`VICTORY_PS_HALVES`);
 plus, from LeoTux: the direct-Wine launcher (`run-victory-direct.sh`) with the `warm-up.sh` progress window,
-the rbtree-server engagement, the `VICTORY_SKIP_NULL_VTABLE` survival guard, and the port-1 home decoupled
-from the mmap mode (`VICTORY_PORT_HOME=1` under `VICTORY_WINE_MAP=0`).
+the rbtree-server engagement, the `VICTORY_SKIP_NULL_VTABLE`/`VICTORY_SKIP_NULL_CHAIN` survival guards, the
+port-1 home decoupled from the mmap mode (`VICTORY_PORT_HOME=1` under `VICTORY_WINE_MAP=0`), the refresh
+region/piece/block epochs with their verifier and the disjoint refresh runs (`VICTORY_REFRESH_EPOCH`,
+`VICTORY_REFRESH_RUNS`), and guards-v2 (protection coalescing, queries outside the lock).
 
 ## Settings
 
@@ -146,6 +149,9 @@ variable set in the environment wins. Our `run-victory-direct.sh` takes the same
 | `VICTORY_TEXTURE_MAX` | `0` | the merged tree caps streamed textures at 1024 px by default (muddy textures); `0` keeps full mips on the 16 GB card |
 | `VICTORY_WC_NO_BACK` | `1` | shaders' writes into write-combined title memory stay on the card (prologue A/B: read-back 49 -> 20 ms, median 74.7 -> 53.6); `0` restores fetching |
 | `VICTORY_CARD_BUFFERS_MIN_KB` | `1024` | buffers under 1 MiB do not get a VRAM copy (prologue A/B: p90 95.4 -> 78.8 ms, the world-load dip ~2 s shorter, no VRAM pressure); `64` restores the old floor |
+| `VICTORY_REFRESH_EPOCH` | `1` | epoch summaries answer provably-clean refresh spans in O(1) instead of walking them (verified 0 disagreements against full walks; `0` walks); pairs with `VICTORY_EPOCH_VERIFY=1` to watch agreement live |
+| `VICTORY_REFRESH_RUNS` | `1` | refreshes track up to 8 disjoint runs per copy instead of one min-max envelope (stdev 26.9 -> 10.6 with the verifier off; `0` restores the single envelope) |
+| `VICTORY_THIN_THREADS` | `14` | thin worker threads (neutral A/B in the prologue; kept for denser scenes) |
 | `VICTORY_WARM_FIRST` | `1` | `0`: start the title without compiling shaders first |
 | `VICTORY_FORK_SETTINGS` | `1` | `0`: none of the tree's speed switches (to tell whether one of them is at fault) |
 | `VICTORY_AMBIENT` | `0` | the title's own ambient light; `0.8`: the forks' stand-in for the missing ray-traced light (flatter skin) |
