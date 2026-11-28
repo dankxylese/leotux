@@ -3537,6 +3537,52 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+thread_local! {
+    /// The copy whose page notes (`copied`) this thread holds, by
+    /// [`Shadow::id`] (0: none): what says a refresh of the same copy has come
+    /// back to the lock on the thread that holds it, which waits for ever. The
+    /// page notes are taken one copy at a time ([`Pages`]).
+    static PAGES_MINE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The copy whose page notes this thread holds now (0: none).
+fn pages_mine() -> u64 {
+    PAGES_MINE.try_with(std::cell::Cell::get).unwrap_or(0)
+}
+
+/// [`Shadow::copied`], held, and the thread's [`PAGES_MINE`] told while it is:
+/// dropped with it.
+struct Pages<'a>(std::sync::MutexGuard<'a, Vec<u64>>, u64);
+
+impl<'a> Pages<'a> {
+    /// `g`, the page notes of the copy `id`, and the thread told it holds
+    /// them; what it held before is put back when this is dropped.
+    fn new(g: std::sync::MutexGuard<'a, Vec<u64>>, id: u64) -> Pages<'a> {
+        let out = pages_mine();
+        let _ = PAGES_MINE.try_with(|mine| mine.set(id));
+        Pages(g, out)
+    }
+}
+
+impl std::ops::Deref for Pages<'_> {
+    type Target = Vec<u64>;
+    fn deref(&self) -> &Vec<u64> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Pages<'_> {
+    fn deref_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.0
+    }
+}
+
+impl Drop for Pages<'_> {
+    fn drop(&mut self) {
+        let _ = PAGES_MINE.try_with(|mine| mine.set(self.1));
+    }
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -4674,13 +4720,29 @@ impl Shadow {
         }
     }
 
-    /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], later: Option<&mut Later>) -> usize {
-        let base = self.start as usize / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
+/// Copies the pages of `[from, to)` written after their last copy
+/// (`written`: last writes by page, in page order; `now`: this
+/// asking), whole pages within the buffer.
+fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], later: Option<&mut Later>) -> usize {
+    let base = self.start as usize / PAGE;
+    // (One job a copy is what keeps this lock from being taken twice on one
+    // thread — a flush hands a copy's runs to one job, `Batch`: `runs-hang.md`.
+    // If that ever stops being so, say it instead of waiting for ever: the
+    // job another run of this copy would need is what `wide`'s own drain runs.)
+    if pages_mine() == self.id {
+        // (The deadlock run27 froze in, said instead: `runs-hang.md`.)
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if said <= 8 || said.is_power_of_two() {
+            tracing::error!(
+                copy = self.id,
+                span = format_args!("{from:#x}..{to:#x}"),
+                "a refresh of a copy re-enters the copy's own page notes on the one thread: a second job of that copy is in the air (VICTORY_REFRESH_RUNS hands one job per copy; runs-hang.md)"
+            );
+        }
+    }
+    let mut copied = Pages::new(self.copied.lock().unwrap_or_else(|e| e.into_inner()), self.id);
+    let mut writes = written.iter().peekable();
         // Pages the range holds in part are never noted in `copied`, and
         // were copied again at every refresh of the range, written or not:
         // of the heap's buffer views alone two ends for each of 4,400
@@ -4779,6 +4841,23 @@ impl Shadow {
             }
         }
         let this = std::ptr::from_ref(self) as usize;
+        // The confirmation of run27's fix (`runs-hang.md`): this thread holds
+        // the copy's page notes while the work goes to the kept threads, and
+        // `wide`'s own drain runs whatever job is in front of that queue. Safe
+        // only while a flush hands **one job a copy** (`Batch::flush_all`,
+        // `Batch::refresh_spans`): a second job of this copy in the air would
+        // come back to the notes held here, on the thread holding them, and
+        // wait for ever. Said once, so a run's log carries it.
+        if pages_mine() == self.id {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::error!(
+                    copy = self.id,
+                    bytes,
+                    "a copy's refresh goes wide with its own page notes held: one job a copy is what makes that safe (VICTORY_REFRESH_RUNS; runs-hang.md)"
+                );
+            });
+        }
         wide_each(parts.len(), move |i| {
             // SAFETY: `wide_each` returns when every part is done, before
             // the borrow of `self` ends. The parts lie apart.

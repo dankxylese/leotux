@@ -9502,37 +9502,55 @@ impl Batch {
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
         const FEW: usize = 256;
-        let mut spans = spans;
+        // One job a copy, its runs one after another: a copy's page notes are
+        // not re-entrant, so two jobs of one copy may not be in the air at once
+        // (run27; `runs-hang.md`).
+        let mut spans = Self::by_copy(spans);
         // (Renderer port #6: on the threads beside, whatever their number.)
         let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
-            let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let all: usize = spans.iter().map(|s| s.1 .0.len()).sum();
+            for (shadow, runs) in &mut spans {
+                let mut keep = Vec::with_capacity(runs.0.len());
+                for (from, to) in std::mem::take(&mut runs.0) {
+                    if !shadow.nothing_new(from, to - from) {
+                        keep.push((from, to));
+                    }
+                }
+                runs.0 = keep;
+            }
+            spans.retain(|s| !s.1.is_empty());
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            FLUSHES[2].fetch_add((all - spans.iter().map(|s| s.1 .0.len()).sum::<usize>()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
-            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+            let ranges: Vec<(usize, usize)> = spans
+                .iter()
+                .filter(|s| s.0.asked_ahead())
+                .flat_map(|s| s.1.iter())
+                .collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
-        FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        FLUSHES[3].fetch_add(spans.iter().map(|s| s.1 .0.len()).sum::<usize>() as u64, Ordering::Relaxed);
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
                 return;
             };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+            let (shadow, runs) = &spans[i];
+            for (from, to) in runs.iter() {
+                if many && shadow.nothing_new(from, to - from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Self::update(shadow, from, to);
             }
-            Self::update(shadow, *from, *to);
         });
         if ahead {
             crate::watch::ask_ahead_done();
@@ -9577,14 +9595,18 @@ impl Batch {
                 .or_default()
                 .add_exact(*from, *to);
         }
+        // (One job a copy, its runs one after another: `runs-hang.md`.)
+        let due = Self::by_copy(due);
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
         crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
-                Self::update(shadow, *from, *to);
+            let (shadow, runs) = &due[i];
+            for (from, to) in runs.iter() {
+                if !shadow.nothing_new(from, to - from) {
+                    Self::update(shadow, from, to);
+                }
             }
         });
         // The time counted is the time it took, not the threads' sum.
@@ -9694,10 +9716,14 @@ impl Batch {
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let jobs = self.jobs();
-        let ahead = jobs.len() > 1;
+        let ahead = jobs.iter().map(|j| j.1 .0.len()).sum::<usize>() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = jobs.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+            let ranges: Vec<(usize, usize)> = jobs
+                .iter()
+                .filter(|j| j.0.asked_ahead())
+                .flat_map(|j| j.1.iter())
+                .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
@@ -9708,31 +9734,43 @@ impl Batch {
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            FLUSHES[3].fetch_add(jobs.len() as u64, Ordering::Relaxed);
+            FLUSHES[3].fetch_add(jobs.iter().map(|j| j.1 .0.len()).sum::<usize>() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
+                // A number to a free thread, not a job to each copy; and a
+                // copy's runs one after another, on one thread (its page notes
+                // are not re-entrant: `runs-hang.md`).
                 let refreshes = jobs;
                 crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
+                    let (shadow, runs) = &refreshes[i];
+                    for (from, to) in runs.iter() {
+                        if (refreshes.len() > FEW || beside) && shadow.nothing_new(from, to - from) {
+                            #[cfg(feature = "diagnostics")]
+                            FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Self::update(shadow, from, to);
                     }
-                    Self::update(shadow, *from, *to);
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = jobs
                     .into_iter()
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                    .map(|(shadow, runs)| {
+                        Box::new(move || {
+                            for (from, to) in runs.iter() {
+                                Self::update(&shadow, from, to);
+                            }
+                        }) as Box<dyn FnOnce() + Send>
+                    })
                     .collect();
                 crate::shadow::wide_run(jobs);
             }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in jobs {
-                Self::update(&shadow, from, to);
+            for (shadow, runs) in jobs {
+                for (from, to) in runs.iter() {
+                    Self::update(&shadow, from, to);
+                }
             }
         }
         if ahead {
@@ -9740,15 +9778,29 @@ impl Batch {
         }
     }
 
-    /// Each run of each pending copy as a job of its own ([`Batch::update`]),
-    /// taken: a copy the batch keeps several runs of is refreshed at each of
-    /// them, and none of them may be left out (R4).
-    fn jobs(&mut self) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-        let mut jobs = Vec::with_capacity(self.refreshes.len());
-        for (shadow, runs) in self.refreshes.drain(..) {
-            for (from, to) in runs.iter() {
-                jobs.push((shadow.clone(), from, to));
-            }
+    /// The flush's copies as jobs, one per copy with every run of it, taken.
+    ///
+    /// One job a copy, not one a run: `Shadow`'s page notes (`copied`) are held
+    /// across the bytes' copy, and `wide`'s own drain runs whatever job is in
+    /// front of the queue, so a second job of the same copy would come back to
+    /// that lock on the thread that holds it and wait for ever (run27 froze
+    /// exactly so; `runs-hang.md`).
+    fn jobs(&mut self) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, Runs)> {
+        std::mem::take(&mut self.refreshes)
+    }
+
+    /// `spans`, a run each, as jobs of one copy each, in the order of their
+    /// first touch: what [`Batch::refresh_spans`] hands the threads.
+    fn by_copy(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, Runs)> {
+        let mut at: ByCopy<usize> = ByCopy::default();
+        let mut jobs: Vec<(std::sync::Arc<crate::shadow::Shadow>, Runs)> = Vec::new();
+        for (shadow, from, to) in spans {
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let i = *at.entry(key).or_insert_with(|| {
+                jobs.push((shadow.clone(), Runs::default()));
+                jobs.len() - 1
+            });
+            jobs[i].1.0.push((from, to));
         }
         jobs
     }
@@ -11718,6 +11770,101 @@ mod refresh_tests {
             batch.flush();
         }
         crate::watch::ask_once_end();
+    }
+
+    /// The units a flush hands the kept threads are **copies**, not runs: a
+    /// copy's runs are one job (its page notes are not re-entrant, and the
+    /// drain `wide` does itself would run a second job of it on the thread that
+    /// holds them — run27, `runs-hang.md`). Asserted on the shape itself, which
+    /// is deterministic, and on a flush that must come back (below).
+    #[test]
+    fn a_flush_hands_one_job_a_copy() {
+        const BIG: usize = 1 << 20;
+        let mut copies = Vec::new();
+        for n in 0..3 {
+            let len = if n == 0 { BIG + 5 * PAGE } else { 2 * PAGE };
+            let region = title(len, true);
+            let data = memory(len);
+            copies.push(Shadow::unbacked(region as u64, data, len as u64, false));
+        }
+        let mut batch = Batch::default();
+        // The first copy touched in three places, the others once.
+        batch.refreshes.push((
+            copies[0].clone(),
+            super::Runs(vec![(0, PAGE), (BIG + 3 * PAGE, BIG + 4 * PAGE), (BIG + 5 * PAGE - 1, BIG + 5 * PAGE)]),
+        ));
+        batch.add(&copies[1], 0, PAGE);
+        batch.add(&copies[2], PAGE, PAGE);
+        let jobs = batch.jobs();
+        assert_eq!(jobs.len(), 3, "one job a copy, whatever its runs");
+        assert_eq!(jobs[0].1 .0.len(), 3, "the first copy's three runs, in one job");
+        assert_eq!(jobs[1].1 .0, vec![(0, PAGE)]);
+        assert_eq!(jobs[2].1 .0, vec![(PAGE, 2 * PAGE)]);
+        assert!(batch.refreshes.is_empty());
+        // And the same grouping from spans (the front path): a copy's runs
+        // behind one another, in the order of their first touch.
+        let spans = vec![
+            (copies[0].clone(), 0, PAGE),
+            (copies[1].clone(), 0, PAGE),
+            (copies[0].clone(), BIG, BIG + PAGE),
+            (copies[2].clone(), 0, PAGE),
+        ];
+        let jobs = Batch::by_copy(spans);
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].1 .0, vec![(0, PAGE), (BIG, BIG + PAGE)]);
+        assert_eq!(jobs[1].1 .0, vec![(0, PAGE)]);
+        assert_eq!(jobs[2].1 .0, vec![(0, PAGE)]);
+    }
+
+    /// A copy refreshed as two runs — the first a megabyte, which
+    /// `take_parts` takes on the kept threads while the copy's page notes are
+    /// held — is **one job** of a flush, so the thread that runs it never comes
+    /// back to those notes: the flush must come back.
+    ///
+    /// Run27 froze here: a job a run meant that `wide`'s own drain (which runs
+    /// whatever is in front of the queue) picked up the second run of the copy
+    /// whose notes that same thread held, and waited for itself for ever
+    /// (`runs-hang.md`). Under the old shape this test never returns, so it is
+    /// given a thread of its own and a deadline: a regression fails here
+    /// instead of hanging the suite.
+    #[test]
+    fn the_runs_of_one_copy_are_one_job_of_the_flush() {
+        const BIG: usize = 1 << 20;
+        let (send, wait) = std::sync::mpsc::channel::<()>();
+        let flushed = std::thread::Builder::new()
+            .name("test: a flush of a copy\'s runs".into())
+            .spawn(move || {
+                // (Four copies, so the flush spreads over the kept threads;
+                // the first of them has two runs, the first a megabyte.)
+                let mut copies = Vec::new();
+                for n in 0..4 {
+                    let len = if n == 0 { BIG + 5 * PAGE } else { PAGE };
+                    let region = title(len, true);
+                    let data = memory(len);
+                    copies.push((Shadow::unbacked(region as u64, data, len as u64, false), len));
+                }
+                let two = vec![(0, BIG), (BIG + 3 * PAGE, BIG + 4 * PAGE)];
+                for round in 0..8 {
+                    let mut batch = Batch::default();
+                    if round == 0 {
+                        // (As a flush of the two runs of the first copy:
+                        // what `Batch::add` does with `VICTORY_REFRESH_RUNS=1`.)
+                        batch.refreshes.push((copies[0].0.clone(), super::Runs(two.clone())));
+                    } else {
+                        batch.add(&copies[0].0, two[0].0, two[0].1 - two[0].0);
+                        batch.add(&copies[0].0, two[1].0, two[1].1 - two[1].0);
+                    }
+                    for (shadow, len) in &copies[1..] {
+                        batch.add(shadow, 0, *len);
+                    }
+                    batch.flush();
+                }
+                let _ = send.send(());
+            })
+            .expect("a test thread");
+        wait.recv_timeout(std::time::Duration::from_secs(240))
+            .expect("the flush of a copy's two runs did not come back: its own page notes were re-entered (one job a copy, runs-hang.md)");
+        flushed.join().expect("the flush's thread");
     }
 
     /// Whatever is written where, by the title or by us, and whichever
