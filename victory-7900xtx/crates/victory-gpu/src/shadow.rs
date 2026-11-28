@@ -43,11 +43,10 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
-    /// Two ranges of title memory taken whole, the last one and the longest,
-    /// and the asking after which each was ([`Shadow::copy_stale`]). A page
-    /// a range holds in part cannot say so in `copied`. Locked inside
-    /// `copied`'s lock.
-    ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Ranges of title memory a copy took whole and the asking after which it
+    /// did ([`Ranged`]): the last few and the longest. A page a range holds
+    /// in part cannot say so in `copied`. Locked inside `copied`'s lock.
+    ranged: Mutex<Ranged>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -133,6 +132,50 @@ struct Card {
     touched: std::sync::atomic::AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+/// What a copy took whole of title memory, and after which asking
+/// ([`Shadow::copy_stale`]): the last few ranges and the longest.
+///
+/// A refresh of a copy is one of a few envelopes, again and again (the heap's
+/// buffer views are 26 refreshes of the same 182 MB a frame); a page only
+/// part of which a range holds cannot say so in `copied`, which is what a
+/// range here answers. The last few are kept because the envelopes of a
+/// frame alternate (its lists' views and the heap's), and the longest because
+/// it covers the most of whatever comes next.
+#[derive(Default)]
+struct Ranged {
+    /// The last [`Ranged::KEPT`] taken, newest at `next`'s predecessor.
+    at: [(usize, usize, u64); Ranged::KEPT],
+    next: usize,
+    /// The longest of all taken (0, 0, 0: none).
+    longest: (usize, usize, u64),
+}
+
+impl Ranged {
+    const KEPT: usize = 4;
+
+    fn add(&mut self, from: usize, to: usize, now: u64) {
+        self.at[self.next] = (from, to, now);
+        self.next = (self.next + 1) % Self::KEPT;
+        if to - from >= self.longest.1.saturating_sub(self.longest.0) {
+            self.longest = (from, to, now);
+        }
+    }
+
+    /// The latest asking after which a range holding `[from, to)` was taken
+    /// whole (0: none is known).
+    fn holding(&self, from: usize, to: usize) -> u64 {
+        // (The newest first: the span asked about is usually the last taken.)
+        self.at
+            .iter()
+            .rev()
+            .chain(std::iter::once(&self.longest))
+            .filter(|r| r.0 < r.1 && r.0 <= from && to <= r.1)
+            .map(|r| r.2)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -4390,6 +4433,13 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // Provably untouched since the copy last took the span whole: nothing
+        // to copy, and nothing to walk (`VICTORY_REFRESH_EPOCH=1`). The gaps
+        // around shaders' writes would copy nothing either, so the busy
+        // ranges below need not be looked for.
+        if matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) && self.epoch_clean(from, to) {
+            return 0;
+        }
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4447,10 +4497,7 @@ impl Shadow {
         if !later.ranged.is_empty() {
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
             for (from, to, now) in later.ranged {
-                ranged[0] = (from, to, now);
-                if to - from >= ranged[1].1 - ranged[1].0 {
-                    ranged[1] = (from, to, now);
-                }
+                ranged.add(from, to, now);
             }
         }
         for (from, to) in later.checks {
@@ -4477,6 +4524,12 @@ impl Shadow {
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
+        // First, the journal's summaries (`VICTORY_REFRESH_EPOCH=1`): nothing
+        // noted written in the span since the copy last took it whole, and
+        // every block of it published, is clean without walking a page.
+        if self.epoch_clean(from, to) {
+            return true;
+        }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
         #[cfg(feature = "diagnostics")]
@@ -4488,11 +4541,41 @@ impl Shadow {
         same
     }
 
+    /// Whether `[from, to)` of the copy is provably untouched by the
+    /// journal's region and block summaries, which answer without walking it
+    /// (`crate::watch::untouched_since`, `VICTORY_REFRESH_EPOCH=1`).
+    ///
+    /// `since` is the asking after which a range holding the span was last
+    /// taken whole ([`Shadow::ranged`], O(1)): it is only a lower bound of
+    /// what the copy holds, so the answer is never cleaner than the walk's.
+    /// With the verifier on (`VICTORY_EPOCH_VERIFY=1`) one span in
+    /// `VICTORY_EPOCH_VERIFY_RATE` is walked as well and the two compared.
+    fn epoch_clean(&self, from: usize, to: usize) -> bool {
+        if !crate::watch::summarised() {
+            return false;
+        }
+        let since = self.ranged(from, to);
+        if since == 0 {
+            return false;
+        }
+        let clean = crate::watch::untouched_since(from, to, since);
+        if crate::watch::epoch_sample(from, to) {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let walk = crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied, since);
+            drop(copied);
+            crate::watch::epoch_compare(from, to, since, clean, walk, self.id);
+        }
+        if clean && crate::watch::epoch() {
+            crate::watch::epoch_answered((to - from) as u64);
+            return true;
+        }
+        false
+    }
+
     /// The latest asking after which a range that holds `[from, to)` was
     /// taken whole (0: none is known). The caller holds `copied`'s lock.
     fn ranged(&self, from: usize, to: usize) -> u64 {
-        let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-        ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
+        self.ranged.lock().unwrap_or_else(|e| e.into_inner()).holding(from, to)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -4660,10 +4743,7 @@ impl Shadow {
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-            ranged[0] = (from, to, now);
-            if to - from >= ranged[1].1 - ranged[1].0 {
-                ranged[1] = (from, to, now);
-            }
+            ranged.add(from, to, now);
         }
         bytes
     }
