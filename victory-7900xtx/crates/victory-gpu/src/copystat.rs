@@ -4,6 +4,10 @@
 //! mapped-page guard, `none` skips the copies (both for timing only). Set
 //! `VICTORY_MEMORY_CATEGORIES=1` for one extra periodic line that gathers the
 //! memory categories already counted here into one approximation.
+//!
+//! `VICTORY_COPYSTAT_TOP` (40 unless given) is how many of the heaviest
+//! ranges, and of the 64 MiB regions, the log names: ten left 77 % of a
+//! frame's 21 GB of refreshes in a tail no line identified (run 24).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -349,6 +353,58 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     e.0 += 1;
     e.1 += len as u64;
     e.2 += us;
+}
+
+/// How many of the heaviest ranges and regions the log names
+/// (`VICTORY_COPYSTAT_TOP`, 40 unless given).
+///
+/// Ten left 77 % of a frame's refreshed volume in a tail no line named: the
+/// heap's 174 MB is one key of 646 inside its own address range (run 24).
+fn top() -> usize {
+    static TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TOP.get_or_init(|| {
+        std::env::var("VICTORY_COPYSTAT_TOP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(40)
+    })
+}
+
+/// A refresh of `[from, from + len)` walked `len` bytes, copied `changed` of
+/// them, and took `us`: per 64 MiB region of address space it lies in.
+///
+/// The per-range table names the ranges; a range is one bound view, and a
+/// copy refreshed in several places has several. The regions say where the
+/// volume is when it is spread over thousands of ranges too small to name —
+/// the tail the ten named ranges left.
+type Regions = HashMap<usize, (u64, u64, u64, u64)>;
+static BY_REGION: Mutex<Option<Regions>> = Mutex::new(None);
+
+/// The bytes of `[from, from + len)` a refresh walked, `changed` of them
+/// copied, in `us` (fed where a refresh walks a span, `Batch::update`).
+pub(crate) fn region(from: usize, len: usize, changed: usize, us: u64) {
+    const SHIFT: u32 = 26;
+    const SIZE: usize = 1 << SHIFT;
+    let end = from.saturating_add(len);
+    if from >= end {
+        return;
+    }
+    let mut map = BY_REGION.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    // (The bytes are cut at the regions' ends; the count, what was copied and
+    // the time count once, in the region the span starts in.)
+    let mut at = from;
+    while at < end {
+        let to = (at / SIZE + 1).saturating_mul(SIZE).min(end);
+        let e = map.entry(at >> SHIFT).or_insert((0, 0, 0, 0));
+        e.1 += (to - at) as u64;
+        at = to;
+    }
+    let e = map.entry(from >> SHIFT).or_insert((0, 0, 0, 0));
+    e.0 += 1;
+    e.2 += changed as u64;
+    e.3 += us;
 }
 
 /// Our own allocations alive now, by size of block (under 4 KiB, to 64 KiB,
@@ -819,6 +875,7 @@ fn log_memory() {
     let stagings = crate::texture::let_go();
     let census = crate::resource::census();
     let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
+    let epochs = crate::watch::epoch_memory();
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
@@ -918,7 +975,8 @@ fn log_memory() {
          outside buffers {:.0} MB; snapshot buffers kept: {} reserving {:.0} MB; staging of \
          textures: {} alive {:.0} MB, {} kept by their texture; host textures: {} alive {:.0} MB, \
          {} placed in title memory; made so far: {} upload buffers {:.0} MB, {} shared buffers \
-         {:.0} MB, {} card buffers {:.0} MB",
+         {:.0} MB, {} card buffers {:.0} MB; the refreshes' epoch summaries: {:.0} KB of 64 MiB \
+         regions and {:.0} KB of 64 KiB blocks (reaching {:#x} and {:#x})",
         mb(private),
         mb(working),
         mb(free),
@@ -941,6 +999,10 @@ fn log_memory() {
         mb(made[3]),
         made[4],
         mb(made[5]),
+        epochs[0] as f64 / 1024.0,
+        epochs[1] as f64 / 1024.0,
+        epochs[2],
+        epochs[3],
     );
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
@@ -1569,13 +1631,22 @@ pub(crate) fn log(frames: f64) {
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
+    let named = top();
+    let all: u64 = ranges.iter().map(|(_, (_, bytes, _, _))| *bytes).sum();
+    tracing::info!(
+        "  refreshes of copies and copies of copies, the {named} heaviest of {} ranges \
+         (VICTORY_COPYSTAT_TOP): {:.1} MB/frame in all, {:.1} MB/frame in the rest",
+        ranges.len(),
+        all as f64 / 1e6 / frames,
+        (all - ranges.iter().take(named).map(|(_, (_, bytes, _, _))| *bytes).sum::<u64>()) as f64 / 1e6 / frames
+    );
     // The kind of memory of each range, asked once per address: a question
     // walks the page tables to the end of the pages alike, up to 10 ms in
     // the title's heaps, and holds the memory map meanwhile (run lane2-0:
     // 10 ms on the submitting thread, when this ran there). A line may name
     // the kind an address had when first seen.
     static KINDS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(named) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         let known = KINDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&src).copied();
         let kind = known.unwrap_or_else(|| {
@@ -1591,6 +1662,42 @@ pub(crate) fn log(frames: f64) {
             n as f64 / frames,
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
+        );
+    }
+    // Where the refreshed volume is, 64 MiB at a time: the ranges above name
+    // what is large, and the thousands of small ones add up to the tail this
+    // says the address of.
+    let regions = BY_REGION.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut regions: Vec<_> = regions.into_iter().flatten().collect();
+    regions.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
+    let walked: u64 = regions.iter().map(|(_, (_, bytes, _, _))| *bytes).sum();
+    let copied: u64 = regions.iter().map(|(_, (_, _, changed, _))| *changed).sum();
+    tracing::info!(
+        "  refreshed by 64 MiB region per frame, the {} heaviest of {} regions: {:.1} MB walked, \
+         {:.1} MB of them copied, in all",
+        named.min(regions.len()),
+        regions.len(),
+        walked as f64 / 1e6 / frames,
+        copied as f64 / 1e6 / frames
+    );
+    for (region, (n, bytes, changed, us)) in regions.into_iter().take(named) {
+        tracing::info!(
+            "  region {:#x}: {:.1}x/frame, {:.2} MB walked, {:.3} MB copied, {:.2} ms/frame",
+            region << 26,
+            n as f64 / frames,
+            bytes as f64 / 1e6 / frames,
+            changed as f64 / 1e6 / frames,
+            us as f64 / 1e3 / frames
+        );
+    }
+    // The refreshes answered from the journal's region summaries, and the
+    // verifier's disagreements (VICTORY_REFRESH_EPOCH, VICTORY_EPOCH_VERIFY).
+    if crate::watch::epoch() || crate::watch::verifying() {
+        tracing::info!(
+            "  refresh epochs per frame (VICTORY_REFRESH_EPOCH={}, verified {}): {}",
+            u8::from(crate::watch::epoch()),
+            u8::from(crate::watch::verifying()),
+            crate::watch::epoch_line(frames)
         );
     }
 }

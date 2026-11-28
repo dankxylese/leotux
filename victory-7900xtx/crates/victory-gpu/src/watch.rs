@@ -52,6 +52,24 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// The unit of the journal's coarsest summary, the 64 MiB region of address
+/// space ("page >> 14" of a kernel page, here `at >> 26`): 1024 of the
+/// journal's pages ([`PAGE`]). A refresh asks whether any write was noted in
+/// the regions of its span before walking a page of it
+/// ([`untouched_since`]).
+const REGION: usize = 64 << 20;
+
+/// The regions and 64 KiB blocks whose last write the journal summarises:
+/// 8 MB of each (64 TiB and 64 GiB of address space), grown in steps as
+/// writes come (R6: 8 bytes a region and a block, far under the windows
+/// alive). A write beyond them is not summarised, and a span that reaches
+/// there is never answered from the summary.
+const REGIONS_MAX: usize = 1 << 20;
+const BLOCKS_MAX: usize = 1 << 20;
+/// How many entries are made at a time: a note at one far address makes
+/// this much and no more.
+const SUMMARY_STEP: usize = 1 << 12;
+
 /// The parts of a page.
 const PARTS: usize = PAGE / KERNEL_PAGE;
 /// All of them.
@@ -73,6 +91,9 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        if summarised() {
+            self.summarise(page, now);
+        }
         let before = self.written.insert(page, now).unwrap_or(0);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
@@ -87,6 +108,44 @@ impl Journal {
         before
     }
 
+    /// Raises the summary of the block and of the region `page` lies in to
+    /// `now`, under the lock the note is made under (R2). Never lowered (a
+    /// note is made under the journal's write lock, and asks are numbered one
+    /// after the other), and made by [`Journal::note`] only while a summary is
+    /// read ([`summarised`]).
+    fn summarise(&mut self, page: usize, now: u64) {
+        raise(&mut self.region_last, page / (REGION / PAGE), REGIONS_MAX, now);
+        raise(&mut self.block_last, page, BLOCKS_MAX, now);
+    }
+
+    /// Whether nothing of `[start, end)` was noted written after the asking
+    /// `since`: every 64 MiB region of it, and every 64 KiB block of it, was
+    /// last written at or before `since` (see [`untouched_since`]).
+    fn untouched(&self, start: usize, end: usize, since: u64) -> bool {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        let (from, to) = (first / (REGION / PAGE), last.div_ceil(REGION / PAGE));
+        // The regions first: most spans are a few of them, and most of those
+        // have had nothing written since the copy took them.
+        let Some(regions) = self.region_last.get(from..to) else {
+            return false;
+        };
+        if regions.iter().all(|&at| at <= since) {
+            return true;
+        }
+        // Another part of one of its regions was: its own blocks say.
+        self.block_last.get(first..last).is_some_and(|blocks| blocks.iter().all(|&at| at <= since))
+    }
+
+    /// The first page of `[start, end)` the journal has written after asking
+    /// `since`, and that asking (for the verifier's line, on a
+    /// disagreement).
+    fn first_write_after(&self, start: usize, end: usize, since: u64) -> Option<(usize, u64)> {
+        self.written
+            .range(start / PAGE..end.div_ceil(PAGE))
+            .find(|&(_, &at)| at > since)
+            .map(|(&page, &at)| (page, at))
+    }
+
     /// The parts of `page` written by an asking after `taken`.
     fn parts_since(&self, page: usize, taken: u64) -> u16 {
         match self.parts.get(&page) {
@@ -94,6 +153,20 @@ impl Journal {
             None => WHOLE,
         }
     }
+}
+
+/// Grows a summary to hold `at` and raises it to `now`: in steps of
+/// [`SUMMARY_STEP`], to `max` at most ([`REGIONS_MAX`], [`BLOCKS_MAX`]). An
+/// entry beyond `max` is not made, and a span that reaches it is never
+/// answered from the summary ([`Journal::untouched`]).
+fn raise(summary: &mut Vec<u64>, at: usize, max: usize, now: u64) {
+    if at >= max {
+        return;
+    }
+    if at >= summary.len() {
+        summary.resize((at + SUMMARY_STEP).min(max), 0);
+    }
+    summary[at] = summary[at].max(now);
 }
 
 /// Of the pages of a copy that were written after it took them (page number,
@@ -149,6 +222,14 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// The 64 MiB regions of address space, each with the asking that last
+    /// noted a write in it ([`Journal::summarise`]): a refresh asks the few
+    /// of them its span lies in instead of walking its pages
+    /// ([`untouched_since`]). Grown as writes come, to [`REGIONS_MAX`].
+    region_last: Vec<u64>,
+    /// The same for each 64 KiB block: what says a span is untouched when
+    /// another block of its region was.
+    block_last: Vec<u64>,
 }
 
 /// Read by many threads at once (a submission's refreshes run on several),
@@ -163,6 +244,8 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    region_last: Vec::new(),
+    block_last: Vec::new(),
 });
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
@@ -1939,6 +2022,166 @@ fn published(start: usize, end: usize) -> bool {
     // then clears the other, which an asking that is publishing the block may
     // just be setting.)
     light() && PUBLISHED.all(first, last) && !BESIDE.any(first, last)
+}
+
+/// Whether a refresh may answer "nothing new" for a span from the journal's
+/// summaries alone (`VICTORY_REFRESH_EPOCH=1`; off by default): the 64 MiB
+/// regions a span lies in, and its 64 KiB blocks, each with the asking that
+/// last noted a write in them ([`Journal::summarise`]).
+///
+/// Off, every refresh walks its range's pages ([`nothing_new`]); a frame
+/// walked 21 GB to find some 90 MB written, 87 % of its entries already
+/// known to copy nothing, and the heap's 26 identical refreshes a frame
+/// each walked 182 MB. On, one of them walks and the rest ask three regions.
+pub(crate) fn epoch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_EPOCH"))
+}
+
+/// Whether the summaries are kept and read at all ([`epoch`], and the
+/// verifier below, which is worth nothing without them).
+pub(crate) fn summarised() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| epoch() || verifying())
+}
+
+/// Whether one span in [`verify_rate`] is answered both from the summary and
+/// by the full walk, and the two compared (`VICTORY_EPOCH_VERIFY=1`; off by
+/// default).
+///
+/// A disagreement where the summary said "clean" and the walk did not is a
+/// write that changed title memory with nothing telling the journal: a copy
+/// left stale on the card, and the one failure of [`untouched_since`] that
+/// cannot be seen otherwise (R1). It must be 0 before the summary is
+/// defaulted on.
+pub(crate) fn verifying() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_EPOCH_VERIFY"))
+}
+
+/// One span in this many is verified (`VICTORY_EPOCH_VERIFY_RATE`, 256
+/// unless given): of a frame's 6,553 refresh entries some 25 are walked
+/// twice.
+fn verify_rate() -> usize {
+    static RATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        std::env::var("VICTORY_EPOCH_VERIFY_RATE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(256)
+    })
+}
+
+/// Since the last line: spans the summary answered clean, their bytes,
+/// verifications made, the bytes they walked, disagreements this line and
+/// since the start (the summary said clean, the walk did not), and the
+/// misses (the walk said clean, the summary did not: no harm, no win).
+static EPOCH: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// [`untouched_since`]'s answer for `[start, end)` at asking `since`: whether
+/// nothing of it was written since the copy took it.
+///
+/// The summary alone never answers: every block of the span must be
+/// published ([`PUBLISHED`]: read-only by our hand, not written since, so a
+/// write would have faulted and been noted), and no region or block of it may
+/// have had a write noted after `since`. So a write the kernel or the title
+/// made is either a note (the summaries see it) or a fault (the block stops
+/// being published): what is left is clean (R1). `false` if either summary
+/// does not reach the span, which it never does while the summaries are not
+/// kept ([`summarised`]).
+pub(crate) fn untouched_since(start: usize, end: usize, since: u64) -> bool {
+    if since == 0 || start >= end {
+        return false;
+    }
+    if !published(start, end) {
+        return false;
+    }
+    journal().untouched(start, end, since)
+}
+
+/// A span was answered from the summary: counted for the epoch line.
+pub(crate) fn epoch_answered(bytes: u64) {
+    EPOCH[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    EPOCH[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this span is one of the sampled ones ([`verify_rate`]): a hash of
+/// its address and length, so the sample is spread over the frame's spans
+/// and the same span is not always taken.
+pub(crate) fn epoch_sample(start: usize, end: usize) -> bool {
+    if !verifying() {
+        return false;
+    }
+    let n = start.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (end.rotate_left(17)).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    (n >> 24) as usize % verify_rate() == 0
+}
+
+/// The span `[start, end)` of copy `id` was answered `clean` by the summary
+/// and `walk` by the full [`nothing_new`]: compared, counted, and said
+/// loudly if the summary answered clean and the walk did not.
+pub(crate) fn epoch_compare(start: usize, end: usize, since: u64, clean: bool, walk: bool, id: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    EPOCH[2].fetch_add(1, Relaxed);
+    EPOCH[3].fetch_add((end - start) as u64, Relaxed);
+    if clean && !walk {
+        EPOCH[4].fetch_add(1, Relaxed);
+        let all = EPOCH[6].fetch_add(1, Relaxed) + 1;
+        // Loudly: every one of the first 64, then one in a power of two.
+        if all <= 64 || all.is_power_of_two() {
+            let (page, at) = journal()
+                .first_write_after(start, end, since)
+                .unwrap_or((0, 0));
+            tracing::error!(
+                id,
+                span = format_args!("{start:#x}..{end:#x}"),
+                since,
+                page = format_args!("{:#x}", page * PAGE),
+                written_at = at,
+                "a refresh's region summary said nothing was written since the copy took it, and walking its pages found a write: a write of the title's with nothing in the journal (VICTORY_EPOCH_VERIFY=1)"
+            );
+        }
+    } else if walk && !clean {
+        EPOCH[5].fetch_add(1, Relaxed);
+        EPOCH[7].fetch_add(1, Relaxed);
+    }
+}
+
+/// [`EPOCH`], taken, for the log, per frame: what the summaries answered,
+/// what was verified, and the disagreements (this line, and since the
+/// start).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn epoch_line(frames: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let of = |i: usize| EPOCH[i].swap(0, Relaxed) as f64 / frames;
+    let since = [6, 7].map(|i| EPOCH[i].load(Relaxed));
+    format!(
+        "{:.0} spans answered clean by the summaries ({:.1} MB), {:.1} verify walks over {:.1} MB; \
+         disagreements {:.1} a frame, {} since the start (the summary said clean, the walk did not); \
+         misses {:.1} a frame, {} since the start (the walk said clean, the summary did not)",
+        of(0),
+        of(1) / 1e6,
+        of(2),
+        of(3) / 1e6,
+        of(4),
+        since[0],
+        of(5),
+        since[1]
+    )
+}
+
+/// What the journal's summaries hold now, for the memory line (R6): the
+/// bytes of the regions' and of the blocks' summaries, and the address
+/// space each reaches.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn epoch_memory() -> [u64; 4] {
+    let j = journal();
+    [
+        (j.region_last.len() * 8) as u64,
+        (j.block_last.len() * 8) as u64,
+        (j.region_last.len() as u64) * REGION as u64,
+        (j.block_last.len() as u64) * PAGE as u64,
+    ]
 }
 
 /// Since the last frame line: what asking about title memory was. Kernel
@@ -4681,6 +4924,8 @@ mod parts_tests {
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
+            region_last: Vec::new(),
+            block_last: Vec::new(),
         };
         assert_eq!(j.parts_since(7, 0), WHOLE);
         assert_eq!(j.note(7, WHOLE, 3), 0);
@@ -6675,5 +6920,128 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::*;
+
+    /// A journal of our own: the askings' notes and their summaries, without
+    /// the one the process shares.
+    fn journal() -> Journal {
+        Journal {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+            region_last: Vec::new(),
+            block_last: Vec::new(),
+        }
+    }
+
+    /// A page number of a title address of ours (the journal's are of `PAGE`).
+    const AT: usize = 0x6f2e_0000;
+
+    #[test]
+    fn a_span_is_untouched_until_a_write_in_it_is_noted() {
+        let mut j = journal();
+        let (first, next) = (AT / PAGE, AT / PAGE + 1);
+        // Taken whole at asking 7.
+        j.summarise(first, 7);
+        assert!(j.untouched(AT, AT + PAGE, 7));
+        assert!(!j.untouched(AT, AT + PAGE, 6), "a write after the copy took it");
+        assert!(!j.untouched(AT, AT + PAGE, 0), "nothing is known before one was taken");
+        // A write in the block after, at asking 8: the span that holds it is
+        // not untouched, and the block before it is.
+        j.summarise(next, 8);
+        assert!(j.untouched(AT, AT + PAGE, 7));
+        assert!(!j.untouched(AT, AT + 2 * PAGE, 7));
+        assert!(!j.untouched(AT + PAGE, AT + 2 * PAGE, 7));
+        // Noted again by a later asking: the write of before is not newer.
+        j.summarise(next, 9);
+        assert!(!j.untouched(AT + PAGE, AT + 2 * PAGE, 8));
+        assert!(j.untouched(AT + PAGE, AT + 2 * PAGE, 9));
+    }
+
+    #[test]
+    fn a_write_elsewhere_in_the_region_is_told_apart_by_the_blocks() {
+        let mut j = journal();
+        let first = AT / PAGE;
+        j.summarise(first, 7);
+        // Another heap's block, 100 blocks (6.5 MB) on: the same 64 MiB
+        // region, no part of our span.
+        j.summarise(first + 100, 9);
+        assert_eq!(j.region_last[first / (REGION / PAGE)], 9);
+        // The region says something was written, the span's blocks say not
+        // in it.
+        assert!(j.untouched(AT, AT + PAGE, 7));
+        assert!(j.untouched(AT, AT + 2 * PAGE, 7));
+        // A span that reaches the block that was written is not.
+        assert!(!j.untouched(AT, AT + 101 * PAGE, 7));
+    }
+
+    #[test]
+    fn a_span_outside_the_summaries_is_never_answered() {
+        let mut j = journal();
+        j.summarise(AT / PAGE, 7);
+        // Never grown to the address: nothing is known of the regions there.
+        assert!(!j.untouched(0x7fff_0000_0000, 0x7fff_0000_0000 + PAGE, 7));
+        assert!(!j.untouched(0x7fff_f000_0000, 0x7fff_f000_0000 + PAGE, 7));
+        // A span that runs past the blocks the summary holds is not answered
+        // from them, whatever its region says.
+        let mut capped = journal();
+        capped.summarise(3, 9);
+        assert!(capped.untouched(0, PAGE, 7), "block 0 was never written");
+        assert!(!capped.untouched(0, (SUMMARY_STEP as usize + 16) * PAGE, 7));
+        // (Beyond its cap an entry is not made at all.)
+        let mut blocks = Vec::new();
+        raise(&mut blocks, BLOCKS_MAX, BLOCKS_MAX, 9);
+        assert!(blocks.is_empty());
+        raise(&mut blocks, 5, BLOCKS_MAX, 9);
+        assert_eq!(blocks.len(), 5 + SUMMARY_STEP);
+        assert_eq!(blocks[5], 9);
+    }
+
+    #[test]
+    fn the_summaries_are_raised_never_lowered_and_grown_in_steps() {
+        let mut j = journal();
+        j.summarise(1000, 9);
+        j.summarise(1000, 5);
+        assert_eq!(j.block_last[1000], 9);
+        assert_eq!(j.region_last[1000 / (REGION / PAGE)], 9);
+        // A note far on grows the summaries by a step, not to the address.
+        assert_eq!(j.block_last.len(), 1000 + SUMMARY_STEP);
+        j.summarise(1000 + 3 * SUMMARY_STEP, 4);
+        assert!(j.block_last.len() > 1000 + 3 * SUMMARY_STEP - SUMMARY_STEP);
+        assert!(j.block_last.len() <= 1000 + 4 * SUMMARY_STEP);
+        assert_eq!(j.block_last[1000 + 3 * SUMMARY_STEP], 4);
+    }
+
+    #[test]
+    fn the_summary_never_answers_for_a_span_whose_blocks_are_not_published() {
+        // Title memory nobody has guarded: not view memory, so no block of it
+        // is published, and the summary is never asked.
+        let buf = vec![0u8; 2 * PAGE];
+        let at = buf.as_ptr() as usize;
+        assert!(!published(at, at + PAGE));
+        assert!(!untouched_since(at, at + PAGE, 1));
+    }
+
+    #[test]
+    fn a_disagreement_is_counted_where_the_summary_said_clean() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = [EPOCH[2].load(Relaxed), EPOCH[6].load(Relaxed), EPOCH[7].load(Relaxed)];
+        // (Both said clean: no disagreement.)
+        epoch_compare(AT, AT + PAGE, 7, true, true, 1);
+        assert_eq!([EPOCH[2].load(Relaxed) - before[0], EPOCH[6].load(Relaxed) - before[1]], [1, 0]);
+        // (The summary said clean, the walk did not: the one that matters.)
+        epoch_compare(AT, AT + PAGE, 7, true, false, 2);
+        assert_eq!([EPOCH[2].load(Relaxed) - before[0], EPOCH[6].load(Relaxed) - before[1]], [2, 1]);
+        // (The walk said clean, the summary did not: no harm, no win.)
+        epoch_compare(AT, AT + PAGE, 7, false, true, 3);
+        assert_eq!(EPOCH[7].load(Relaxed) - before[2], 1);
+        assert_eq!(EPOCH[6].load(Relaxed) - before[1], 1);
     }
 }
