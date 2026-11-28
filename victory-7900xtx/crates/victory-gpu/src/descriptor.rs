@@ -1094,9 +1094,12 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// The shapes of views of placed memory, and where each is.
+    /// The shapes of views of placed memory, and where each is by its
+    /// hash ([`shape_key`]): keyed by the shape itself the index held a
+    /// second copy of each, 2.4 million of them (some 900 MB with the list)
+    /// 18 minutes into the world.
     shapes: Vec<Shape>,
-    shape_index: std::collections::BTreeMap<Shape, u32>,
+    shape_index: std::collections::BTreeMap<u64, u32>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
@@ -1196,6 +1199,11 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, 
     )
 }
 
+fn shape_key(shape: &Shape) -> u64 {
+    use std::hash::BuildHasher;
+    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(shape)
+}
+
 /// The record words that name the view of placed memory at `address` with
 /// shape number `shape`.
 fn placed_words(shape: u32, address: u64) -> [u32; 2] {
@@ -1206,16 +1214,25 @@ impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
-        if let Some(&at) = self.shape_index.get(&shape) {
-            return Some(at);
+        let key = shape_key(&shape);
+        if let Some(&at) = self.shape_index.get(&key) {
+            // of two shapes with one hash the second is a table entry, as
+            // when the shapes are full.
+            return (self.shapes[at as usize] == shape).then_some(at);
         }
         if self.shapes.len() >= SHAPES {
             return None;
         }
         let at = self.shapes.len() as u32;
         self.shapes.push(shape);
-        self.shape_index.insert(shape, at);
+        self.shape_index.insert(key, at);
         Some(at)
+    }
+
+    /// The number of `shape` if it is there already.
+    fn known_shape(&self, shape: &Shape) -> Option<u32> {
+        let &at = self.shape_index.get(&shape_key(shape))?;
+        (self.shapes[at as usize] == *shape).then_some(at)
     }
 
     /// The view of placed memory [`placed_words`] named.
@@ -1274,7 +1291,7 @@ fn words_for(view: View) -> [u32; 2] {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
                     // Nearly every placed view has a shape seen before.
-                    let known = views_read().shape_index.get(&shape).copied();
+                    let known = views_read().known_shape(&shape);
                     let shape = known.or_else(|| views_write().shape(shape));
                     if let Some(shape) = shape {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
@@ -1328,7 +1345,7 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
             + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + views.shape_index.len() as u64 * size_of::<(u64, u32)>() as u64 * 3 / 2,
         constants,
         placed,
         views.shapes.len() as u64,
@@ -1617,6 +1634,74 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Whether a placed view's descriptions lose the words the title may leave
+/// unwritten ([`placed_resource_words`], [`placed_view_words`]). On by
+/// default, as upstream; `VICTORY_SHAPE_PADDING_MASK=0` keeps every word of
+/// both descriptions, as before, so a title that fills the padding with
+/// something that differs per view makes a new shape each time (the leak
+/// this fixes: 34.9 million table entries, 16.7 GB, 20 -> 8-10 fps over a
+/// long session).
+fn shape_padding_mask() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHAPE_PADDING_MASK").is_none_or(|v| v != "0"))
+}
+
+/// Copy only the fields of a placed resource description. Padding can differ
+/// between two views of the same texture and the caller may leave it unwritten.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if !shape_padding_mask() {
+        return words(desc);
+    }
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    let mut fields = [0; 14];
+    // SAFETY: the caller supplies a 56-byte ResourceDesc, possibly unaligned.
+    // Dimension occupies word 0. Alignment through Flags occupy words 2..13.
+    unsafe {
+        fields[0] = src.read_unaligned();
+        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
+    }
+    Some(fields)
+}
+
+/// The words of a placed view's description with those its kind does not
+/// use set to zero. The first ten words are the PC's view description: for a
+/// shader resource view, the format, the dimension, the component mapping,
+/// a word of padding (the union that follows starts on 8 bytes) and the
+/// union's six words; for an unordered access view, the format, the
+/// dimension and the union's eight words. Each dimension uses only the head
+/// of the union, and the title leaves the rest unwritten: run vt-shapes saw
+/// 131,392 values in word 3 and 36,413 in word 9 of a million shapes, each
+/// a new shape for the same view. Words 10 and on (the address and the
+/// console's own fields) are kept; an unknown dimension keeps all.
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    let mut d = words(desc)?;
+    if !shape_padding_mask() {
+        return Some(d);
+    }
+    // Words of the union each dimension uses (D3D12_BUFFER_SRV and the like).
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(d[1] as usize).copied())
+    } else {
+        // D3D12_SRV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D, cube, cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(d[1] as usize).copied())
+    };
+    if let Some(used) = used.filter(|_| d[1] != 0) {
+        if !unordered {
+            d[3] = 0;
+        }
+        d[start + used..10].fill(0);
+    }
+    Some(d)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1626,7 +1711,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1637,7 +1722,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -2035,6 +2120,115 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// Two placed views alike but for the words their kind does not use
+    /// (the padding after the component mapping, the union's unused tail)
+    /// are one record; a used word still tells them apart.
+    #[test]
+    fn placed_views_ignore_unused_view_words() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        let resource = [1, 0, 0, 0, 0x4000, 0, 1, 0x10001, 0, 1, 0, 1, 0, 0];
+        // A structured buffer view: words 4-5 first element, 6 count, 7
+        // stride, 8 flags; 3 and 9 are not used.
+        let srv = [0, 1, 0x1688, 0, 16, 0, 64, 16, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        // An unordered buffer view: words 2-3 first element, 4 count, 5
+        // stride, 6-7 counter offset, 8 flags; 9 is not used.
+        let uav = [0, 1, 16, 0, 64, 16, 0, 0, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        for (unordered, create, desc, unused, used) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _), srv, [3usize, 9], 6usize),
+            (true, create_placed_uav, uav, [9, 9], 4),
+        ] {
+            create(null, &resource, &desc, handle);
+            let first = slot;
+            assert_eq!(view(handle), Some(View::Placed(unordered, resource, desc)));
+            let mut noisy = desc;
+            for w in unused {
+                noisy[w] = 0xdead_beef;
+            }
+            create(null, &resource, &noisy, handle);
+            assert_eq!(slot, first, "unused words left out");
+            let mut other = desc;
+            other[used] += 1;
+            create(null, &resource, &other, handle);
+            assert_ne!(slot, first, "a used word counts");
+        }
+        // A 2D texture view uses four words of the union (4-7): 8 and 9 go.
+        let mut tex = [28, 4, 0x1688, 0x77, 0, 1, 0, 0, 0x55, 0x66, 0x2000, 0x6, 0, 0, 0, 0];
+        create_placed_srv(null, &resource, &tex, handle);
+        tex[3] = 0;
+        (tex[8], tex[9]) = (0, 0);
+        assert_eq!(view(handle), Some(View::Placed(false, resource, tex)));
+    }
+
+    /// Two placed views alike but for the words the title leaves unwritten
+    /// (the resource description's padding, the view's unused tail) are one
+    /// shape, and one number in the shape index keyed by the shape's hash;
+    /// a used word still makes another shape.
+    #[test]
+    fn placed_views_alike_but_for_padding_are_one_shape() {
+        let resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
+        // A 2D texture view: words 4-7 of the union are used, so 8 and 9 go.
+        let desc = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        let shape = |resource: &[u32; 14], desc: &[u32; 16]| {
+            let resource = placed_resource_words(resource).unwrap();
+            let desc = placed_view_words(desc, false).unwrap();
+            shape_of(false, &resource, &desc).0
+        };
+        let mut views = Views {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            by_resource: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            shapes: Vec::new(),
+            shape_index: std::collections::BTreeMap::new(),
+        };
+        let at = views.shape(shape(&resource, &desc)).unwrap();
+        // Words 1 and 13 of the resource description, 3 and 9 of the view.
+        let (mut noisy_resource, mut noisy_desc) = (resource, desc);
+        noisy_resource[1] = 0xaaaa_aaaa;
+        noisy_resource[13] = 0xbbbb_bbbb;
+        noisy_desc[3] = 0xcccc_cccc;
+        noisy_desc[9] = 0xdddd_dddd;
+        let noisy = shape(&noisy_resource, &noisy_desc);
+        assert_eq!(shape_key(&shape(&resource, &desc)), shape_key(&noisy));
+        assert_eq!(views.shape(noisy), Some(at), "one shape for one view");
+        assert_eq!(views.known_shape(&noisy), Some(at));
+        // A word the kind uses still tells them apart.
+        let mut other_desc = desc;
+        other_desc[6] = 1;
+        assert_ne!(views.shape(shape(&resource, &other_desc)), Some(at));
+    }
+
+    #[test]
+    fn placed_views_share_resources_across_description_padding() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let view_desc = [0u32; 16];
+        let null = std::ptr::null();
+        let mut resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
+        let expected = resource;
+        for (unordered, create) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _)),
+            (true, create_placed_uav),
+        ] {
+            create(null, &expected, &view_desc, handle);
+            let first = slot;
+            resource[1] = 0xaaaa_aaaa;
+            resource[13] = 0xbbbb_bbbb;
+            create(null, &resource, &view_desc, handle);
+            assert_eq!(slot, first);
+            assert_eq!(
+                view(handle),
+                Some(View::Placed(unordered, expected, view_desc))
+            );
+            let mut other = resource;
+            other[12] = 4;
+            create(null, &other, &view_desc, handle);
+            assert_ne!(slot, first);
+        }
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
@@ -2102,16 +2296,19 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
+        // A resource description and a view no other test uses. A placed view
+        // keeps the fields of a description and not its padding
+        // ([`placed_resource_words`]): the words compared are those kept.
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        let kept = placed_resource_words(&resource).unwrap();
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-            View::Placed(_, r, _) => *r == resource,
+            View::Placed(_, r, _) => *r == kept,
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == kept).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
@@ -2119,18 +2316,18 @@ mod tests {
             let placed = 0xd_4940_0000 + n * 0x1_0000;
             (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
             create_placed_srv(null, &resource, &desc, at);
-            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+            assert_eq!(view(at), Some(View::Placed(false, kept, desc)));
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        assert_eq!(view(at), Some(View::Placed(true, kept, desc)));
         assert_eq!(shapes(), 2);
         // Placed memory past 1 TiB (not title memory) is a table entry.
         (desc[10], desc[11]) = (0, 0x100);
         create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(view(at), Some(View::Placed(false, kept, desc)));
         assert_eq!(entries(), 1);
         // A record's words are the same for the same view (the host knows
         // a slot's view by them), and differ with the address.
