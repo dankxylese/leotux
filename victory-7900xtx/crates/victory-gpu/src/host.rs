@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -244,6 +244,21 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
+/// Whether the wait ([`mapped`]) is taken once a submission instead of once
+/// an allocation (on by default; `VICTORY_MAPPED_BATCH=0`: as before).
+///
+/// The wait in [`mapped`] is a barrier over the work the system still has to
+/// do to map the card's memory asked for so far, and it is needed only
+/// before a list that names that memory runs. Taken one a call it is taken
+/// once every allocation: ~28,600 times in a run, 0.77 ms each, and 3.8 s
+/// of the 5.6 s world-load frame. Taken once a submission, every allocation
+/// of a frame's recording is behind the one barrier taken before that
+/// frame's lists go ([`mapped_barrier`]).
+fn mapped_batch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BATCH").is_none_or(|v| v != "0"))
+}
+
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
     queue: ID3D12CommandQueue,
@@ -257,14 +272,71 @@ struct Aside {
 // thread at a time (the lock).
 unsafe impl Send for Aside {}
 
+/// The one [`Aside`]: the copy that makes new memory mapped is sent on it,
+/// and the fence waited for, under this lock.
+static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
+
+/// The highest value [`ASIDE`]'s fence was signalled with for new memory that
+/// no barrier has been waited for yet (0: none), and the barriers waited for
+/// (times, microseconds, the longest).
+struct Pending {
+    high: AtomicU64,
+    barriers: [AtomicU64; 3],
+}
+
+static PENDING: Pending = Pending { high: AtomicU64::new(0), barriers: [const { AtomicU64::new(0) }; 3] };
+
+impl Pending {
+    /// Memory was sent to [`ASIDE`]'s queue with `value`: the barrier that
+    /// completes its mapping is waited for at the next [`Pending::take`] and
+    /// [`Pending::waited`], not here.
+    fn note(&self, value: u64) {
+        // (The values only grow, one `Aside` and one send under its lock: the
+        // highest covers all of them.)
+        self.high.fetch_max(value, Ordering::Release);
+    }
+
+    /// The value a barrier has to reach for every mapping asked for so far
+    /// (`None`: nothing to wait for).
+    fn take(&self) -> Option<u64> {
+        match self.high.load(Ordering::Acquire) {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
+    /// The fence reached `value`: nothing older than it is pending. One noted
+    /// after the take is later than `value` and stays, for the barrier after
+    /// this one (`None` of `take` sees it).
+    fn waited(&self, value: u64) {
+        let _ = self.high.compare_exchange(value, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
 /// New memory of the card is mapped into its address space when this
 /// returns: a copy of a few bytes is sent to a queue of ours after the
 /// memory was made, which the system starts only when all mappings asked
 /// for so far are done, and waited for. (`MakeResident` came back before
 /// that: run n11 was lost as n08 was with it alone.) Best done off a hot
 /// path: a tenth of a millisecond to some.
+///
+/// With [`mapped_batch`] the copy is sent here and the wait is not: the
+/// fence's value is noted ([`PENDING`]) and the barrier is taken once, at
+/// the next [`mapped_barrier`] — before the list that can name the memory
+/// goes to the card.
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
-    static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
+    mapped_with(device, mapped_batch())
+}
+
+/// [`mapped`] waiting here, as every call did before batching: for memory a
+/// list that is not a submission's may name before the next barrier — blocks
+/// of textures (`crate::pool`) and host textures (`crate::resource`), which
+/// the copy worker of `crate::texture::ahead` names on a queue of its own.
+pub(crate) fn mapped_now(device: &ID3D12Device) -> windows::core::Result<()> {
+    mapped_with(device, false)
+}
+
+fn mapped_with(device: &ID3D12Device, batch: bool) -> windows::core::Result<()> {
     if !wait_resident() {
         return Ok(());
     }
@@ -317,7 +389,11 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
+        if batch {
+            // The copy is on its way (the system starts it at once); what is
+            // waited for is the fence, once, at the next `mapped_barrier`.
+            PENDING.note(a.value);
+        } else if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
             WaitForSingleObject(a.event, INFINITE);
         }
@@ -328,13 +404,105 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
     let n = MAPPED[0].load(Ordering::Relaxed);
     if n == 1 || n.is_multiple_of(200) {
+        // (Batched, the time here is the send alone: the wait is counted
+        // where it happens, by `mapped_barrier`.)
+        let how = if mapped_batch() {
+            "VICTORY_MAPPED_BATCH=1: the send here, the wait at the next submission; VICTORY_WAIT_RESIDENT=0: not"
+        } else {
+            "VICTORY_WAIT_RESIDENT=0: not"
+        };
         tracing::info!(
-            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new card memory waited for until it is mapped ({how}), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
             MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0,
             MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0
         );
     }
     Ok(())
+}
+
+/// Waits for the mapping of every allocation whose copy was sent to
+/// [`ASIDE`]'s queue and not waited for yet: one barrier for all of them,
+/// where [`mapped`] used to take one a call. Called before a list that can
+/// name such memory is given to the card — at a submission's start and at
+/// its send, and before the copies of ours that go straight to the queue.
+///
+/// Nothing of a submission can name an allocation made after the barrier it
+/// took: a list names only memory that existed when it was recorded, and
+/// memory is only handed to a recorder after its copy was sent and noted
+/// here, so every allocation a list of this submission names was noted
+/// before the take. Allocations noted after the take belong to lists
+/// recorded after it, and are behind the next barrier.
+pub(crate) fn mapped_barrier() {
+    if !mapped_batch() || !wait_resident() {
+        return;
+    }
+    let Some(value) = PENDING.take() else { return };
+    let started = std::time::Instant::now();
+    {
+        let aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(a) = aside.as_ref() else { return };
+        // SAFETY: our fence and event. Holding the lock means one waiter at a
+        // time (the event is auto-reset), and `mapped` takes it to send, so
+        // the value noted above was signalled by an `ExecuteCommandLists` that
+        // has already happened.
+        unsafe {
+            if a.fence.GetCompletedValue() < value {
+                if let Err(e) = a.fence.SetEventOnCompletion(value, a.event) {
+                    tracing::warn!(error = %e, "the mapping of new card memory was not waited for");
+                    return;
+                }
+                WaitForSingleObject(a.event, INFINITE);
+            }
+        }
+    }
+    PENDING.waited(value);
+    let us = started.elapsed().as_micros() as u64;
+    let barriers = &PENDING.barriers;
+    barriers[0].fetch_add(1, Ordering::Relaxed);
+    barriers[1].fetch_add(us, Ordering::Relaxed);
+    barriers[2].fetch_max(us, Ordering::Relaxed);
+    let n = barriers[0].load(Ordering::Relaxed);
+    if n == 1 || n.is_multiple_of(200) {
+        tracing::info!(
+            "new card memory's mapping waited for (VICTORY_MAPPED_BATCH=1: once a submission), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            barriers[1].load(Ordering::Relaxed) as f64 / 1000.0,
+            barriers[2].load(Ordering::Relaxed) as f64 / 1000.0
+        );
+    }
+}
+
+/// The pending barriers: one value for every allocation, cleared only by a
+/// wait that reached it, and one noted meanwhile left for the next.
+#[cfg(test)]
+mod pending {
+    #[test]
+    fn notes_batch_into_the_highest_value() {
+        let pending = super::Pending { high: std::sync::atomic::AtomicU64::new(0), barriers: Default::default() };
+        assert_eq!(pending.take(), None, "nothing asked for yet");
+        for value in 1..=5 {
+            pending.note(value);
+        }
+        assert_eq!(pending.take(), Some(5), "one barrier for all five");
+        pending.waited(5);
+        assert_eq!(pending.take(), None, "waited for: nothing is pending");
+    }
+
+    #[test]
+    fn memory_asked_for_while_the_barrier_waits_stays_for_the_next() {
+        let pending = super::Pending { high: std::sync::atomic::AtomicU64::new(0), barriers: Default::default() };
+        pending.note(1);
+        let value = pending.take().expect("one pending");
+        // Another thread asks for memory while this barrier is waited for.
+        pending.note(2);
+        pending.waited(value);
+        assert_eq!(
+            pending.take(),
+            Some(2),
+            "the barrier for 1 says nothing about memory asked for after it"
+        );
+        pending.waited(2);
+        assert_eq!(pending.take(), None);
+    }
 }
 
 /// Times, microseconds and the longest of [`mapped`].
@@ -4740,8 +4908,11 @@ impl Host {
                     if let Some(own) = &own {
                         // With `upq`: the submission's own memory (the PC's)
                         // comes whole into a buffer of ours in the card's on
-                        // the copy queue; the sends come from there.
+                        // the copy queue; the sends come from there. That
+                        // buffer is new card memory, and its list goes on a
+                        // queue of its own: mapped before the copy names it.
                         if looks.is_none() && upq::on() {
+                            mapped_barrier();
                             let (memory, used) = own.source();
                             up = upq::send(self, &self.queue, &[(memory, 0, memory, used)], |_, _, _| {});
                         }
@@ -4752,6 +4923,8 @@ impl Host {
                     // on the copy queue, and this list copies them from
                     // there (the card's memory), after a wait for that.
                     if own.is_none() && looks.is_none() && upq::on() {
+                        // (As above: the bounce buffer is new card memory.)
+                        mapped_barrier();
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
@@ -4837,6 +5010,10 @@ impl Host {
                         }
                     }
                     list.Close()?;
+                    // (The copies in the card's memory this list reads may be
+                    // memory just made: their mapping is waited for here, as
+                    // this list goes on a queue of its own.)
+                    mapped_barrier();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -5274,6 +5451,9 @@ impl Host {
                     }
                     list.Close()?;
                     let one = [Some(list.cast::<ID3D12CommandList>()?)];
+                    // (The copy it fetches from may be memory just made: its
+                    // mapping is waited for here, before this queue names it.)
+                    mapped_barrier();
                     match &copy_queue {
                         // Beside the queue that draws, when the card's copy
                         // queue has the fetch.
@@ -5612,6 +5792,9 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    // (The memory it reads (`work.fetched`, a copy of the
+                    // card's) may be memory just made: mapped before it goes.)
+                    mapped_barrier();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -6095,6 +6278,11 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
+        // New card memory asked for before this submission is mapped before
+        // anything here can name it: the barrier is taken once, here, where
+        // the preparation that follows (and the sweep, and the descriptor
+        // heaps' records) overlaps the driver's work instead of adding to it.
+        mapped_barrier();
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         // Renderer port #7 (from renderer patch #4): the round asked for when
@@ -6440,6 +6628,15 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
+        // Everything the preparation asked the card's memory for (a list's
+        // scratch, the steps for copies in the card's memory, the clamp
+        // batches, the timestamps' readback buffer) is mapped before the
+        // lists that name it go: one barrier here, the last instant before
+        // the sends below, and it covers the one taken at the start of this
+        // submission too. `mapped` sends under `ASIDE`'s lock and this waits
+        // under it, and the submission lock is held across both, so no
+        // allocation is noted between this take and these sends.
+        mapped_barrier();
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
