@@ -2065,6 +2065,12 @@ impl HostHeap {
         self.count
     }
 
+    /// Leave some space for lists that need to finish before the queue can
+    /// submit them. Called between thin recording chunks.
+    pub(crate) fn dynamic_pressure(&self) -> bool {
+        self.free.load(std::sync::atomic::Ordering::Relaxed) < self.dynamic.saturating_mul(5) / 8
+    }
+
     /// Writes the word of the table of element strides for the dynamic slot
     /// `index`, which holds `view` of a table made afresh: shaders ask it
     /// whether a typed view in a table is of an integer format
@@ -2840,6 +2846,14 @@ impl HostHeap {
     /// caller's to make null when it has let go of its own slot's lock
     /// ([`HostHeap::unmake_stale`]).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
+        self.note_buffer_inner(index, view, seen, true)
+    }
+
+    /// [`HostHeap::note_buffer`]; `record_change` false: the slot is not put
+    /// back in [`HostHeap::buffer_changes`] (the heap pass, which mirrored it
+    /// itself). Nor is a slot a draw read through a table lately and
+    /// `seen` now: that draw makes it. (maren-halv/VIctory-Fast `7da8eb5`.)
+    fn note_buffer_inner(&self, index: u32, view: Option<&View>, seen: bool, record_change: bool) -> Vec<(u32, u64)> {
         if self.sampler {
             return Vec::new();
         }
@@ -2945,7 +2959,7 @@ impl HostHeap {
         } else {
             self.buffers.remove(index)
         };
-        if was {
+        if was && record_change && !(seen && self.copied_tabled(index, crate::frame::current())) {
             self.changed.put(index);
         }
         stale
@@ -3376,6 +3390,12 @@ impl HostHeap {
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
     }
 
+    #[cfg(test)]
+    pub(super) fn descriptor_bytes(&self, index: u32) -> Option<Vec<u8>> {
+        let mut bytes = vec![0; self.step as usize];
+        crate::host::read_into(self.cpu(index).ptr as *const u8, &mut bytes).then_some(bytes)
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
@@ -3455,6 +3475,17 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_inner(index, handle, for_draw, true)
+    }
+
+    /// [`HostHeap::mirror`] for a draw, by the heap pass (`draw::heap_buffer_pass`):
+    /// what it mirrors is not queued for its next round again.
+    /// (maren-halv/VIctory-Fast `7da8eb5`.)
+    pub(crate) fn mirror_heap_pass(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_inner(index, handle, true, false)
+    }
+
+    fn mirror_inner(&self, index: u32, handle: u64, for_draw: bool, record_change: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3494,10 +3525,10 @@ impl HostHeap {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 self.make_null(index);
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer_inner(index, None, false, record_change);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer_inner(index, None, false, record_change);
             }
             return None;
         };
@@ -3506,7 +3537,7 @@ impl HostHeap {
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             // (When this slot's lock is let go: a lock at a time.)
-            let stale = self.note_buffer(index, Some(&view), for_draw);
+            let stale = self.note_buffer_inner(index, Some(&view), for_draw, record_change);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -3943,7 +3974,7 @@ pub(crate) fn half_inexact(view: &View) -> Option<u32> {
     (!EXACT.contains(&format)).then_some(format)
 }
 
-fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+pub(crate) fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
@@ -6309,7 +6340,17 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let memory = vec![0u64; 1 << 13];
-        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let mut start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // Pick a page whose `+8` offset is not a multiple of the 456-byte
+        // structured element stride inside any loose-window grid (64 KiB..4 MiB):
+        // `456 = 8 * 57`, so a random 4 KiB heap page otherwise lands on an
+        // element boundary ~1 in 57 runs and legitimately uses the loose window.
+        while [64 << 10, 128 << 10, 256 << 10, 512 << 10, 1 << 20, 2 << 20, 4 << 20]
+            .iter()
+            .any(|&grid| ((start + 8) % grid).is_multiple_of(456))
+        {
+            start += 4096;
+        }
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {

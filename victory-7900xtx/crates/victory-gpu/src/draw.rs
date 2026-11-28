@@ -1119,7 +1119,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
     let changed = host.buffer_changes();
     let all = kept.passes == 0 || (kept.passes % HEAP_ROUND == 0 && !heap_spread());
-    let slots = if all {
+    let mut slots = if all {
         kept.clear_all();
         host.buffer_slots()
     } else if heap_spread() {
@@ -1137,6 +1137,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     } else {
         changed
     };
+    // A slot at most once a pass (maren-halv/VIctory-Fast `79a92c7`), then the
+    // pass counter of our own sweep (kept from pass to pass, with its ranges).
+    slots.sort_unstable();
+    slots.dedup();
     kept.passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
@@ -1161,7 +1165,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         if host.copied_tabled(index, frame) {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let view = host.mirror_heap_pass(index, heap.handle(index)?)?;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
@@ -3983,7 +3987,10 @@ impl State {
                 host.dynamic_word(index, crate::descriptor::view(table + u64::from(k) * 32).as_ref());
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
+                // The cache uses the title's format. Half moves need the
+                // unsigned view made in the table path below.
                 if list_views
+                    && !half.contains(&(slot, k * 8))
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
@@ -4885,7 +4892,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0
@@ -4926,11 +4933,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, desc), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Some compute-written textures are also read by the title CPU.
-            list.texture_written(*resource as This);
+            list.texture_written(*resource as This, desc.as_ref());
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
@@ -5238,3 +5245,7 @@ mod record_hash_tests {
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "draw/texback_test.rs"]
+mod texback_test;

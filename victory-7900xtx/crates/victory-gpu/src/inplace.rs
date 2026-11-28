@@ -834,6 +834,29 @@ pub(crate) fn home_touches(at: usize, len: usize) -> bool {
     homes.get(n).is_some_and(|h| h.0 < end)
 }
 
+/// Whether any of `[at, at + len)` is pages at home that a heap may be open
+/// on (not those given up, [`home_given_up`]): the guards never make such a
+/// page read-only, whatever range they were asked about. While one is, the
+/// kernel refuses every submission of the process (`-EPERM` out of amdgpu's
+/// `amdgpu_ttm_tt_get_user_pages`: the heap's memory has to be writable) and
+/// the device is lost.
+pub(crate) fn home_stays_writable(at: usize, len: usize) -> bool {
+    if !HOMES_ANY.load(Ordering::Relaxed) {
+        return false;
+    }
+    let end = at.saturating_add(len.max(1));
+    let homes = HOMES.read().unwrap_or_else(|e| e.into_inner());
+    let n = homes.partition_point(|h| h.1 <= at);
+    let Some(touched) = homes.get(n..) else {
+        return false;
+    };
+    let given = GIVEN_UP.read().unwrap_or_else(|e| e.into_inner());
+    touched.iter().take_while(|h| h.0 < end).any(|h| {
+        let (a, b) = (h.0.max(at), h.1.min(end));
+        !given.iter().any(|g| g.0 <= a && b <= g.1)
+    })
+}
+
 /// Whether a heap opened on a view of a section is that section's memory to
 /// the card: a view of a section of our own is opened, a buffer placed in it,
 /// and the card asked what it reads there. Once, with a queue of its own

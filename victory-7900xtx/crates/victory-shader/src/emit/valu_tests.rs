@@ -871,6 +871,48 @@ fn v_cmp_lg_is_false_for_nan() {
     }
 }
 
+/// `v_cmp_f_*` is false and `v_cmp_tru_*` true whatever the operands, NaNs
+/// included (RDNA2 ISA). As `fcmp false`/`fcmp true` WARP removed its device
+/// at the first dispatch.
+#[test]
+fn float_compares_that_are_always_false_or_true() {
+    let nan = f32::NAN.to_bits();
+    let f = f32::to_bits;
+    let f32_inputs = [
+        [f(1.0), f(2.0), 0, 0],
+        [f(1.0), f(1.0), 0, 0],
+        [nan, f(1.0), 0, 0],
+        [nan, nan, 0, 0],
+    ];
+    let f16_inputs = [
+        [0x3C00, 0x4000, 0, 0],
+        [0x3C00, 0x3C00, 0, 0],
+        [0x7E00, 0x3C00, 0, 0],
+        [0x7E00, 0x7E00, 0, 0],
+    ];
+    let mut hardware_cases = 0;
+    // v_cmp_*_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20
+    for (op, what, inputs, want) in [
+        (0x000u16, "v_cmp_f_f32", f32_inputs, 0),
+        (0x00f, "v_cmp_tru_f32", f32_inputs, 1),
+        (0x0c8, "v_cmp_f_f16", f16_inputs, 0),
+        (0x0ef, "v_cmp_tru_f16", f16_inputs, 1),
+    ] {
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            hardware_cases += usize::from(backend == "hardware");
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+    eprintln!("constant float compare cases on hardware: {hardware_cases}");
+}
+
 #[test]
 fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
     // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
@@ -1382,6 +1424,87 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
     // s_ashr_i64 s[6:7], -100, 4; v_mov_b32 v0, s7: the high dword.
     let ashr = [sop2(0x23, 6, 255, 0x84), MINUS_100, vop1(0x001, 0, sgpr(7))];
     check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
+}
+
+/// `v_mad_u64_u32` gives `{carry, D} = a * b + c` (65 bits): the two dwords
+/// of the result and the carry out, with the addend in a register pair of
+/// its own and sharing a register with the second factor. The addends are
+/// picked so that comparing with the dwords swapped would answer otherwise.
+/// Every case runs; the mismatches are counted by device, form and output
+/// before the test fails.
+#[test]
+fn v_mad_u64_u32_matches_its_definition() {
+    let factors: [u32; 6] = [0, 1, 2, 0xFFFF, 0x8000_0000, 0xFFFF_FFFF];
+    let addends: [u64; 9] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x1_0000_0000,
+        0x1_FFFF_FFFF,
+        0x7FFF_FFFF_FFFF_FFFF,
+        0xFFFF_FFFE_0000_0002,
+        0xFFFF_FFFF_0000_0000,
+        0xFFFF_FFFF_FFFF_FFFF,
+    ];
+    let mut inputs: Vec<[u32; 4]> = Vec::new();
+    for &a in &factors {
+        for &b in &factors {
+            for &c in &addends {
+                inputs.push([a, b, c as u32, (c >> 32) as u32]);
+            }
+        }
+    }
+    let mut counts: std::collections::BTreeMap<(String, &str, &str), usize> = Default::default();
+    let mut first: Vec<String> = Vec::new();
+    // v_mad_u64_u32 v[5:6], s20, v1, v2, v[3:4] and, sharing v2,
+    // v_mad_u64_u32 v[5:6], s20, v1, v2, v[2:3] (VOP3B: s20 in bits 14:8);
+    // then v0 = the carry (v_cndmask_b32_e64 v0, 0, 1, s20), v5 or v6
+    for (third, form) in [(3u8, "v[3:4]"), (2, "v[2:3]")] {
+        for output in ["carry", "low", "high"] {
+            let mut body = vec![
+                0x35 << 26 | 0x176 << 16 | 20 << 8 | 5,
+                vgpr(1) as u32 | (vgpr(2) as u32) << 9 | (vgpr(third) as u32) << 18,
+            ];
+            match output {
+                "carry" => body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20))),
+                "low" => body.push(vop1(0x001, 0, vgpr(5))),
+                _ => body.push(vop1(0x001, 0, vgpr(6))),
+            }
+            let shader = build_valu_cs(&body);
+            let at = usize::from(third) - 1;
+            run_cases(&shader, &inputs, |backend, _, inp, got| {
+                let (a, b) = (inp[0], inp[1]);
+                let c = u64::from(inp[at]) | u64::from(inp[at + 1]) << 32;
+                let sum = u128::from(a) * u128::from(b) + u128::from(c);
+                let want = match output {
+                    "carry" => (sum >> 64) as u32,
+                    "low" => sum as u32,
+                    _ => (sum >> 32) as u32,
+                };
+                if got != want {
+                    *counts
+                        .entry((backend.to_owned(), form, output))
+                        .or_default() += 1;
+                    if first.len() < 12 {
+                        first.push(format!(
+                            "{backend} {form} {output}: v_mad_u64_u32({a:#010x}, {b:#010x}, {c:#018x}) = {got:#010x}, want {want:#010x}"
+                        ));
+                    }
+                }
+            });
+        }
+    }
+    for ((backend, form, output), n) in &counts {
+        eprintln!(
+            "v_mad_u64_u32 {backend} {form} {output}: {n} of {} wrong",
+            inputs.len()
+        );
+    }
+    assert!(
+        counts.is_empty(),
+        "v_mad_u64_u32 mismatches: {counts:?}\n{}",
+        first.join("\n")
+    );
 }
 
 #[test]

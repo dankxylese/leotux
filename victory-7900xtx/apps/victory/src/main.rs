@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod memcpy;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;

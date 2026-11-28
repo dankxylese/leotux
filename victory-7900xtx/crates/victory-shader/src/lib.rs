@@ -30,8 +30,12 @@ pub mod structure;
 /// raw typed loads; upstream's own numbers stay below. 0x4c00_0003: the
 /// Vice-Tay AMD scalar rules — an `s_min`/`s_max` flag that is the
 /// comparison's, and a legacy multiply-add whose zero product plus a `-0`
-/// accumulator is `+0`.)
-pub const TRANSLATOR_VERSION: u32 = 0x4c00_0003;
+/// accumulator is `+0`. 0x4c00_0004: 64-bit compares and `v_mad_u64_u32`
+/// carries worked out dword by dword, fxceless 1506 and 1507. 0x4c00_0005,
+/// one bump for the merge of the two lines: the scalar rules and fxceless
+/// 1506/1507 together, and always-true/always-false float compares lowered
+/// as constants — no cached translation is trusted across that.)
+pub const TRANSLATOR_VERSION: u32 = 0x4c00_0005;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

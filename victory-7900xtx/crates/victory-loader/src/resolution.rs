@@ -37,8 +37,20 @@
 //!   the title divided by it (+0x28f03e8) 49 s in.
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **Interface.** The title lays its interface out in pixels of a
+//!   3840x2160 screen (`video/uiResolution`), and with `video/uiOverlay`
+//!   presents it as a second plane over the scene. At a smaller output
+//!   without that, tips, prompts and subtitles keep their 3840x2160 size in
+//!   pixels. `VICTORY_UI_PLANE_720=1` (with `VICTORY_OUTPUT=1280x720` or
+//!   `1920x1080`; [`ui_plane`]) asks for the overlay with an interface of
+//!   3840x2160, three or two times the scene each way, and for the display
+//!   pool the title has for two planes (82 MiB in place of 64); the host
+//!   composes the second plane onto the first (`VICTORY_PLANES`).
 
 use crate::frame_rate::Patched;
+
+#[cfg(any(windows, test))]
+mod ui_plane;
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
@@ -297,21 +309,66 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// code yet.
 #[cfg(windows)]
 pub unsafe fn apply_asked(base: usize, size: usize) {
+    // SAFETY: the caller's promise.
+    unsafe { apply(base, size, true) }
+}
+
+/// Applies `VICTORY_OUTPUT` alone: for a run whose render scale and upscaler
+/// are a FidelityFX profile's (`VICTORY_FSR_4K`, which changes bytes inside
+/// [`FFX_SCALE`] and [`PICKER`] in the title's file before it is loaded).
+///
+/// # Safety
+/// As [`apply_asked`].
+#[cfg(windows)]
+pub unsafe fn apply_output(base: usize, size: usize) {
+    // SAFETY: the caller's promise.
+    unsafe { apply(base, size, false) }
+}
+
+/// `scale_and_upscaler`: whether `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE`
+/// and `VICTORY_UPSCALER` are applied too.
+///
+/// # Safety
+/// As [`apply_asked`].
+#[cfg(windows)]
+unsafe fn apply(base: usize, size: usize, scale_and_upscaler: bool) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
-        asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
-        if (w, h) != (3840, 2160) {
+        // Set the two-plane video configuration (a 1280x720 or 1920x1080
+        // scene under a 3840x2160 interface) only when both display-pool
+        // requirements have been verified and applied. Until then the title
+        // may still use its original single-plane settings.
+        let separate_ui = ui_plane::requested(
+            (w, h),
+            std::env::var_os("VICTORY_UI_PLANE_720").as_deref(),
+            std::env::var_os("VICTORY_PLANES").as_deref(),
+        ) && {
+            // SAFETY: the caller provides a mapped image before title execution.
+            unsafe {
+                [&OUTPUT, &POOL_CHECK, &ui_plane::POOL].iter().all(|site| matches(base, size, site) == Patched::Done)
+                    && write(base, size, &POOL_CHECK, &pool_check_code()) == Patched::Done
+                    && write(base, size, &ui_plane::POOL, &ui_plane::SPLIT_POOL) == Patched::Done
+            }
+        };
+        if separate_ui {
+            asked.push((&OUTPUT, ui_plane::output_code((w, h)), format!("{w}x{h} scene, 3840x2160 interface")));
+        } else {
+            asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+        }
+        if !separate_ui && (w, h) != (3840, 2160) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
         }
     }
-    if let Some(s) = asked_render_scale() {
-        asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
-    }
-    if let Some(s) = asked_ffx_scale() {
-        asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
-    }
-    if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+    if scale_and_upscaler {
+        if let Some(s) = asked_render_scale() {
+            asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+        }
+        if let Some(s) = asked_ffx_scale() {
+            asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
+        }
+        if let Some(kind) = asked_upscaler() {
+            asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+        }
     }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.

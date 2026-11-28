@@ -43,6 +43,10 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
+    /// There is a priority hint for this request. The ordinary queue still owns it.
+    waiter_hint: AtomicBool,
+    /// Measured only with the diagnostic queue trace enabled.
+    requested_at: OnceLock<Instant>,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
@@ -84,6 +88,8 @@ impl Pending {
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
+            waiter_hint: AtomicBool::new(false),
+            requested_at: OnceLock::new(),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -604,13 +610,33 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
-/// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// Start previously used pipelines at creation. With a byte limit, also
+/// give small compute pipelines a head start on their first dispatch.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    static MAX_BYTES: OnceLock<usize> = OnceLock::new();
+    let small_compute = p.compute && p.shaders.first().is_some_and(|shader| {
+        let limit = MAX_BYTES.get_or_init(|| {
+            let bytes = std::env::var("VICTORY_EARLY_COMPUTE_MAX_BYTES")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            tracing::info!(bytes, "cold compute pipeline byte limit");
+            bytes
+        });
+        within_early_compute_limit(shader.container.len(), *limit)
+    });
+    if small_compute || (!p.shaders.is_empty() && super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
+        if small_compute {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::info!("first small compute pipeline started at creation"));
+        }
     }
+}
+
+fn within_early_compute_limit(bytes: usize, limit: usize) -> bool {
+    bytes != 0 && bytes <= limit
 }
 
 /// Whether the frame's budget is one for all threads together: a thread
@@ -626,23 +652,59 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// A recorder can take its frame number, then reach the budget lock out of order.
+fn reserve_wait(
+    spent: &mut (u64, Duration),
+    frame: u64,
+    budget: Duration,
+    shared: bool,
+) -> Duration {
+    if frame < spent.0 {
+        return Duration::ZERO;
+    }
+    if frame > spent.0 {
+        *spent = (frame, Duration::ZERO);
+    }
+    let left = budget.saturating_sub(spent.1);
+    if shared {
+        spent.1 += left;
+    }
+    left
+}
+
+/// The first recorder in a frame sets its deadline. A late recorder for
+/// an older frame shares the current deadline.
+fn compute_deadline(
+    current: &mut Option<(u64, Instant)>,
+    frame: u64,
+    now: Instant,
+    budget: Duration,
+) -> Instant {
+    if let Some((newest, deadline)) = *current
+        && frame <= newest
+    {
+        return deadline;
+    }
+    let deadline = now + budget;
+    *current = Some((frame, deadline));
+    deadline
+}
+
 /// Waits for a compute pass's pipeline until it is made or `budget` after
 /// the frame's first such wait, whichever thread that was: all of a frame's
 /// waits end together, and none takes another's time (a thread that came
 /// while another waited found nothing left of a budget counted as
 /// [`wait`] counts it, and dropped its pass at once).
-fn wait_compute(p: &Pending, frame: u64, budget: Duration) {
+fn wait_compute(p: &Arc<Pending>, frame: u64, budget: Duration) {
     // The frame the waiting belongs to and when it ends.
-    static UNTIL: Mutex<(u64, Option<Instant>)> = Mutex::new((u64::MAX, None));
+    static UNTIL: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
     let until = {
         let mut until = UNTIL.lock().unwrap_or_else(|e| e.into_inner());
-        if until.0 != frame {
-            *until = (frame, None);
-        }
-        *until.1.get_or_insert_with(|| Instant::now() + budget)
+        compute_deadline(&mut until, frame, Instant::now(), budget)
     };
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
+    prefer_waiter(p, started, until);
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
@@ -669,7 +731,7 @@ fn wait_compute(p: &Pending, frame: u64, budget: Duration) {
 }
 
 /// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+fn wait(p: &Arc<Pending>, frame: u64) {
     if p.waits_alone() {
         return wait_compute(p, frame, compute_budget());
     }
@@ -680,25 +742,21 @@ fn wait(p: &Pending, frame: u64) {
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((0, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
+        reserve_wait(&mut spent, frame, budget, shared)
     };
     if left.is_zero() {
         return;
     }
     let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
+    if screen {
+        prefer_waiter(p, started, started + left);
+    }
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
@@ -762,6 +820,9 @@ fn slow_limit() -> usize {
 }
 
 struct Queue {
+    /// Requests with a caller that has time left to wait. A hint expires
+    /// with that caller's budget, leaving the original request in place.
+    waiters: VecDeque<(Arc<Pending>, Instant)>,
     /// Requested passes over the screen (and compute passes that wait by a
     /// budget of their own, [`Pending::ahead`]): before all others, and the
     /// only ones [`SCREEN_WORKERS`] take.
@@ -777,6 +838,7 @@ struct Queue {
 impl Queue {
     const fn new() -> Self {
         Self {
+            waiters: VecDeque::new(),
             screen: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
@@ -809,16 +871,30 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
+    fn prefer_waiter(&mut self, p: &Arc<Pending>, until: Instant) -> bool {
+        if p.queue_state.load(Ordering::Relaxed) != REQUESTED || !p.ahead() || p.waiter_hint.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        self.waiters.push_back((p.clone(), until));
+        true
+    }
+
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
-        // An early entry can have been promoted and claimed already.
-        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
-            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        // A request may already have been claimed through a waiter hint.
+        let unclaimed = |list: &mut VecDeque<Arc<Pending>>, priority| {
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == priority)
         };
-        let mut p = self.screen.pop_front();
+        let mut p = std::iter::from_fn(|| self.waiters.pop_front()).find_map(|(p, until)| {
+            p.waiter_hint.store(false, Ordering::Relaxed);
+            (p.queue_state.load(Ordering::Relaxed) == REQUESTED && Instant::now() < until).then_some(p)
+        });
+        if p.is_none() {
+            p = unclaimed(&mut self.screen, REQUESTED);
+        }
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = unclaimed(&mut self.requested, REQUESTED).or_else(|| unclaimed(&mut self.early, EARLY));
             if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
+                p = unclaimed(&mut self.slow, EARLY);
                 if let Some(p) = &p {
                     p.was_slow.store(true, Ordering::Relaxed);
                     self.slow_now += 1;
@@ -834,6 +910,33 @@ impl Queue {
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
 
+fn waiter_priority() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_PIPELINE_WAITERS_FIRST").is_some_and(|v| v == "1");
+        tracing::info!(enabled, "pipeline priority for active waiters");
+        enabled
+    })
+}
+
+fn trace_request_latency() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_QUEUE_TIMING").is_some_and(|v| v == "1"))
+}
+
+/// Move a compute or screen request ahead while the caller can still wait.
+fn prefer_waiter(p: &Arc<Pending>, started: Instant, until: Instant) {
+    if !waiter_priority() || started >= until || p.queue_state.load(Ordering::Relaxed) != REQUESTED
+        || p.waiter_hint.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.prefer_waiter(p, until) {
+        AVAILABLE.notify_all();
+    }
+}
+
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
 fn start(p: &Arc<Pending>, priority: u8) {
@@ -848,6 +951,9 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
+        if priority == REQUESTED && trace_request_latency() {
+            p.requested_at.get_or_init(Instant::now);
+        }
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
@@ -864,6 +970,12 @@ fn next(screens_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(p) = queue.pop(screens_only, slow_limit()) {
+            let queued_for = p.requested_at.get().map(Instant::elapsed);
+            drop(queue);
+            if let Some(delay) = queued_for {
+                tracing::info!(us = delay.as_micros() as u64, shaders = ?p.shaders,
+                    "a requested pipeline reached a worker");
+            }
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -1095,6 +1207,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn late_pipeline_wait_keeps_newer_frame_budget() {
+        let budget = Duration::from_millis(500);
+        for shared in [false, true] {
+            let mut spent = (0, Duration::ZERO);
+            assert_eq!(reserve_wait(&mut spent, 0, budget, shared), budget);
+            assert_eq!(reserve_wait(&mut spent, 8, budget, shared), budget);
+            if !shared {
+                spent.1 = Duration::from_millis(250);
+            }
+            let before = spent;
+            assert_eq!(reserve_wait(&mut spent, 7, budget, shared), Duration::ZERO);
+            assert_eq!(spent, before);
+            assert_eq!(reserve_wait(&mut spent, 8, budget, shared), budget - before.1);
+            assert_eq!(reserve_wait(&mut spent, 9, budget, shared), budget);
+        }
+    }
+
+    #[test]
+    fn late_compute_wait_keeps_newer_frame_deadline() {
+        let started = Instant::now();
+        let budget = Duration::from_millis(500);
+        let until = started + budget;
+        let later = started + Duration::from_millis(250);
+        let mut current = None;
+        assert_eq!(compute_deadline(&mut current, 8, started, budget), until);
+        assert_eq!(compute_deadline(&mut current, 7, later, budget), until);
+        assert_eq!(compute_deadline(&mut current, 8, later, budget), until);
+        assert_eq!(compute_deadline(&mut current, 9, later, budget), later + budget);
+    }
+
+    #[test]
+    fn early_compute_limit_excludes_empty_and_oversized_containers() {
+        assert!(!within_early_compute_limit(0, 0));
+        assert!(!within_early_compute_limit(0, 1024));
+        assert!(!within_early_compute_limit(1024, 0));
+        assert!(within_early_compute_limit(1024, 1024));
+        assert!(!within_early_compute_limit(1025, 1024));
+    }
+
+    #[test]
     fn all_workers_have_a_valid_wait_at_the_maximum_setting() {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
@@ -1208,6 +1360,43 @@ mod tests {
         assert!(queue.pop(false, 1).is_none());
         queue.slow_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn an_active_waiter_can_pass_other_requests_without_a_double_claim() {
+        let make = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.screen = true;
+            Arc::new(p)
+        };
+        let (older, waiting) = (make(), make());
+        let mut queue = Queue::new();
+        assert!(queue.push(&older, REQUESTED).unwrap());
+        assert!(queue.push(&waiting, REQUESTED).unwrap());
+        let until = Instant::now() + Duration::from_secs(5);
+        assert!(queue.prefer_waiter(&waiting, until));
+        assert!(!queue.prefer_waiter(&waiting, until));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &waiting));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &older));
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn an_expired_hint_keeps_its_request_in_original_order() {
+        let make = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.screen = true;
+            Arc::new(p)
+        };
+        let (older, waiting) = (make(), make());
+        let mut queue = Queue::new();
+        assert!(queue.push(&older, REQUESTED).unwrap());
+        assert!(queue.push(&waiting, REQUESTED).unwrap());
+        assert!(queue.prefer_waiter(&waiting, Instant::now()));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &older));
+        assert!(!waiting.waiter_hint.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &waiting));
         assert!(queue.pop(false, 1).is_none());
     }
 

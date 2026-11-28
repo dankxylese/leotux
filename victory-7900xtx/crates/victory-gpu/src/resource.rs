@@ -1477,6 +1477,26 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`alias_of`]): a reference the caller holds
+/// while it uses the texture, which the title cannot drop meanwhile.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1499,6 +1519,19 @@ fn target_seen(address: u64) -> (&'static std::sync::atomic::AtomicU64, u64) {
     (&TARGETS_SEEN[(bit >> 6) as usize], 1 << (bit & 63))
 }
 
+#[cfg(windows)]
+fn pin_alias_source(address: u64) -> Option<Held> {
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let source = *targets.get(&address)? as This;
+    // Drop the table lock before the caller can give back the reference.
+    // Resource::drop takes the same lock when the last reference goes away.
+    if crate::object::add_ref_alive(source) {
+        Some(Held(source))
+    } else {
+        None
+    }
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
@@ -1519,8 +1552,13 @@ fn target_seen(address: u64) -> (&'static std::sync::atomic::AtomicU64, u64) {
 /// all zeros from a first stage that held light (run 88).
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
+///
+/// The texture is pinned under the table's lock and returned as a [`Held`]
+/// handle: the caller copies from it after the lock is given back, and the
+/// title (or one of its recording threads) may drop its own last reference
+/// in between.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1549,9 +1587,11 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     if seen.load(std::sync::atomic::Ordering::SeqCst) & bit == 0 && crate::toggled!("VICTORY_PLACED_QUICK") {
         return None;
     }
-    // Under the table's lock: a texture leaves it before it is freed.
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    // Pinned under the table's lock and handed back as a `Held`: the copy that
+    // reads it happens after the lock is given back (born `5d73111`), and the
+    // quick check above keeps the lock off the common path.
+    let held = pin_alias_source(r.data() as u64)?;
+    let other = held.get();
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -1587,7 +1627,10 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    if !same {
+        return None;
+    }
+    Some(held)
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -3617,6 +3660,71 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[cfg(windows)]
+    fn alias_test_source() -> This {
+        let null = std::ptr::null();
+        let mut source = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source),
+            S_OK
+        );
+        source
+    }
+
+    /// The source a placed view aliases is held while the caller copies it:
+    /// the title may let go of its own reference between the lookup and the
+    /// copy (or a recording thread may), and the copy still needs it.
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let null = std::ptr::null();
+        let source = alias_test_source();
+        let mut view = null;
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let held = alias_of(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+        // The title lets go: the pin, not the title's reference, keeps the
+        // source (and the copy about to be made from it) alive.
+        resource_release(source);
+        assert!(textures().contains(&(source as usize)), "the held source is not freed");
+        if let Some(host) = crate::host::host() {
+            assert!(host_resource(held.get()).is_some(), "a held source is still copyable");
+            let list = host.new_list().expect("an open host list");
+            assert!(crate::texture::alias(&list, view, held.get()), "record the alias copy");
+            eprintln!("recorded a host texture alias copy while pinned");
+        }
+        drop(held);
+        assert!(!textures().contains(&(source as usize)), "the last reference frees it");
+        resource_release(view);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_pin_can_be_released_after_the_table_lookup() {
+        let source = alias_test_source();
+        let address = resource(source).data() as u64;
+        let held = pin_alias_source(address).expect("an alias source");
+        resource_release(source);
+        // An incompatible candidate would discard its pin here. Its final
+        // reference can take the table lock again to unregister the source.
+        assert!(TARGETS_AT.try_lock().is_ok(), "the lookup released the table");
+        drop(held);
+        assert!(pin_alias_source(address).is_none());
     }
 
     #[test]

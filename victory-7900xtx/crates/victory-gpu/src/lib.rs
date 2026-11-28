@@ -27,6 +27,8 @@ mod texstore;
 mod capture;
 #[cfg(windows)]
 mod compose;
+#[cfg(windows)]
+mod dxc;
 pub mod console;
 mod wc;
 #[cfg(windows)]

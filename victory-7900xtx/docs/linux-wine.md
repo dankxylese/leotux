@@ -259,6 +259,14 @@ brightness was taken (0 to 255).
   in run 30, 22.8 in run 32) and halves their waits for the guards (11.0 to 5.5 ms).
 - `VICTORY_OUTPUT=1920x1080`: 39.2 ms a frame (25.5 fps), the card 78 % busy, the picture
   there (run 27). The largest gain left that was measured.
+- `VICTORY_UI_PLANE_720=1` with `VICTORY_OUTPUT=1920x1080` or `1280x720`: the interface gets
+  the title's second plane, laid out at 3840x2160 and brought down onto the scene by the
+  compositor (`VICTORY_PLANES`, on by default). Without it the interface is drawn into the
+  scene with its elements as many pixels large as at 3840x2160: twice too large at
+  1920x1080 (a tip's panel runs off the bottom of the picture), three times at 1280x720.
+  On an RX 7900 XT (RADV 26.3.1, Wine 11.22) over the opening, same keys, warm: 15.8 frames
+  a second at 1920x1080 against 16.3 at 1280x720, both with the switch, which is inside
+  what two runs of one setting differ by there. Off by default.
 - `--console series-s`: not run (`play.sh` passes no arguments to `victory run`).
 
 ## The intro videos go forwards and back (`VICTORY_JOIN_PARTS`)
@@ -900,6 +908,183 @@ lock for a third of a millisecond at a time, 2,000 times a second.
       same picture each time.
     - not the driver's compiler: a recorded frame's network replayed with RADV's ACO and with
       its LLVM backend (`RADV_DEBUG=llvm`) gives the same result word for word.
+12. `VICTORY_WC_NO_BACK=1` (Belobug/VIctory-Belobug-AMD pull request 477, by
+    icecreammule277-dot; its seven commits picked onto this branch): what shaders write into
+    title memory the title asked for as write-combined stays on the card. On this branch, the
+    launcher's other settings, 200 s read from second 100, one run each: 38.0 ms a frame
+    without (run 130), 33.8 with (run 131), the submitting thread working 33.5 and 27.0 ms
+    of them. On the Linux branch alone (before main was merged in), 200 s read from second
+    100, no frames kept: 25.1 ms a frame without (run 94, 39.8 frames a second), 22.6 with
+    (run 95, 44.3), the submitting thread working 22.4 and 17.6 ms of them. The frames of the
+    world kept of the run with it are whole pictures, faces too. `scripts/play-1080p.sh` sets
+    it. The first scene alone.
+13. Where the submitting thread's time goes, and `VICTORY_CARD_TOUCHED=1`. The card is not
+    what holds the frame back any more: its core runs at 2,460 MHz and it draws 127 to 133 W
+    of the 220 it may (runs 119 to 128), while the submitting thread works most of the
+    frame. Sampled every 5 ms (`VICTORY_PROFILE`, run 123, on the branch without main) that
+    thread is parked 35 % of the time (waiting for its helpers or for work), 8.6 % in
+    `NtGetWriteWatch`, 4.2 % in the diagnostics' `GetThreadTimes`, and 6.9 % in one function
+    of ours: `shadow::card_dirty`, which at every submission, 28 a frame, asked each of the
+    3,450 copies in the card's memory whether it had changed, where some 130 had.
+    `VICTORY_CARD_TOUCHED=1` asks only the copies that were marked as changed. By turns of
+    10 s in one run (run 124, the branch without main): the thread's time for these copies
+    2.60 -> 1.30 ms a frame, its work 23.7 -> 22.6 ms; the frame 27.2 -> 26.0 ms (median of
+    five phases' medians each side), within what the scene moves it by from one phase to the
+    next, so the frame's gain is not shown, the thread's is. The picture as before.
+    `scripts/play-1080p.sh` sets it. Unset, every copy is asked as before.
+
+    Tried the same day and not kept, each a run or two: the Series S profile (27.9 ms
+    against 28.2, and blocks of pixels on faces and arms); two presents in the line
+    (`VICTORY_SUBMIT_FRAMES=2`: the title's wait at presents 10.5 -> 0.0 ms, the frame no
+    shorter); joined parts sent to the queue in one call (26.1 against 25.8 ms). A thread's
+    priority asked above normal changes nothing here: every thread of the process has nice
+    0, the submitting one too, since the process may not raise one (`Max nice priority 0`).
+14. This branch (the Linux branch merged with main) against the Linux branch alone, the same
+    settings, in turn, 200 s each and no frames kept (runs 133 to 136): 31.1 and 27.0 ms a
+    frame here, 26.6 and 27.9 there; the submitting thread working 22.2 and 19.1 ms here,
+    20.5 and 20.6 there. No difference is shown: this branch's two runs lie 4 ms apart.
+    (A first version of this item said this branch was 6 ms slower. That compared runs that
+    kept every eighth frame of the world as a picture, `VICTORY_CAPTURE_WORLD=1`, with runs
+    that did not: keeping them costs several ms a frame, 33.8 ms with against 27.0 to 31.1
+    without on this branch. The figures of item 12 are both from runs that kept them, so
+    their difference stands and their level is some ms too high.)
+
+15. FSR 4 at the output's own size, as anti-aliasing (`VICTORY_FSR_4K=native`, avatarmanz
+    pull request 444's output size, the PC upscaler from AMD's signed
+    `amd_fidelityfx_upscaler_dx12.dll` with Proton's `amdxc64.dll` and `amdxcffx64.dll`,
+    `VICTORY_FSR_VERSION=4.1.1`, `DXIL_SPIRV_CONFIG=wmma_rdna3_workaround`). The launcher's
+    settings with main's order of clamps off, 200 s each, in turn, no frames kept (runs 137
+    to 142):
+
+    | Upscaler | Picture made at | Frame (median) | Card |
+    |---|---|---|---|
+    | the title's own | 1280x720 | 25.2 and 27.9 ms | 140 W, 82 % busy |
+    | FSR 4.1.1 `quality` | 1280x720 | 25.4 and 26.1 ms | 144 W, 85 % |
+    | FSR 4.1.1 `native` | 1920x1080 | 27.0 and 26.7 ms | 169 W, 96 % |
+
+    The card takes the extra work in the room it had; the submitting thread, which sets the
+    pace, works as before. Whole-size pictures of the same shot of the police check (runs 143
+    to 145, `frame-3322`, `-3321` and `-3191`): face, glasses and collar are sharp with
+    `native` and soft with the title's upscaler, `quality` between them (`sheets/fsr/` beside
+    the logs). `scripts/play-1080p.sh` uses `native` when it finds the DLL (`FIDELITYFX_DIR`,
+    by default Forza Horizon 6's Steam folder, where this PC has one; `FIDELITYFX_DIR=none`
+    for the title's upscaler). Not provided to FSR: the exposure, reactive and transparency
+    masks (others reported noise on particles from that; not looked at here).
+
+    What the title hands FSR (a test build logging each dispatch, run 148): the reactive and
+    transparency slots are empty and exposure is automatic (creation flags 0x29) on the
+    title's side, not dropped by the bridge; the jitter moves from frame to frame in a short
+    cycle, as FSR wants it.
+
+## Others' fixes measured here (2026-11-27 and 28)
+
+Each candidate was tried on top of what had been kept before it, in turn with what it was
+tried against: two runs each side of 200 s read from second 100, `play-1080p.sh`'s settings,
+no frames kept, then one run with every eighth frame of the world kept to look at the
+picture (`side-by-side.sh` at the same moments, `brightness.py`). Runs of the same thing lie
+1 to 2 ms apart, so a difference under that is read as none. The first scene is a cutscene:
+none of these changed what it shows.
+
+Kept (this branch has them, one commit each, with their source in the message):
+
+| Fix | Source | Runs | Frame with / without |
+|---|---|---|---|
+| The fork's pull requests 21 to 27 | UwUCammie | 152-157, 175-179 | 33.7/32.8 against 32.3/32.1 ms (21 to 25 with NVIDIA 223, 225) |
+| Split submissions keep their dynamic descriptors; formats 189-191; no BC MSAA layout | trustno1-coder/VIctory-NVIDIA 223, 225, 386 | as above | |
+| Clean write-watch shards and heap-pass self-requeues skipped | anoyarou b109dc2 (from maren-halv/VIctory-Fast) | 160-163 | the submitting thread 25.6/26.5 against 26.9/27.6 ms |
+| Texture pool pieces used again once the card is done with them | after Hasusmogus/cool_fox f97fdade | 169-174 | frame the same; textures that waited for memory shown 8.2/8.5 s late against 9.4/8.5 |
+| memcpy and memmove of our own under Wine | anoyarou 33ca7a1 | 185-188 | 31.7/34.1 against 32.9/34.8 ms |
+| x86-64-v3 build | VIctory-NVIDIA 603 (part a) | 200-203 | 32.3/32.2 against 33.5/31.7 ms |
+| Land before remap; cache key race; zero only holes; timestamp slots; RVAs past 4 GiB | VIctory-NVIDIA 631, 632, 2cffd2d, 202d285; Raptorbk45 a82b0d4 | 205-212 | the same |
+| Card-step constant buffers learnt and checked, **off** (`VICTORY_CARD_STEPS_LEARN=1`) | Raptorbk45 4f7d65c (from SlaktarnVI) | 205-211 | on: 40.7 against 33.2 ms |
+
+The copy of our own is the one that matters: `victory.exe` imports `memcpy` and `memmove`
+from `VCRUNTIME140`, which Proton's `vcruntime140.dll` forwards to `ntdll`, and `ntdll`'s
+copy goes a byte at a time: `RtlMoveMemory` 195-205 us a MiB, `ucrtbase`'s `memmove` 6.4,
+and `HeapReAlloc` moving a block of 1 MiB 285 us (a small benchmark under Proton
+Experimental). Bypassing only `HeapReAlloc` gained nothing (runs 180-183).
+
+Tried and left out: Vice-Tay 357, heap pacing against stretched triangles (39.5/41.3 ms
+against 32.5/32.3, runs 148-151; no stretched triangles seen without it in the first scene);
+cool_fox d78b9eb5, `memcmp` of our own (33.9/35.4 against 32.3/32.5, runs 165-168);
+VIctory-NVIDIA 552, non-temporal snapshot copies (the same, runs 190-193); Vice-Tay 370's
+sRGB and linear view casts (never asked for in the first scene: no line in the log, the
+picture the same, runs 158-159); VIctory-NVIDIA 353, feb90ad and 0745a5d, translator fixes
+(`victory shaders` translated all 25,790 again and none came out different).
+
+Not needed here: Vice-Tay 372 and VIctory-NVIDIA 243 (the head blend-shape pass: its
+pipeline is made at loading and first bound at frame 998, never dropped: `VICTORY_COMPUTE_WAIT_MS`
+covers it); VIctory-NVIDIA 340 (its sweep runs at relay stage 3, `play.sh` sets 2); FiveNine
+f9d2da84 (0 questions about holes a frame here, `VICTORY_WINE_MAP`); VIctory-NVIDIA 662 (the
+largest group count asked for is 216).
+
+Device methods 0x1c8 and 0x218 ("a pipeline creation method that is not implemented", some
+16,000 calls a run) take nothing from the picture: refused, the title makes the same
+pipeline from a container through 0x1f0, which translates far better. VIctory-NVIDIA 506,
+which reads 0x218's loose parts, found 29 % of draws dropped with it against 3 % without and
+left it off. Not taken.
+
+Skipping cool_fox 113's 43 passes that only prepare for ray tracing
+(`VICTORY_SKIP_PIPELINES`, the list in `~/Games/victory-logs/patches/`): 31.3/32.4 against
+32.7/32.6 ms, the first scene's picture the same (runs 195-199). Not in the launcher yet:
+interiors not looked at.
+
+The "dropped without a host pipeline" count (130 to 350 a frame) is the ray-tracing
+structure builder's stages, which are off with ray tracing.
+
+### Past the first scene (run 215)
+
+A run of 420 s on this branch with Enter pressed every 6 s from second 120: the night
+cutscene, an interior, the prison by day and the "PROLOGUE" title card, with no device lost
+(the fork's pull request 27 is for that, at the change of scene after the intro) and no
+fault in the kernel's log. The frame over seconds 300 to 420: 36.1 ms (27.7 frames a
+second), from 23.5 to 60.6 ms by scene, the longest while the prison loaded (829 draws a
+frame dropped while their pipelines were made, then back to the builder's).
+
+### The interface at its own size (the fork's pull request 28, runs 216-221)
+
+With `VICTORY_OUTPUT=1920x1080` the title drew its interface at its 4K pixel size: hints,
+prompts and subtitles twice too large. `VICTORY_UI_PLANE_720=1` (UwUCammie) has the title
+draw the scene at 1920x1080 and the interface on a second plane at 3840x2160, which the
+layer composes (the log: "1920x1080 scene, 3840x2160 interface", "compositing two planes").
+The frame is the same: 31.6 and 31.8 ms with, 31.6 and 31.4 without. The prompt "Se
+déplacer / Bouger la caméra" in the prison is at a 1080p interface's size with it, twice that
+without (`sheets/integ/ui-sbs.png` beside the logs). `scripts/play-1080p.sh` sets it.
+
+`VICTORY_STORE_BESIDE=1` and `VICTORY_COPY_BESIDE=1` (zocram4cc/victory-linux-perf measured
+-3.2 ms a frame with both on an RX 7900 XTX): nothing here. In the prison, by turns, two runs
+each: both 31.8 and 31.6 ms, none 31.5 and 31.8, the store alone 31.7 and 31.8 (runs
+223-228). Left off.
+
+A run of 420 s from that save (run 222, scripted keys: W held for 5 s at a time, Enter):
+the cell at 25.5 frames a second (39.2 ms), the submitting thread 33.9 ms, no fault. The
+character did not move: the keys reach the title as keyboard and as the stand-in pad's
+stick, but at that point of the game it did not take them. Free play is not shown yet.
+
+fxceless 1506 and 1507 (AMD's compiler got 64-bit compares wrong where operands share a
+dword, and `v_mad_u64_u32`'s carry where the addend's pair shares a register with a
+factor): 537 of the title's 25,790 shaders translate differently with them
+(`TRANSLATOR_VERSION` 0x4c00_0004). In the prison, by turns: 30.6 and 31.9 ms with, 31.3
+and 31.9 without (runs 230-233); the picture the same at the same moments, brightness 70.1
+against 71.5 (runs 234-235). Taken.
+
+`VICTORY_WINDOWS_BAR_MB=4096` (from zocram4cc/victory-linux-perf, where it gave 45.9 against
+48.3 ms on an RX 6900 XT): the title-memory windows outside buffers lie in the card's memory
+and the CPU writes them through the bus, with no copy to send and no list of changes. In the
+prison, by turns: **28.3 and 28.1 ms a frame with it, 31.7 and 31.4 without** (35.4 frames a
+second against 31.7), the submitting thread 17.3 and 16.4 ms against 21.1 and 21.8, the worst
+report line 31.6 and 33.4 against 33.7 and 37.3 (runs 237-240); the picture the same,
+brightness 71.5 (run 241). The card draws 157 W against 150. `scripts/play-1080p.sh` sets it.
+On a card with less memory than this one's 16 GB it may not fit: windows go there only while
+a fifth of the card's budget is free.
+
+(The executable of runs 222 to 235 marked "linux-wine" or "base" was built before pull
+request 28 was merged: their interface is at the old size. Their times stand, as 28 does not
+change them, runs 216-219.)
+
+These runs started in the prison: the long run (215) had saved the game's progress there
+(a new save slot at its end). Measured runs from here on are in the prison by day, not the
+night cutscene: their frames are not comparable with the ones above.
 
 ## Tools
 

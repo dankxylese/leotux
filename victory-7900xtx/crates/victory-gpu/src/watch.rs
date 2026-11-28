@@ -2025,9 +2025,12 @@ pub(crate) fn look_at_holes() {
         }
         if block >= until {
             // (Or unmapped memory was mapped since the part was taken: told
-            // already, and forgotten.)
+            // already, and forgotten. Re-checked under the lock, as born
+            // `a71d324` has it: a concurrent remap+unmap cycle must not lose
+            // a fresh placeholder from `held`.)
             let mut g = guards_at(block * BLOCK);
-            if g.held.remove(block) {
+            if g.held.contains(block) && uncommitted_end(block) <= block {
+                g.held.remove(block);
                 PUBLISHED.clear(block);
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| {
@@ -3742,8 +3745,15 @@ fn protect_alias(g: &mut Guards, shard: usize, block: usize) -> bool {
     if g.protected.contains(block) {
         return true;
     }
-    // (Nor a block found to hold memory of our own, [`Held`].)
-    if g.left_alone(block) || g.rests(block, rest()) || g.foreign.contains(&block) {
+    // (Nor a block found to hold memory of our own, [`Held`]; nor one at home
+    // the host has a heap on and must stay writable — born `73d7b69`: the
+    // kernel refused every submission once a page of such a heap was
+    // read-only, the device lost at the scene change after the intro.)
+    if g.left_alone(block)
+        || g.rests(block, rest())
+        || g.foreign.contains(&block)
+        || crate::inplace::home_stays_writable(block * BLOCK, BLOCK)
+    {
         return false;
     }
     // Ahead of the protection.
@@ -4729,7 +4739,15 @@ pub fn title_memory_freed(at: usize, len: usize) {
     let first = at / BLOCK;
     let noted = {
         let g = guards_at(first * BLOCK);
-        [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()]
+        // A block whose only note is an alias of another view counts too
+        // (born `ed8e4cc`): the invalidation of that view must not be skipped
+        // because nothing else was noted of it.
+        [
+            g.protected.range(first..).next(),
+            g.absent.range(first..).next(),
+            g.foreign.range(first..).next().copied(),
+            g.aliased.range(first..).next(),
+        ]
     };
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
@@ -4755,6 +4773,9 @@ pub fn title_memory_freed(at: usize, len: usize) {
         for block in foreign {
             g.foreign.remove(&block);
         }
+        // What the title opened for writing there is nothing of whatever
+        // comes next (born `ed8e4cc`).
+        forget_opened(&mut g, from..to);
     }
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
@@ -4779,6 +4800,21 @@ fn allocation_end(at: usize, inside: usize) -> usize {
         next = ask(to);
     }
     end
+}
+
+/// Drops what `g` noted opened in `range` (born `ed8e4cc`'s `forget_opened`).
+/// The caller holds the shard's lock, which is what guards ours' `opened`.
+fn forget_opened(g: &mut Guards, range: std::ops::Range<usize>) {
+    if g.opened.is_empty() {
+        return;
+    }
+    if range.end.saturating_sub(range.start) <= 64 {
+        for block in range {
+            g.opened.remove(&block);
+        }
+    } else {
+        g.opened.retain(|block, _| !range.contains(block));
+    }
 }
 
 /// Tells what keeps track of what title memory shows; the guards, with no
@@ -4808,6 +4844,8 @@ fn title_memory_changed(at: usize, len: usize) {
         for block in aliased {
             g.aliased.remove(block);
         }
+        // (Nor stays a block opened for writing there: born `ed8e4cc`.)
+        forget_opened(&mut g, from..to);
         g.unheated(from, to);
     }
 }
@@ -4964,6 +5002,15 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+/// Serializes tests that exercise the single process-global standing asking
+/// (`ask_once` / `ask_ahead` / `ask_rest` / `ask_once_end`), which the runtime
+/// drives from one submitting thread.
+#[cfg(test)]
+pub(crate) fn lock_standing_asking() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -5307,11 +5354,53 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Clears stale process-global watch notes left at an address the OS just
+    /// handed to a fresh test allocation.
+    fn forget_test_range(at: usize, len: usize) {
+        let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+        if len == 0 || first >= last {
+            return;
+        }
+        // Wait for any in-flight `Remapping` whose `UnmapViewOfFile` freed this
+        // address to drop and clear `g.changing` before we guard it.
+        let _changing = title_memory_remapping();
+        // (This tree's state is sharded, born's one `Guards`: one shard's lock
+        // at a time, its own blocks.)
+        for (shard, from, to) in segments(first, last) {
+            let mut g = Guards::lock(shard);
+            let blocks: Vec<usize> = g.protected.range(from..to).collect();
+            for block in blocks {
+                g.protected.remove(block);
+                g.clean.remove(block);
+                g.absent.remove(block);
+                g.held.remove(block);
+                g.aliased.remove(block);
+            }
+            for block in g.clean.range(from..to).chain(g.absent.range(from..to)).chain(g.held.range(from..to)).chain(g.aliased.range(from..to)).collect::<Vec<_>>() {
+                g.clean.remove(block);
+                g.absent.remove(block);
+                g.held.remove(block);
+                g.aliased.remove(block);
+            }
+            for block in g.foreign.range(from..to).copied().collect::<Vec<_>>() {
+                g.foreign.remove(&block);
+            }
+            forget_opened(&mut g, from..to);
+        }
+        for block in first..last {
+            PUBLISHED.clear(block);
+            PROTECTED.clear(block);
+            BESIDE.clear(block);
+        }
+        crate::inplace::views_gone(at, at.saturating_add(len));
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
         use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
         };
@@ -5326,9 +5415,12 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            CloseHandle(section);
+            view
         };
         assert_ne!(view, 0);
+        forget_test_range(view, 2 * BLOCK);
         assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
@@ -5389,6 +5481,7 @@ mod tests {
                     0
                 );
             }
+            forget_test_range(p, blocks * BLOCK);
             p
         }
     }
@@ -5442,6 +5535,7 @@ mod tests {
         };
         let at = view.Value as usize;
         assert_ne!(at, 0);
+        forget_test_range(at, 2 * BLOCK);
         let pages = |block: usize| at / PAGE + block..at / PAGE + block + 1;
         assert!(writes(at, at + 2 * BLOCK, true).is_some());
         assert!(published(at, at + 2 * BLOCK) || !light());
@@ -5680,6 +5774,7 @@ mod tests {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert_ne!(p, 0);
+        let _standing = lock_standing_asking();
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
         ask_ahead(&ranges);
@@ -5772,6 +5867,7 @@ mod tests {
             let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
             CloseHandle(section);
             assert!(!view.Value.is_null());
+            forget_test_range(view.Value as usize, SIZE);
             View(view)
         };
         let start = view.0.Value as usize;
@@ -5796,6 +5892,46 @@ mod tests {
             unsafe { (at as *mut u8).write_volatile(1) };
         }
         assert_eq!(refresh(), [early / PAGE, late / PAGE]);
+    }
+
+    /// Pages at home (under Wine the host may have a heap open on them) stay
+    /// writable when a range that begins in a hole the guards know reaches
+    /// into them, and are told as written at every asking.
+    #[test]
+    fn pages_at_home_are_never_made_read_only() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
+        // SAFETY: a fresh reservation of three blocks; the last two are
+        // committed, the first stays a hole.
+        let p = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(p, 0);
+            assert!(!VirtualAlloc((p + BLOCK) as *const _, 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            p
+        };
+        forget_test_range(p, 3 * BLOCK);
+        let protection = |block: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            assert_ne!(unsafe { VirtualQuery((p + block * BLOCK) as *const _, &mut info, size_of_val(&info)) }, 0);
+            info.Protect
+        };
+        // The hole alone: a view with its block absent, known from here on.
+        assert!(guard(p, p + BLOCK).is_some());
+        crate::inplace::title_memory_home(p + BLOCK, 2 * BLOCK, true);
+        let home = [p / BLOCK + 1, p / BLOCK + 2];
+        for _ in 0..2 {
+            let written = guard(p, p + 3 * BLOCK).expect("known for a view by its first block");
+            assert!(home.iter().all(|block| written.contains(block)), "{written:?}");
+            assert_eq!([protection(1), protection(2)], [PAGE_READWRITE; 2]);
+        }
+        assert!(!crate::inplace::home_stays_writable(p, BLOCK));
+        assert!(crate::inplace::home_stays_writable(p, BLOCK + 1));
+        crate::inplace::title_memory_home(p + BLOCK, 2 * BLOCK, false);
+        assert!(!crate::inplace::home_stays_writable(p, 3 * BLOCK));
+        forget_test_range(p, 3 * BLOCK);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A range of view memory whose first block is not mapped is a view
@@ -5831,6 +5967,7 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
+            forget_test_range(p, 3 * BLOCK);
             (p, section)
         };
         let map = |block: usize| {
@@ -5923,6 +6060,7 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
+            forget_test_range(p, 3 * BLOCK);
             (p, section)
         };
         let map = |block: usize| {
@@ -5998,6 +6136,8 @@ mod tests {
             let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
             assert_ne!(one, 0);
             assert_ne!(two, 0);
+            forget_test_range(one, bytes);
+            forget_test_range(two, bytes);
             crate::inplace::title_memory_view(one, bytes, section as usize, 0);
             crate::inplace::title_memory_view(two, bytes, section as usize, 0);
             (section as usize, one, two)
@@ -6009,14 +6149,19 @@ mod tests {
     fn drop_views(section: usize, views: &[usize], bytes: usize) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
-        for &view in views {
-            title_memory_remapped(view, bytes);
-            // SAFETY: a view of the section mapped by `two_views`.
-            unsafe {
-                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: view as *mut _,
-                })
-            };
+        {
+            let _changing = title_memory_remapping();
+            for &view in views {
+                title_memory_remapped(view, bytes);
+                // SAFETY: a view of the section mapped by `two_views`.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: view as *mut _,
+                    })
+                };
+            }
+            // Unregister before CloseHandle so a recycled handle in another test cannot be unmapped here.
+            crate::title_memory_section_gone(section);
         }
         // SAFETY: the section's last reference.
         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
@@ -6139,6 +6284,13 @@ mod tests {
     /// as written at each asking, at every view of it, until it has rested.
     #[test]
     fn a_block_just_written_rests() {
+        struct ResetRest;
+        impl Drop for ResetRest {
+            fn drop(&mut self) {
+                REST_IN_TEST.set(std::time::Duration::ZERO);
+            }
+        }
+        let _reset = ResetRest;
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         let rests = |rests: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if rests { 3600 } else { 0 }));
@@ -6206,7 +6358,6 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         drop_views(section, &[one, two], BLOCK);
-        crate::title_memory_section_gone(section);
     }
 
     /// Stores that fault, and copies, as the title makes them: what is there
@@ -6277,7 +6428,6 @@ mod tests {
         assert!(writable(one));
         crate::titlewrite::ON_IN_TEST.set(false);
         drop_views(section, &[one, two], SIZE);
-        crate::title_memory_section_gone(section);
     }
 
     /// Of a page taken before, what is taken again is the kernel's pages
@@ -6515,6 +6665,177 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    fn is_opened(block: usize) -> bool {
+        guards_at(block * BLOCK).opened.contains_key(&block)
+    }
+
+    /// Born's tests ask one `Guards` about a block; here that is the block's
+    /// shard's, read under its lock.
+    fn aliased_has(block: usize) -> bool {
+        guards_at(block * BLOCK).aliased.contains(block)
+    }
+
+    fn aliased_insert(block: usize) {
+        guards_at(block * BLOCK).aliased.insert(block);
+    }
+
+    fn put_beside_once(block: usize, byte: u8) {
+        let started = std::time::Instant::now();
+        loop {
+            // SAFETY: a byte of the view's first page.
+            let done = put_beside(block, 1, |delta| unsafe {
+                ((block * BLOCK + 100).wrapping_add(delta) as *mut u8).write(byte)
+            });
+            match done {
+                Beside::Done => return,
+                Beside::Full => put_count(block).store(0, std::sync::atomic::Ordering::Relaxed),
+                Beside::Cannot => {
+                    if started.elapsed() >= std::time::Duration::from_secs(30) {
+                        let reading = title_memory_reading_now();
+                        let beside = reading.as_ref().is_some_and(|_| crate::inplace::beside_page(block * BLOCK).is_some());
+                        panic!(
+                            "put_beside stayed Cannot for 30s (light={}, view_guard={}, protected={}, reading={}, beside={})",
+                            light(), view_guard(), PROTECTED.any(block, block + 1), reading.is_some(), beside
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    // FLAGGED (born merge): born's test of its own BESIDE/opened model, which
+    // this tree's guards-v2 replaced — our `BESIDE` is set by a put beside
+    // (`put_beside`, `opened_for_writing`) and taken by `guard`, and the
+    // remap/free path clears `opened` (`forget_opened`) but not `BESIDE`,
+    // whose stale bits only cost a re-guard, never a missed write. Passing it
+    // as written needs born's beside registry back; not guessed at in the
+    // merge. `put_beside` returns Cannot here for the same reason.
+    #[ignore = "born's BESIDE model, not ours (flagged in UPSTREAM.md, 2026-11-28 merge)"]
+    fn remapping_and_unmapping_clear_beside_and_opened_state() {
+        struct ResetRest;
+        impl Drop for ResetRest {
+            fn drop(&mut self) {
+                REST_IN_TEST.set(std::time::Duration::ZERO);
+            }
+        }
+        let _reset = ResetRest;
+
+        // Part A: BESIDE cleared by title_memory_remapped and title_memory_unmapping.
+        let (section, one, two) = two_views(BLOCK);
+        crate::title_memory_section(section, BLOCK as u64, true);
+        assert!(guard(one, one + BLOCK).is_some() && guard(two, two + BLOCK).is_some());
+        put_beside_once(one / BLOCK, 0x42);
+        assert!(BESIDE.any(one / BLOCK, one / BLOCK + 1) && BESIDE.any(two / BLOCK, two / BLOCK + 1));
+        title_memory_remapped(one, BLOCK);
+        assert!(!BESIDE.any(one / BLOCK, one / BLOCK + 1));
+        title_memory_unmapping(two, BLOCK);
+        assert!(!BESIDE.any(two / BLOCK, two / BLOCK + 1));
+        drop_views(section, &[one, two], BLOCK);
+
+        // Part B: g.opened cleared by title_memory_remapped and title_memory_unmapping.
+        let (section, one, two) = two_views(BLOCK);
+        REST_IN_TEST.set(std::time::Duration::from_secs(3600));
+        assert!(guard(one, one + BLOCK).is_some());
+        // SAFETY: guarded view, opened by the fault handler.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert!(is_opened(one / BLOCK));
+        title_memory_remapped(one, BLOCK);
+        assert!(!is_opened(one / BLOCK));
+        assert!(guard(one, one + BLOCK).is_some());
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()), "remapped block must not stay resting");
+
+        assert!(guard(two, two + BLOCK).is_some());
+        // SAFETY: guarded view, opened by the fault handler.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert!(is_opened(two / BLOCK));
+        title_memory_unmapping(two, BLOCK);
+        assert!(!is_opened(two / BLOCK));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    #[test]
+    // FLAGGED (born merge): as above — born's BESIDE model, ours in its place.
+    // What it checks of `opened` and of the alias invalidation does hold here:
+    // `forget_opened` on remap/free, `open_fault` clearing `aliased` and the
+    // other views' `PUBLISHED`.
+    #[ignore = "born's BESIDE model, not ours (flagged in UPSTREAM.md, 2026-11-28 merge)"]
+    fn freeing_memory_clears_beside_opened_and_aliased_state() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MapViewOfFile3, UnmapViewOfFile2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // Case 1: len != 0 on an opened-only block (not in protected/absent/foreign).
+        let (section, one, two) = two_views(BLOCK);
+        assert!(guard(one, one + BLOCK).is_some());
+        // SAFETY: guarded view, opened by the fault handler.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert!(is_opened(one / BLOCK));
+        title_memory_freed(one, BLOCK);
+        assert!(!is_opened(one / BLOCK));
+        drop_views(section, &[one, two], BLOCK);
+
+        // Case 2: len != 0 with BESIDE + g.aliased.
+        let (section, one, two) = two_views(BLOCK);
+        crate::title_memory_section(section, BLOCK as u64, true);
+        assert!(guard(one, one + BLOCK).is_some() && guard(two, two + BLOCK).is_some());
+        put_beside_once(one / BLOCK, 0x55);
+        assert!(BESIDE.any(one / BLOCK, one / BLOCK + 1) && aliased_has(one / BLOCK));
+        title_memory_freed(one, BLOCK);
+        assert!(!BESIDE.any(one / BLOCK, one / BLOCK + 1) && !aliased_has(one / BLOCK));
+        drop_views(section, &[one, two], BLOCK);
+
+        // Case 2b: freeing a live aliased view must still invalidate sibling views
+        // (when VirtualFree fails on a view, writes through `one` must be seen at `two`).
+        let (section, one, two) = two_views(BLOCK);
+        assert!(writes(one, one + BLOCK, true).is_some() && writes(two, two + BLOCK, true).is_some());
+        assert!(published(two, two + BLOCK) && aliased_has(one / BLOCK));
+        title_memory_freed(one, BLOCK);
+        assert!(!aliased_has(one / BLOCK) && writable(one));
+        assert!(!published(two, two + BLOCK), "sibling view must be invalidated when freed view opens");
+        // SAFETY: `one` stays mapped (as when VirtualFree fails on a view) and is now writable.
+        unsafe { ((one + 16) as *mut u8).write(0x77) };
+        assert_eq!(guard(two, two + BLOCK), Some(vec![two / PAGE]));
+        drop_views(section, &[one, two], BLOCK);
+
+        // Case 3: len == 0 (whole allocation via allocation_end) clears block 0 only.
+        let p = placeholder(2);
+        // SAFETY: replace placeholder block 0 with a 1-block view.
+        let view = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile3(
+                section, GetCurrentProcess(), p as *const _, 0, BLOCK,
+                MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0,
+            );
+            CloseHandle(section);
+            view
+        };
+        assert_eq!(view.Value as usize, p);
+        assert!(guard(p, p + BLOCK).is_some());
+        // SAFETY: guarded view, opened by the fault handler.
+        unsafe { ((p + 8) as *mut u8).write(1) };
+        BESIDE.set(p / BLOCK);
+        aliased_insert(p / BLOCK);
+        BESIDE.set((p + BLOCK) / BLOCK);
+        title_memory_freed(p, 0);
+        assert!(!BESIDE.any(p / BLOCK, p / BLOCK + 1) && !aliased_has(p / BLOCK) && !is_opened(p / BLOCK));
+        assert!(BESIDE.any((p + BLOCK) / BLOCK, (p + BLOCK) / BLOCK + 1), "adjacent allocation must not be cleared");
+        BESIDE.clear((p + BLOCK) / BLOCK);
+        title_memory_freed(p + BLOCK, BLOCK);
+        // SAFETY: our view and placeholders.
+        unsafe {
+            assert_ne!(UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER), 0);
+            for block in 0..2 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
     }
 }
 

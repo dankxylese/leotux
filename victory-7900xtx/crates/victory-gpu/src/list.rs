@@ -289,6 +289,30 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+#[cfg(windows)]
+fn pool_on_create() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LIST_CREATE_POOL") { return on; }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let reuse = std::env::var_os("VICTORY_LIST_CREATE_POOL").is_none_or(|v| v != "0");
+        tracing::info!(reuse, "host list reuse at construction");
+        reuse
+    })
+}
+
+#[cfg(windows)]
+#[track_caller]
+fn new_host_list() -> Option<crate::host::HostList> {
+    match crate::host::host()?.new_list() {
+        Ok(list) => Some(list),
+        Err(e) => {
+            tracing::warn!(error = %e, "no host command list");
+            None
+        }
+    }
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -303,7 +327,7 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => new_host_list(),
     }
 }
 
@@ -647,13 +671,10 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        // Thin replay materialization also creates this box. Taking a list
+        // already reset after GPU completion preserves its private budget
+        // and allocators instead of bypassing the idle pool every replay.
+        host: if thin { None } else if pool_on_create() { fresh_list() } else { new_host_list() },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -2594,6 +2615,44 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a D3D12 device"]
+    fn a_completed_host_list_can_be_reused_at_replay_construction() {
+        use windows::core::Interface;
+
+        assert!(pools());
+        let host = crate::host::host().expect("a D3D12 device");
+        let finished = host.new_list().expect("a host list");
+        let identity = Interface::as_raw(&*finished.list);
+        finished.close();
+        host.execute(&[&finished]);
+        // SAFETY: the host device is live, and the submission has completed.
+        unsafe { host.device.GetDeviceRemovedReason() }.expect("the device is healthy");
+        recycle(
+            vec![Detached {
+                host: finished,
+                _uploads: Vec::new(),
+                _state: crate::draw::State::default(),
+            }],
+            &[0],
+        );
+        assert_eq!(IDLE.lock().unwrap().0.len(), 1);
+        let thin = boxed(0, std::ptr::null(), true);
+        assert!(thin.host.is_none());
+        assert_eq!(IDLE.lock().unwrap().0.len(), 1);
+
+        let ready = boxed(0, std::ptr::null(), false);
+        let list = ready.host.as_ref().expect("an open host list");
+        let reused = std::env::var_os("VICTORY_LIST_CREATE_POOL").is_none_or(|v| v != "0");
+        assert_eq!(Interface::as_raw(&*list.list) == identity, reused);
+        assert_eq!(IDLE.lock().unwrap().0.len(), usize::from(!reused));
+        list.close();
+        host.execute(&[list]);
+        // SAFETY: as above. The second submission uses the materialized list.
+        unsafe { host.device.GetDeviceRemovedReason() }.expect("the device is healthy");
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the
