@@ -60,16 +60,14 @@ covers only Wine's builtin. dxil.dll unneeded at runtime (vkd3d carries dxil-spi
 - Vice-Tay's Linux change = the rbtree wineserver: WE ALREADY HAVE IT (nothing to pull).
 - Banding lead (when we hit it): pipeline library x RTV-format mismatch, VICTORY_RTV_FORMAT_LOG=1 to check.
 
-## Mirror sweep yield (pr-mirror-sweep.md, 305 PR heads; sequence AFTER the born merge — same files)
+## Mirror sweep yield (pr-mirror-sweep.md, 305 PR heads; M1-M4+M7 merged 2026-11-28)
 
-- [ ] M1. #475 PAGEMAP_SCAN from the runtime (kernel write-watch asks past Wine's VM lock, ~20 ms/GB walk avoided; new wine.rs+pagemap.rs; take #475's wine.rs only, #129/#166 create it differently).
-- [ ] M2. #469 translator v2 (17 commits: helper-lane readfirstlane, g16 gradients, annotateHandle AMD crash fix, decode fixes; rebase translator version onto ours, one bump with the fxceless/born line).
-- [ ] M3. #405 SCALAR_SPLITS to every widen caller + divergent-branch scalars + RDNA2 fuzz oracle harness.
-- [ ] M4. #338 built-in shaders' root signatures serialized (vkd3d E_FAIL insurance; rootstring.rs; touches our ambient.rs).
+- [x] M1-M4, M7 merged: PAGEMAP_SCAN (VICTORY_LINUX_SCAN default on under Wine), translator v2 + SCALAR_SPLITS + RDNA2 oracle (translator 0x4c00_0006), rootstring (fallback-only), #334/#81/#410/#476 (VICTORY_PRESSURE_TRIM default on).
 - [ ] M5. #205 host RAM footprint (VM decommit + ram_trim.rs + trims; heavy rebase, land after #72; measure RSS on a matched run).
 - [ ] M6. #72 opt-in 90/85% LRU VRAM GC + upload pool + retry-on-evict (off by default).
-- [ ] M7. Cheap follow-ons: #334 (DXBC hashing), #81 (wave64 unknown block index), #410 (operandless VOP1 decode + invalidation), #476/#474 scratch chunks (take one — shared membench.rs).
-- Mirror otherwise confirmed redundant (305 heads swept; the 167 remainder are Windows-side D3D12-layer work vkd3d replaces for us; 13 shader decode hardenings catalogued as a batch if a decode-side crash appears).
+- [ ] #405's dropped one-line VICTORY_SCALAR_SPLITS entry in victory-gpu/src/shader_cache.rs (cache-key hygiene if the switch is toggled without a rebuild; not needed after the 0x4c00_0006 bump).
+- [ ] #338 follow-up: the other built-in signatures still lift theirs from the blob (indirect.rs's other 9 ladders, tiles.rs, resource.rs, host/rtbench.rs, indirect/bench.rs, descriptor/host.rs) — convert if vkd3d E_FAILs ever show there.
+- Regression (born merge, run36): guard-mutex serialization amplification; land_before_remap=0 fixed (launcher default). Guards-v3 (sharded default) is the structural fix, in flight.
 
 ## Perf levers from our own telemetry (perf-levers.md 2026-11-27; prologue ~75-100 ms/frame, GPU ~0-10 ms)
 
