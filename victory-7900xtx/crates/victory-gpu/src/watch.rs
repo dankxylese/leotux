@@ -370,16 +370,26 @@ pub(crate) fn lock_waits(frames: f64) -> String {
             format!("{shard}: {:.2} ms/{}", ns as f64 / 1e6 / frames, n as f64 / frames)
         })
         .collect();
+    let [off, off_blocks] = std::array::from_fn(|i| OFF_LOCK[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     format!(
-        "ranges held {}, journal read {}, journal noted in {}, guards {}; guards by shard (blocked ms and waits per frame) [{}]: {}",
+        "ranges held {}, journal read {}, journal noted in {}, guards {}; guards by shard (blocked ms and waits per frame) [{}]: {}; \
+         {:.0} protections with no shard's lock held ({:.0} blocks, VICTORY_PROTECT_OFFLOCK)",
         of(0),
         of(1),
         of(2),
         of(3),
         if sharded() { "8 shards" } else { "1" },
-        shards.join(", ")
+        shards.join(", "),
+        off as f64 / frames,
+        off_blocks as f64 / frames
     )
 }
+
+/// Since the last line, the protections asked of Windows with no shard's lock
+/// held (`VICTORY_PROTECT_OFFLOCK`, [`apply_runs`]) and the blocks they were
+/// for: the calls the shards' blocked time above is spent no more on.
+#[cfg(feature = "diagnostics")]
+static OFF_LOCK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The page ranges some thread is asking about: asking forgets what it
 /// answers, so until the answer is in the journal no other thread may ask
@@ -2545,7 +2555,10 @@ thread_local! {
 }
 
 struct Guards {
-    /// Blocks we made read-only.
+    /// Blocks we made read-only — or, with `VICTORY_PROTECT_OFFLOCK`, are
+    /// making so: one of those is in `protecting` until the call is made and
+    /// its answer noted, and is writable until then (a write that comes at it
+    /// is the fault handler's, [`open_fault`]).
     protected: Blocks,
     /// Of those, the ones not written since a copy took them.
     clean: Blocks,
@@ -2568,6 +2581,14 @@ struct Guards {
     /// one opens them all. (A write's range can be huge, `fread`'s, so only
     /// these are looked up.)
     aliased: Blocks,
+    /// Blocks whose protection is being asked of Windows with the lock given
+    /// back (`VICTORY_PROTECT_OFFLOCK`, [`apply_runs`]), and the claim of the
+    /// asking that is asking for it: no other asking protects them or notes
+    /// them clean meanwhile. A claim is its holder's to give up (at the one
+    /// lock it takes after the call), so one left behind by a path that did
+    /// not finish would only cost the block its protection — it would be told
+    /// written at each asking, never noted clean — and never a write.
+    protecting: std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<PageHash>>,
     /// Blocks opened by a write fault, and when ([`rest`]).
     opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
     /// Blocks whose write faults follow one another ([`hot_frames`]).
@@ -2588,6 +2609,7 @@ impl Guards {
             kernel: Vec::new(),
             changing: Vec::new(),
             aliased: Blocks::new(),
+            protecting: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             heat: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             hot_blocks: 0,
@@ -3956,14 +3978,18 @@ fn set_read_only(from: usize, to: usize) -> bool {
 /// at again.
 ///
 /// The questions are asked with no lock held ([`survey`], which changes
-/// nothing); the answer is noted, and Windows asked, under the shard's lock.
-/// The cover of a block whose page is shown elsewhere takes that page's views,
-/// which are other shards', so it is a step of its own ([`ViewsStep`]) after
-/// this shard's lock is given back — but a block is not noted clean before it,
-/// so nothing is seen half done: a block read-only and taken for clean while
-/// another view of its page is writable is a write lost, and one read-only and
-/// taken for nothing of ours is a fault nobody takes. One call for each run of
-/// blocks one view holds, where there was one for each block.
+/// nothing); the plan is made under the shard's lock, and with
+/// `VICTORY_PROTECT_OFFLOCK` (the default) the protection of a block no other
+/// view of its page shares is asked for **after the lock is given back**, at
+/// the one lock the call's answer is noted under — a `VirtualProtect` under
+/// Wine is a server round trip of 20 to 50 µs, and a frame of the prologue
+/// guarded 361 blocks in 254 calls, 17.6 ms of the shard's lock held while
+/// every other asking of that shard stood in line. The blocks whose page is
+/// shown elsewhere keep the protection under the lock: their other views are
+/// taken with them ([`cover_here`], in one [`ViewsStep`]), and the window in
+/// which one view is read-only and another still writable is the ViewsStep's
+/// to keep small — this is not the place to widen it. `=0` asks Windows under
+/// the lock for every run, as before.
 fn apply_runs(shard: usize, runs: &[(usize, usize)], covers: &[(usize, usize)]) {
     if runs.is_empty() && covers.is_empty() {
         return;
@@ -3973,6 +3999,11 @@ fn apply_runs(shard: usize, runs: &[(usize, usize)], covers: &[(usize, usize)]) 
         crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
     }
     let surveyed: Vec<Surveyed> = runs.iter().map(|&(from, to)| survey(from, to)).collect();
+    let off_lock = protect_off_lock();
+    let claim = next_claim();
+    // Blocks whose protection is asked of Windows with the lock given back,
+    // and that are noted clean once it is back, run by run.
+    let mut plan: Vec<(usize, usize)> = Vec::new();
     // Blocks of this shard's that are read-only by our hand but not noted
     // clean here: their page is shown at other addresses, and its other views
     // are not read-only yet — taken with them below, in one step
@@ -4001,22 +4032,60 @@ fn apply_runs(shard: usize, runs: &[(usize, usize)], covers: &[(usize, usize)]) 
                 }
             }
             for &(from, to) in &said.view {
-                // Ahead of the protection (`PROTECTED`), as it was before: a
-                // fault that comes once the page is read-only waits for this
-                // shard's lock, and finds the block noted.
-                for block in from..to {
-                    PROTECTED.set(block);
+                if !off_lock {
+                    protect_here(&mut g, from, to, &mut viewed);
+                    continue;
                 }
-                if set_read_only(from, to) {
-                    // (After the call, not before: a store of the title's that
-                    // lands while Windows is asked — the page writable until
-                    // the last moment of it — would be taken for clean
-                    // otherwise.)
-                    g.protected.insert_all(from..to);
-                    seen_elsewhere(&mut g, from, to, &mut viewed);
-                } else {
-                    for block in from..to {
-                        PROTECTED.clear(block);
+                // The sub-runs of this run: the blocks whose page the title
+                // shows at no other address — theirs is the protection no
+                // other view has to wait for, and it is asked of Windows
+                // with the lock given back — the blocks a page is shown
+                // elsewhere by, and those another asking has guarded,
+                // claimed or noted clean since this plan was made (left to
+                // it, and told written by this one all the same).
+                let mut shown = elsewhere(from * BLOCK, (to - from) * BLOCK).into_iter().peekable();
+                let mut pieces: Vec<(usize, usize, u8)> = Vec::new();
+                for block in from..to {
+                    while shown.peek().is_some_and(|(page, _)| page / BLOCK < block) {
+                        shown.next();
+                    }
+                    let aliased = shown.peek().is_some_and(|(page, _)| page / BLOCK == block);
+                    let theirs = !aliased
+                        && (g.protecting.contains_key(&block)
+                            || g.protected.contains(block)
+                            || g.clean.contains(block));
+                    let class = if aliased {
+                        2
+                    } else if theirs {
+                        0
+                    } else {
+                        1
+                    };
+                    match pieces.last_mut() {
+                        Some((_, last, same)) if *last == block && *same == class => *last = block + 1,
+                        _ => pieces.push((block, block + 1, class)),
+                    }
+                }
+                for (from, to, class) in pieces {
+                    match class {
+                        // (Its page is shown elsewhere: as it was.)
+                        2 => protect_here(&mut g, from, to, &mut viewed),
+                        1 => {
+                            // The guards' from now on — noted in `protected`
+                            // before Windows is asked, so that a write that
+                            // comes at one of them while the lock is not held
+                            // is the fault handler's to open, as it was when
+                            // the lock was — and claimed, so that no other
+                            // asking protects them or notes them clean until
+                            // this one has (`seen_elsewhere`).
+                            for block in from..to {
+                                PROTECTED.set(block);
+                                g.protecting.insert(block, claim);
+                            }
+                            g.protected.insert_all(from..to);
+                            plan.push((from, to));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -4028,7 +4097,119 @@ fn apply_runs(shard: usize, runs: &[(usize, usize)], covers: &[(usize, usize)]) 
             seen_elsewhere(&mut g, from, to, &mut viewed);
         }
     }
+    // Windows is asked here, with no shard's lock held: each of these calls is
+    // what the lock was held across before ([`protect_off_lock`]).
+    if !plan.is_empty() {
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            OFF_LOCK[0].fetch_add(plan.len() as u64, Relaxed);
+            OFF_LOCK[1].fetch_add(plan.iter().map(|&(from, to)| (to - from) as u64).sum::<u64>(), Relaxed);
+        }
+        let mut applied: Vec<bool> = Vec::with_capacity(plan.len());
+        for &(from, to) in &plan {
+            // (Still the guards' when the call is made: every path that gives
+            // write access back takes a block out of `PROTECTED` under this
+            // lock, so one of them that has been opened since the claim is
+            // not asked for — and is given back below rather than noted.)
+            applied.push(PROTECTED.all(from, to) && set_read_only(from, to));
+        }
+        let mut g = Guards::lock(shard);
+        let mut back: Vec<usize> = Vec::new();
+        for (i, &(from, to)) in plan.iter().enumerate() {
+            for block in from..to {
+                g.protecting.remove(&block);
+                if applied[i] && g.protected.contains(block) {
+                    // (Still the guards', and read-only by the call above:
+                    // nothing has opened it since — every open of a block
+                    // takes it out of `protected` under this lock before the
+                    // write access is back.)
+                    g.clean.insert(block);
+                } else {
+                    // Opened, or taken away, meanwhile; or Windows would not
+                    // make it read-only: nothing is noted, and the write
+                    // access this asking took is given back below. (The next
+                    // asking guards it again: a block opened and not yet told
+                    // does not rest.)
+                    g.protected.remove(block);
+                    g.clean.remove(block);
+                    if applied[i] {
+                        back.push(block);
+                    } else {
+                        PROTECTED.clear(block);
+                    }
+                }
+            }
+        }
+        if !back.is_empty() {
+            back.sort_unstable();
+            back.dedup();
+            // ([`make_writable`] counts its own time, which the asks line
+            // prints as changing protections; the shard's lock is held, as
+            // for every other give-back of its blocks.)
+            make_writable(&back);
+        }
+    }
     cover_here(shard, &viewed);
+}
+
+/// Makes `[from, to)` read-only and notes it, with the shard's lock held:
+/// the path of every protection before `VICTORY_PROTECT_OFFLOCK` (`=0`), and
+/// of a block whose page the title shows elsewhere, whose other views are
+/// taken with it by [`cover_here`] once the lock is given back.
+fn protect_here(g: &mut Guards, from: usize, to: usize, viewed: &mut Vec<usize>) {
+    // Ahead of the protection (`PROTECTED`), as it was before: a fault that
+    // comes once the page is read-only waits for this shard's lock, and finds
+    // the block noted.
+    for block in from..to {
+        PROTECTED.set(block);
+    }
+    if set_read_only(from, to) {
+        // (After the call, not before: a store of the title's that lands
+        // while Windows is asked — the page writable until the last moment of
+        // it — would be taken for clean otherwise.)
+        g.protected.insert_all(from..to);
+        seen_elsewhere(g, from, to, viewed);
+    } else {
+        for block in from..to {
+            PROTECTED.clear(block);
+        }
+    }
+}
+
+/// Whether a run no other view of whose page shares is made read-only with
+/// the shard's lock given back (`VICTORY_PROTECT_OFFLOCK`; `=0`: every
+/// protection under the lock, as it was before it).
+///
+/// A `VirtualProtect` under Wine is a server round trip, some 20 to 50 µs, and
+/// the guards make 254 of them for a frame of the prologue (361 blocks of
+/// 5,776 pages), 17.6 ms of the frame with the shard's lock held — while every
+/// other asking of the same shard waited for it (the per-shard line of
+/// [`lock_waits`] prints the blocked time, and is where this shows).
+///
+/// What the lock is for is the decision, not the call: which blocks are to be
+/// made read-only (and which of them by way of another view of their page),
+/// and which may be noted clean. The call changes nothing of that state, so
+/// it is made with no lock held, and the blocks are noted clean at the next
+/// one only if nothing has opened them since — every path that gives write
+/// access back takes a block out of `PROTECTED` and `protected` under the
+/// shard's lock, and the claim (`Guards::protecting`) keeps every other asking
+/// off them until that note is made. A block whose page is shown elsewhere
+/// keeps its protection under the lock: the ViewsStep that covers its other
+/// views ([`cover_here`]) is what keeps a write through one of them from
+/// landing between the two halves, and moving the protection out of the lock
+/// would widen the window between this view's protection and its cover.
+fn protect_off_lock() -> bool {
+    crate::toggled!("VICTORY_PROTECT_OFFLOCK")
+}
+
+/// The number of the next claim of blocks whose protection is asked with no
+/// lock held ([`Guards::protecting`]).
+static CLAIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// See [`CLAIMS`].
+fn next_claim() -> u64 {
+    CLAIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Of this shard's blocks `[from, to)`, those read-only by our hand: the ones
@@ -4043,11 +4224,15 @@ fn apply_runs(shard: usize, runs: &[(usize, usize)], covers: &[(usize, usize)]) 
 /// ahead of — so that a view of the page mapped meanwhile is seen by one of
 /// the two ([`views_mapped`] looks for `PROTECTED` on the views it is told of
 /// after the census has them; this looks at the census after `PROTECTED`).
-/// `[from, to)` in address order, within this shard.
+/// A block another asking is applying the protection of with no lock held is
+/// left to it (`Guards::protecting`, [`apply_runs`]): its page is writable
+/// until that asking's call is made, so noting it clean here would be noting
+/// it clean before it is read-only. `[from, to)` in address order, within this
+/// shard.
 fn seen_elsewhere(g: &mut Guards, from: usize, to: usize, viewed: &mut Vec<usize>) {
     let mut shown = elsewhere(from * BLOCK, (to - from) * BLOCK).into_iter().peekable();
     for block in from..to {
-        if !g.protected.contains(block) {
+        if !g.protected.contains(block) || g.protecting.contains_key(&block) {
             continue;
         }
         // (Both in address order: a page shown elsewhere is passed as the
@@ -4137,6 +4322,14 @@ fn protect_alias(block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let mut g = Guards::lock(shard_of(block));
     alias_noted(&mut g, block);
+    // (A block whose protection is being asked with no lock held
+    // ([`apply_runs`], `VICTORY_PROTECT_OFFLOCK`) is no view of a page shown
+    // elsewhere — a page shown at more than one address is protected under the
+    // lock — and were the census to have given it one since, it is writable
+    // until that asking's call is made: not covered.)
+    if g.protecting.contains_key(&block) {
+        return false;
+    }
     if g.protected.contains(block) {
         return true;
     }
@@ -5415,6 +5608,28 @@ pub(crate) fn install() {
                     crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);
                     crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
                 }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        // (A protection taken with the shard's lock given back
+        // (`VICTORY_PROTECT_OFFLOCK`, [`apply_runs`]) that a write has come at
+        // in the moment between its call and the note that makes the block the
+        // guards' — or one that an open of the block, made while that call was
+        // under way, has taken back since: `PROTECTED` has it and no shard's
+        // state does, so nothing of the loops above could open it. Its write
+        // access is given back here and it is told written, as that open would
+        // have; the next asking guards it again. (Without this, the store
+        // below would fault on a page read-only by our hand and noted by
+        // nothing, which nobody takes.)
+        if protect_off_lock() && ours.is_none() && PROTECTED.any(block, block + 1) && !writable(at) {
+            let mut g = guards_at(at);
+            if !g.protected.contains(block) {
+                g.clean.remove(block);
+                PUBLISHED.clear(block);
+                PROTECTED.clear(block);
+                make_writable(&[block]);
+                #[cfg(feature = "diagnostics")]
+                crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
@@ -7763,6 +7978,23 @@ mod many_askers_tests {
             assert!(!super::published(at, end), "{i}");
             assert!(super::published(at + PAGE, end), "{i}: the other block");
         }
+        // (The protection is asked of Windows with the shard's lock given back
+        // — `VICTORY_PROTECT_OFFLOCK`, the default — and the block noted clean
+        // at the next one: clean is read-only, and nothing is left claimed.
+        // A block left open for a fault of its own — hot, or resting — is
+        // neither, and is as it was.)
+        writes(at, end, true).expect("a view");
+        let block = at / PAGE;
+        let g = super::Guards::lock(super::shard_of(block));
+        assert!(!g.protecting.contains_key(&block), "a claim left behind");
+        if g.clean.contains(block) {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            assert_eq!(info.Protect, PAGE_READONLY, "clean, though the lock was given back before the call");
+        }
+        drop(g);
         super::title_memory_unmapping(at, 2 * PAGE);
     }
 
