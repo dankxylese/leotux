@@ -5250,58 +5250,213 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
+/// The null descriptors a slot can get, one kind for each thing the title's
+/// views are: a descriptor made once, copied into a slot instead of made
+/// again for it ([`null_at`], `VICTORY_NULL_TEMPLATES`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Null {
+    /// A constant buffer view of no memory.
+    Cbv,
+    /// A buffer view that reads zeros.
+    Buffer,
+    /// A 2D texture view that reads zeros: what a slot with no view at all
+    /// gets.
+    Srv2d,
+    /// A texture view that reads zeros with the dimension `words[1]`
+    /// (2..=10), as the title's description names it.
+    Srv(u32),
+    /// An unordered access view of a buffer.
+    UavBuffer,
+    /// An unordered access view of a texture of the title's dimension
+    /// (`D3D12_UAV_DIMENSION`: 0..=4, 2D for anything else).
+    Uav(u32),
+}
+
+impl Null {
+    /// How many kinds there are: a slot of the template heap each.
+    const KINDS: usize = 18;
+
+    /// The template slot of this kind.
+    fn index(self) -> usize {
+        match self {
+            Null::Cbv => 0,
+            Null::Buffer => 1,
+            Null::Srv2d => 2,
+            Null::Uav(d) => 3 + d.min(4) as usize,
+            Null::UavBuffer => 8,
+            Null::Srv(d) => 9 + d.saturating_sub(2).min(8) as usize,
+        }
+    }
+
+    /// A texture view of the title's dimension `dimension`, 2D if that is
+    /// no texture's (the title's zero description, or a stub).
+    fn srv(dimension: u32) -> Null {
+        if (2..=10).contains(&dimension) { Null::Srv(dimension) } else { Null::Srv2d }
+    }
+
+    /// An unordered access view of the title's dimension, 2D if that is no
+    /// dimension the desc can name.
+    fn uav(dimension: Option<u32>) -> Null {
+        match dimension {
+            Some(d @ 0..=4) => Null::Uav(d),
+            _ => Null::Uav(D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32),
+        }
+    }
+}
+
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    null_at(null_kind(view), at);
+}
+
+/// What [`null_for`] makes of `view`: the kind of null descriptor it is
+/// (made from the view alone, so that it can be one already made).
+fn null_kind(view: &View) -> Null {
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
     // Unordered views: whether a buffer, and the title's view dimension.
     let (buffer, dimension) = match view {
-        View::Unordered(r, _, desc) => (
-            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-            desc.map(|d| d[1]),
-        ),
+        View::Unordered(r, _, desc) => (is_buffer(r) || desc.is_some_and(|d| d[1] == 1), desc.map(|d| d[1])),
         View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
         // reports it).
-        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
-            return null_buffer_view(at);
-        }
-        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => return Null::Buffer,
+        View::Placed(false, resource, _) if resource[0] == 1 => return Null::Buffer,
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
-        View::Placed(false, _, desc) => {
-            return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
-        }
-        View::Constant(..) => {
+        View::Shader(_, Some(desc)) => return Null::srv(desc[1]),
+        View::Placed(false, _, desc) => return Null::srv(desc.get(1).copied().unwrap_or(0)),
+        View::Constant(..) => return Null::Cbv,
+        _ => return Null::Srv2d,
+    };
+    if buffer { Null::UavBuffer } else { Null::uav(dimension) }
+}
+
+/// Writes the null descriptor of `kind` at `at`: a template made once and
+/// copied, where there is one, and one made for the slot where there is not.
+///
+/// A template is a `CopyDescriptorsSimple` and no `Create*View`: the title
+/// writes null views by the thousand a frame (a slot it has no view for, a
+/// texture that is away, a table it clears), and under Wine each of those
+/// calls into the runtime's descriptor code for a descriptor that is always
+/// the same 32 bytes.
+fn null_at(kind: Null, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if crate::toggled!("VICTORY_NULL_TEMPLATES")
+        && let Some(source) = null_template(kind)
+    {
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap, and one of the templates' own heap
+        // (both CBV/SRV/UAV descriptors of this device).
+        unsafe {
+            host.device
+                .CopyDescriptorsSimple(1, at, source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        return;
+    }
+    null_make(kind, at);
+}
+
+/// A heap of one null descriptor for each [`Null`] kind, made on first use
+/// (CPU only: the card never sees it).
+fn null_template(kind: Null) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    struct Templates {
+        _heap: ID3D12DescriptorHeap,
+        base: usize,
+        step: usize,
+    }
+    static TEMPLATES: std::sync::OnceLock<Option<Templates>> = std::sync::OnceLock::new();
+    // (The device is made once for the process, as the templates are.)
+    let templates = TEMPLATES
+        .get_or_init(|| {
+            let host = host()?;
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: Null::KINDS as u32,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            };
+            // SAFETY: plain CPU-only descriptor heap creation.
+            let heap: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&desc).ok()? };
+            // SAFETY: a live heap's start, asked of it.
+            let base = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
+            // SAFETY: a plain device query.
+            let step = unsafe {
+                host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize
+            };
+            let at = |kind: Null| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + kind.index() * step };
+            let kinds = [
+                Null::Cbv,
+                Null::Buffer,
+                Null::Srv2d,
+                Null::UavBuffer,
+                Null::Uav(0),
+                Null::Uav(1),
+                Null::Uav(2),
+                Null::Uav(3),
+                Null::Uav(4),
+            ]
+            .into_iter()
+            .chain((2..=10).map(Null::Srv));
+            for kind in kinds {
+                // (The kinds themselves, as a slot gets them: one definition
+                // of each null descriptor.)
+                null_make(kind, at(kind));
+            }
+            Some(Templates { _heap: heap, base, step })
+        })
+        .as_ref()?;
+    Some(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: templates.base + kind.index() * templates.step })
+}
+
+/// Makes the null descriptor of `kind` at `at`, on the device.
+fn null_make(kind: Null, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    match kind {
+        Null::Cbv => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
-        _ => return null_view(at),
-    };
-    let desc = if buffer {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
+        Null::Buffer => null_buffer_at(at),
+        Null::Srv2d => null_srv_at(at),
+        Null::Srv(dimension) => {
+            let mut words = [0u32; 10];
+            words[1] = dimension;
+            null_like(&words, at);
         }
-    } else {
-        null_uav_desc(dimension)
-    };
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            None::<&ID3D12Resource>,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
+        Null::UavBuffer => {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                ..Default::default()
+            };
+            // SAFETY: a slot of our heap; a null resource is allowed with a
+            // desc.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    at,
+                )
+            };
+        }
+        Null::Uav(dimension) => {
+            let desc = null_uav_desc(Some(dimension));
+            // SAFETY: as above.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    at,
+                )
+            };
+        }
+    }
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -5344,9 +5499,15 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// See [`null_at`]: a buffer view that reads zeros (raw, as translated
+/// shaders mostly read buffers).
+fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    null_at(Null::Buffer, at);
+}
+
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
-fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+fn null_buffer_at(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
@@ -5372,7 +5533,7 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
     if !TEXTURES.contains(&words[1]) {
-        return null_view(at);
+        return null_srv_at(at);
     }
     let Some(host) = host() else { return };
     // One mip, one slice or cube, plane 0: fields a null view still checks.
@@ -5394,11 +5555,17 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
-/// A view that reads zeros, for slots whose view the host cannot make.
+/// See [`null_at`]: a view that reads zeros, for slots whose view the host
+/// cannot make.
 /// shortcut: slots with no view at all (kind unknown) get this null 2D
 /// view; null buffer views there did not stop the world's low-address
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    null_at(Null::Srv2d, at);
+}
+
+/// A view that reads zeros, for slots whose view the host cannot make.
+fn null_srv_at(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,

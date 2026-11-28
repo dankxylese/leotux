@@ -3803,42 +3803,108 @@ fn unguard_blocks(blocks: &[usize]) {
     more(4, blocks.len() as u64);
 }
 
-/// Gives write access back to `blocks`, guarded ones: one `VirtualProtect`
-/// for each, as it was before the state was sharded, and no question to
-/// Windows about what is there.
+/// Whether the un-guard asks Windows for a run of blocks that follow one
+/// another in one call, as the guard does ([`set_read_only`])
+/// (`VICTORY_OPEN_RUNS=0`: one call a block, as it was before).
 ///
-/// (One run of blocks in one call read better, and cost a `VirtualQuery` for
-/// every block whose range was not one committed view — every hole, and every
-/// placeholder under Wine, which is most of what a `fread` opens. That is a
-/// server round trip each, on the title's own faulting threads, and run25
-/// paid it 200–1,100 times a frame without a counter of the file noticing:
-/// hence the [`tally`], which the asks line prints as "changing protections"
-/// beside the calls that make blocks read-only.)
+/// A run of guarded blocks is one protection: ours. The call is made, and
+/// the protection Windows reports for the run (its first block's) is what
+/// tells whether that is so — and where it is not, the run is put back as it
+/// was and asked for a block at a time, so a hole, a placeholder or a page
+/// the runtime took keeps its own protection as before.
+fn open_runs() -> bool {
+    crate::toggled!("VICTORY_OPEN_RUNS")
+}
+
+/// Gives write access back to `blocks`, guarded ones: no question to Windows
+/// about what is there, and one `VirtualProtect` for each run of blocks that
+/// follow one another ([`open_runs`]), as for the guard.
+///
+/// (One run of blocks in one call was tried before and read better, but it
+/// cost a `VirtualQuery` for every block whose range was not one committed
+/// view — every hole, and every placeholder under Wine, which is most of what
+/// a `fread` opens. That is a server round trip each, on the title's own
+/// faulting threads, and run25 paid it 200–1,100 times a frame without a
+/// counter of the file noticing: hence the [`tally`], which the asks line
+/// prints as "changing protections" beside the calls that make blocks
+/// read-only. This one asks nothing: a run of blocks we guard is read-only
+/// by our hand, and the call says so where it is, and is put back and asked
+/// for a block at a time where it is not.)
 ///
 /// Called with the shard's lock held, as the protection of a block we guard
 /// is; `blocks` in order, no repeats.
 fn make_writable(blocks: &[usize]) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    if blocks.is_empty() {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    for &block in blocks {
-        let mut old = 0;
-        // SAFETY: blocks we made read-only; only their protection changes.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+    if !open_runs() {
+        for &block in blocks {
+            writable_one(block);
+        }
+    } else {
+        for (from, to) in runs_of(blocks) {
+            if !writable_run(from, to) {
+                // Not ours to give back as one (a block of the run is other
+                // memory's now, and the run was put back as it was): asked
+                // for a block at a time, as it was before.
+                for block in from..to {
+                    writable_one(block);
+                }
             }
         }
-        PROTECTED.clear(block);
     }
     #[cfg(feature = "diagnostics")]
-    if !blocks.is_empty() {
-        tally(8, started.elapsed().as_nanos() as u64);
+    tally(8, started.elapsed().as_nanos() as u64);
+}
+
+/// One block writable again: one `VirtualProtect`, as it was before the runs
+/// ([`make_writable`]).
+fn writable_one(block: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: blocks we made read-only; only their protection changes.
+    unsafe {
+        if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+            && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+        {
+            // Not what we left there: the address is other memory's
+            // (code's, say), which keeps its protection.
+            VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+        }
     }
+    PROTECTED.clear(block);
+}
+
+/// Blocks `[from, to)` writable in one call: whether Windows took them as
+/// one (and every block of them is noted writable if so).
+///
+/// The protection it reports is the run's first block's, and a run of blocks
+/// we guard is one protection: read-only by our hand, or writable where a
+/// write of ours through another view had it opened already. Anything else
+/// (code, a placeholder, memory the runtime gave another use) is not ours to
+/// give back, and the run is put back as it was for [`writable_one`] to ask
+/// for a block at a time.
+fn writable_run(from: usize, to: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let bytes = (to - from) * BLOCK;
+    let mut old = 0;
+    // SAFETY: blocks we made read-only; only their protection changes.
+    let ok = unsafe { VirtualProtect((from * BLOCK) as *const _, bytes, PAGE_READWRITE, &mut old) != 0 };
+    if !ok {
+        return false;
+    }
+    if matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+        for block in from..to {
+            PROTECTED.clear(block);
+        }
+        return true;
+    }
+    let mut back = old;
+    // SAFETY: as above; what it was, put back.
+    unsafe { VirtualProtect((from * BLOCK) as *const _, bytes, old, &mut back) };
+    false
 }
 
 /// Gives write access back to the guarded blocks of `[at, end)` and notes
@@ -5006,6 +5072,52 @@ mod shard_tests {
         assert_eq!(one, [(0, first, last)]);
         // Nothing of a range of no blocks.
         assert_eq!(segments_with(first, first, SHARDS).count(), 0);
+    }
+
+    /// A run of blocks made read-only by our hand is given back writable in
+    /// one call, and a run one block of which is writable already is taken as
+    /// one too (its protection is what we left there, as far as the call
+    /// says).
+    #[test]
+    fn a_run_is_given_back_writable_in_one_call() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: fresh pages, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let blocks: Vec<usize> = (0..3).map(|i| p / BLOCK + i).collect();
+        let protection = |block: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        // Two blocks, read-only by our hand: one call gives them back.
+        assert!(set_read_only(blocks[0], blocks[1] + 1));
+        assert_eq!((protection(blocks[0]), protection(blocks[1])), (PAGE_READONLY, PAGE_READONLY));
+        make_writable(&blocks[..2]);
+        assert_eq!((protection(blocks[0]), protection(blocks[1])), (PAGE_READWRITE, PAGE_READWRITE));
+        assert!(!PROTECTED.all(blocks[0], blocks[0] + 1), "not noted guarded");
+        assert!(!PROTECTED.all(blocks[1], blocks[1] + 1));
+        // A run that takes in a block that was writable already: the run is
+        // read-only by its first block, and every block of it is given back.
+        assert!(set_read_only(blocks[0], blocks[1] + 1));
+        make_writable(&blocks);
+        assert_eq!((protection(blocks[0]), protection(blocks[2])), (PAGE_READWRITE, PAGE_READWRITE));
+        // With the runs off, one call a block, as it was before.
+        assert!(set_read_only(blocks[0], blocks[1] + 1));
+        for block in &blocks[..2] {
+            writable_one(*block);
+        }
+        assert_eq!(protection(blocks[0]), PAGE_READWRITE);
+        // SAFETY: our own pages, as allocated above.
+        unsafe { VirtualFree(p as *mut _, 3 * PAGE, MEM_RELEASE) };
     }
 
     /// Blocks that follow one another are one ask of Windows.
