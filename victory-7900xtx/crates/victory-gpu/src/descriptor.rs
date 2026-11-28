@@ -1634,9 +1634,24 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Whether a placed view's descriptions lose the words the title may leave
+/// unwritten ([`placed_resource_words`], [`placed_view_words`]). On by
+/// default, as upstream; `VICTORY_SHAPE_PADDING_MASK=0` keeps every word of
+/// both descriptions, as before, so a title that fills the padding with
+/// something that differs per view makes a new shape each time (the leak
+/// this fixes: 34.9 million table entries, 16.7 GB, 20 -> 8-10 fps over a
+/// long session).
+fn shape_padding_mask() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHAPE_PADDING_MASK").is_none_or(|v| v != "0"))
+}
+
 /// Copy only the fields of a placed resource description. Padding can differ
 /// between two views of the same texture and the caller may leave it unwritten.
 fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if !shape_padding_mask() {
+        return words(desc);
+    }
     if desc.is_null() {
         return None;
     }
@@ -1663,6 +1678,9 @@ fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
 /// console's own fields) are kept; an unknown dimension keeps all.
 fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
     let mut d = words(desc)?;
+    if !shape_padding_mask() {
+        return Some(d);
+    }
     // Words of the union each dimension uses (D3D12_BUFFER_SRV and the like).
     let (start, used) = if unordered {
         // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
@@ -2143,6 +2161,45 @@ mod tests {
         assert_eq!(view(handle), Some(View::Placed(false, resource, tex)));
     }
 
+    /// Two placed views alike but for the words the title leaves unwritten
+    /// (the resource description's padding, the view's unused tail) are one
+    /// shape, and one number in the shape index keyed by the shape's hash;
+    /// a used word still makes another shape.
+    #[test]
+    fn placed_views_alike_but_for_padding_are_one_shape() {
+        let resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
+        // A 2D texture view: words 4-7 of the union are used, so 8 and 9 go.
+        let desc = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        let shape = |resource: &[u32; 14], desc: &[u32; 16]| {
+            let resource = placed_resource_words(resource).unwrap();
+            let desc = placed_view_words(desc, false).unwrap();
+            shape_of(false, &resource, &desc).0
+        };
+        let mut views = Views {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            by_resource: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            shapes: Vec::new(),
+            shape_index: std::collections::BTreeMap::new(),
+        };
+        let at = views.shape(shape(&resource, &desc)).unwrap();
+        // Words 1 and 13 of the resource description, 3 and 9 of the view.
+        let (mut noisy_resource, mut noisy_desc) = (resource, desc);
+        noisy_resource[1] = 0xaaaa_aaaa;
+        noisy_resource[13] = 0xbbbb_bbbb;
+        noisy_desc[3] = 0xcccc_cccc;
+        noisy_desc[9] = 0xdddd_dddd;
+        let noisy = shape(&noisy_resource, &noisy_desc);
+        assert_eq!(shape_key(&shape(&resource, &desc)), shape_key(&noisy));
+        assert_eq!(views.shape(noisy), Some(at), "one shape for one view");
+        assert_eq!(views.known_shape(&noisy), Some(at));
+        // A word the kind uses still tells them apart.
+        let mut other_desc = desc;
+        other_desc[6] = 1;
+        assert_ne!(views.shape(shape(&resource, &other_desc)), Some(at));
+    }
+
     #[test]
     fn placed_views_share_resources_across_description_padding() {
         let mut slot = [0u32; 8];
@@ -2239,16 +2296,19 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
+        // A resource description and a view no other test uses. A placed view
+        // keeps the fields of a description and not its padding
+        // ([`placed_resource_words`]): the words compared are those kept.
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        let kept = placed_resource_words(&resource).unwrap();
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-            View::Placed(_, r, _) => *r == resource,
+            View::Placed(_, r, _) => *r == kept,
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == kept).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
@@ -2256,18 +2316,18 @@ mod tests {
             let placed = 0xd_4940_0000 + n * 0x1_0000;
             (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
             create_placed_srv(null, &resource, &desc, at);
-            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+            assert_eq!(view(at), Some(View::Placed(false, kept, desc)));
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        assert_eq!(view(at), Some(View::Placed(true, kept, desc)));
         assert_eq!(shapes(), 2);
         // Placed memory past 1 TiB (not title memory) is a table entry.
         (desc[10], desc[11]) = (0, 0x100);
         create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(view(at), Some(View::Placed(false, kept, desc)));
         assert_eq!(entries(), 1);
         // A record's words are the same for the same view (the host knows
         // a slot's view by them), and differ with the address.
