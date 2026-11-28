@@ -2758,7 +2758,9 @@ mod tests {
         assert_eq!(load(&[0x48, 0x8b, 0x05, 0x18, 0x00, 0x00, 0x00]), None);
         assert_eq!(load(&[0x48, 0x89, 0x42, 0x18]), None);
         assert_eq!(load(&[0x44, 0x8b, 0x42, 0x18]), None);
-        assert_eq!(load(&[0x49, 0x8b, 0x42, 0x18]), None);
+        // REX.B is accepted since the wild-load guard (run58): the base may
+        // be any register, r10 included — only X (a scaled index) is refused.
+        assert_eq!(load(&[0x49, 0x8b, 0x42, 0x18]), Some((4, 0, 10, 24)));
         assert_eq!(load(&[0x48, 0x8b, 0x87, 0x00, 0x00, 0x01, 0x00]), None);
         assert_eq!(load(&[0x48, 0x8b, 0x47, 0x80]), None);
         assert_eq!(load(&[0x48, 0x8b, 0x87, 0xf0, 0xff, 0xff, 0xff]), None);
@@ -2973,7 +2975,9 @@ mod tests {
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x04, 0x10]), None);
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x05, 0x18, 0, 0, 0]), None);
         assert_eq!(load(&[0x46, 0x0f, 0xb7, 0x40, 0x18]), None);
-        assert_eq!(load(&[0x45, 0x0f, 0xb7, 0x40, 0x18]), None);
+        // REX.R+B: also accepted since the wild-load guard (r8d read of r8's
+        // word); 0x46 (X set, an index) above stays refused.
+        assert_eq!(load(&[0x45, 0x0f, 0xb7, 0x40, 0x18]), Some((5, 8, 8, 24, 2)));
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x40, 0xf0]), None);
         assert_eq!(load(&[0x44, 0x0f, 0xb7, 0x80, 0x18]), None);
         // A 64-bit `mov` still needs its REX.W: `8b 02` is a 32-bit load and
@@ -3065,12 +3069,12 @@ mod tests {
         // r11 = 0xff7474823f800000 — a wild, non-canonical pointer, whose
         // fault Windows reports as the all-ones address.
         assert_eq!(
-            chain_skip(51, (11, 0xff7474823f800000), &[0x41, 0x0f, 0xb7, 0x43, 0x6c], usize::MAX, 0).0,
+            chain_skip(53, (11, 0xff7474823f800000), &[0x41, 0x0f, 0xb7, 0x43, 0x6c], usize::MAX, 0).0,
             Some(5)
         );
         // A canonical base whose address does not match is still refused.
         assert_eq!(
-            chain_skip(52, (11, 0x10000), &[0x41, 0x0f, 0xb7, 0x43, 0x6c], usize::MAX, 0).0,
+            chain_skip(54, (11, 0x10000), &[0x41, 0x0f, 0xb7, 0x43, 0x6c], usize::MAX, 0).0,
             None
         );
     }
