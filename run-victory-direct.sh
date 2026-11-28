@@ -53,6 +53,8 @@ defaults VICTORY_LOG=info "VICTORY_LOG_FILE=Z:\\home\\manse\\A.Projects\\GTA6-Em
          VICTORY_WINE_MAP=0 \
          VICTORY_PORT_HOME=1 \
          VICTORY_WC_NO_BACK=1 \
+         VICTORY_REFRESH_EPOCH=1 \
+         VICTORY_REFRESH_RUNS=1 \
          VICTORY_TEXTURE_MAX=0 \
          VICTORY_NO_WATCHDOG=1 \
          VICTORY_SKIP_INT3=1 \
