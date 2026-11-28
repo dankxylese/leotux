@@ -8739,7 +8739,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8750,6 +8750,11 @@ struct Batch {
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// runs ([`Batch::refresh_ahead`]).
     ahead: ByCopy<Runs>,
+    /// Single-entry cache of the last `ahead` hit — the copy (by address) and
+    /// the span it was asked for — so consecutive `Step::Refresh` entries for
+    /// the same buffer skip the hash lookup and the walk of its runs
+    /// (`(0, 0, 0)` when there is none: an `Arc`'s pointer is never 0).
+    last_ahead: (usize, usize, usize),
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -8835,8 +8840,20 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
 }
 
 /// Steps of a submission's lists from which [`Batch::refresh_front`] makes
-/// each list's part beside the submitting thread (renderer port #6).
-const WIDE_PLAN_STEPS: usize = 4096;
+/// each list's part beside the submitting thread (renderer port #6;
+/// `VICTORY_WIDE_PLAN_STEPS`, 1024 unless given — 4096, the whole of a dense
+/// submission made as parts beside the submitting thread, was too much of
+/// the frame on one thread).
+fn wide_plan_steps() -> usize {
+    static STEPS: OnceLock<usize> = OnceLock::new();
+    *STEPS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_PLAN_STEPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1024)
+    })
+}
 
 /// One list's part of [`front_spans`] (renderer port #6, [`list_front`]).
 #[derive(Default)]
@@ -9306,6 +9323,7 @@ impl Batch {
     /// refreshed ahead, and with `textures` no texture as looked at.
     fn again(&mut self, textures: bool) {
         self.ahead.clear();
+        self.last_ahead = (0, 0, 0);
         self.front = false;
         if textures {
             self.textures.clear();
@@ -9315,8 +9333,15 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        // (The same copy asked for the same span as a moment ago, and held it
+        // then: `last_ahead` is only set on a hit, and cleared whenever
+        // `ahead` changes.)
+        if self.last_ahead == (key, address, end) {
+            return;
+        }
         // (Refreshed ahead already: one of its runs holds the span.)
         if self.ahead.get(&key).is_some_and(|runs| runs.holds(address, end)) {
+            self.last_ahead = (key, address, end);
             return;
         }
         match self.index.get(&key) {
@@ -9338,7 +9363,11 @@ impl Batch {
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
         if !self.front {
-            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            self.ahead.remove(&key);
+            if self.last_ahead.0 == key {
+                self.last_ahead = (0, 0, 0);
+            }
         }
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
@@ -9393,6 +9422,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.last_ahead = (0, 0, 0);
         self.textures.clear();
     }
 
@@ -9406,7 +9436,7 @@ impl Batch {
         // a frame has most of the frame's steps, 3-6 ms of this alone (run
         // guard-4).
         let steps: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
-        if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
+        if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= wide_plan_steps() {
             #[derive(Clone, Copy)]
             struct Lists(*const *const HostList, usize);
             // SAFETY: the lists outlive the call, which waits for every job.
@@ -9441,7 +9471,7 @@ impl Batch {
             return;
         }
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-        let mut touches = Vec::new();
+        let mut touches = Vec::with_capacity(steps);
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);
@@ -9485,6 +9515,7 @@ impl Batch {
     ) {
         planning.end();
         self.front = true;
+        self.ahead.reserve(spans.len());
         for (shadow, from, to) in &spans {
             self.ahead
                 .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -9525,6 +9556,8 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.iter().map(|s| s.1 .0.len()).sum::<usize>()) as u64, Ordering::Relaxed);
         }
+        // (No `ask_once` short-circuit here, as above: `watch::ask_once_active`
+        // is not in this tree.)
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans
@@ -9714,7 +9747,9 @@ impl Batch {
             }
         }
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
+        // not one per copy. (The `ask_once` short-circuit of the upstream
+        // patch is not taken: it needs `watch::ask_once_active`, which this
+        // branch may not add to `watch.rs`.)
         let jobs = self.jobs();
         let ahead = jobs.iter().map(|j| j.1 .0.len()).sum::<usize>() > 1;
         if ahead {
