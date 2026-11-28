@@ -47,6 +47,10 @@ pub(crate) struct Shadow {
     /// did ([`Ranged`]): the last few and the longest. A page a range holds
     /// in part cannot say so in `copied`. Locked inside `copied`'s lock.
     ranged: Mutex<Ranged>,
+    /// Raised with every take recorded in `ranged`: what says a span whose
+    /// summaries said "not untouched" need not be asked again until the copy
+    /// takes something ([`DIRTY_AT`]).
+    took: std::sync::atomic::AtomicU64,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -3537,6 +3541,78 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+thread_local! {
+    /// The copy whose page notes (`copied`) this thread holds, by
+    /// [`Shadow::id`] (0: none): what says a refresh of the same copy has come
+    /// back to the lock on the thread that holds it, which waits for ever. The
+    /// page notes are taken one copy at a time ([`Pages`]).
+    static PAGES_MINE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// The last span the journal's summaries were asked about and said **not**
+    /// untouched — by copy, by the copy's count of takes, and the span — so
+    /// the span is asked once, not once by `nothing_new` and again by
+    /// `update` right after it (`VICTORY_REFRESH_EPOCH=1`). `took` changing,
+    /// or the copy taking the span again, is a new answer's chance; a stale
+    /// entry can only say "not clean" where clean was possible, which costs
+    /// the walk it would have made anyway, never a stale copy.
+    static DIRTY_AT: std::cell::Cell<(u64, u64, usize, usize)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
+/// Whether the journal's summaries have already been asked about this span,
+/// of this copy as of its `took` count, and said "not untouched" ([`DIRTY_AT`]).
+fn dirty_known(id: u64, took: u64, from: usize, to: usize) -> bool {
+    DIRTY_AT.with(|d| {
+        let d = d.get();
+        d.0 == id && d.1 == took && d.2 == from && d.3 == to
+    })
+}
+
+/// [`dirty_known`]'s record (a stale entry can only cost the walk it would
+/// have made anyway).
+fn dirty_remember(id: u64, took: u64, from: usize, to: usize) {
+    let _ = DIRTY_AT.try_with(|d| d.set((id, took, from, to)));
+}
+
+/// The copy whose page notes this thread holds now (0: none).
+fn pages_mine() -> u64 {
+    PAGES_MINE.try_with(std::cell::Cell::get).unwrap_or(0)
+}
+
+/// [`Shadow::copied`], held, and the thread's [`PAGES_MINE`] told while it is:
+/// dropped with it.
+struct Pages<'a>(std::sync::MutexGuard<'a, Vec<u64>>, u64);
+
+impl<'a> Pages<'a> {
+    /// `g`, the page notes of the copy `id`, and the thread told it holds
+    /// them; what it held before is put back when this is dropped.
+    fn new(g: std::sync::MutexGuard<'a, Vec<u64>>, id: u64) -> Pages<'a> {
+        let out = pages_mine();
+        let _ = PAGES_MINE.try_with(|mine| mine.set(id));
+        Pages(g, out)
+    }
+}
+
+impl std::ops::Deref for Pages<'_> {
+    type Target = Vec<u64>;
+    fn deref(&self) -> &Vec<u64> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Pages<'_> {
+    fn deref_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.0
+    }
+}
+
+impl Drop for Pages<'_> {
+    fn drop(&mut self) {
+        let _ = PAGES_MINE.try_with(|mine| mine.set(self.1));
+    }
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -3638,6 +3714,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            took: Default::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             card_owned: Mutex::default(),
@@ -4499,6 +4576,7 @@ impl Shadow {
             for (from, to, now) in later.ranged {
                 ranged.add(from, to, now);
             }
+            self.took.fetch_add(1, Ordering::Relaxed);
         }
         for (from, to) in later.checks {
             self.refresh_check(from, to);
@@ -4526,12 +4604,17 @@ impl Shadow {
         }
         // First, the journal's summaries (`VICTORY_REFRESH_EPOCH=1`): nothing
         // noted written in the span since the copy last took it whole, and
-        // every block of it published, is clean without walking a page.
-        if self.epoch_clean(from, to) {
+        // every block of it published, is clean without walking a page. The
+        // asking taken for it is the walk's too — one take of that lock, not
+        // two — and a span the summaries said not clean is not asked again
+        // ([`DIRTY_AT`]).
+        let took = self.took.load(Ordering::Relaxed);
+        let since = self.ranged(from, to);
+        if !dirty_known(self.id, took, from, to) && self.epoch_clean_at(from, to, since, took) {
             return true;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, since);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4542,7 +4625,7 @@ impl Shadow {
     }
 
     /// Whether `[from, to)` of the copy is provably untouched by the
-    /// journal's region and block summaries, which answer without walking it
+    /// journal's region, piece and block summaries, which answer without walking it
     /// (`crate::watch::untouched_since`, `VICTORY_REFRESH_EPOCH=1`).
     ///
     /// `since` is the asking after which a range holding the span was last
@@ -4554,11 +4637,28 @@ impl Shadow {
         if !crate::watch::summarised() {
             return false;
         }
+        // Asked once a span (see [`DIRTY_AT`]): no lock taken for the answer
+        // `nothing_new` has just given for it.
+        let took = self.took.load(Ordering::Relaxed);
+        if dirty_known(self.id, took, from, to) {
+            return false;
+        }
         let since = self.ranged(from, to);
+        self.epoch_clean_at(from, to, since, took)
+    }
+
+    /// [`Shadow::epoch_clean`] at the asking `since` the caller has already
+    /// taken ([`Shadow::nothing_new`] takes it for the walk anyway), with
+    /// `took` as it was read before it.
+    fn epoch_clean_at(&self, from: usize, to: usize, since: u64, took: u64) -> bool {
         if since == 0 {
+            dirty_remember(self.id, took, from, to);
             return false;
         }
         let clean = crate::watch::untouched_since(from, to, since);
+        if !clean {
+            dirty_remember(self.id, took, from, to);
+        }
         if crate::watch::epoch_sample(from, to) {
             let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             let walk = crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied, since);
@@ -4674,13 +4774,29 @@ impl Shadow {
         }
     }
 
-    /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], later: Option<&mut Later>) -> usize {
-        let base = self.start as usize / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
+/// Copies the pages of `[from, to)` written after their last copy
+/// (`written`: last writes by page, in page order; `now`: this
+/// asking), whole pages within the buffer.
+fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], later: Option<&mut Later>) -> usize {
+    let base = self.start as usize / PAGE;
+    // (One job a copy is what keeps this lock from being taken twice on one
+    // thread — a flush hands a copy's runs to one job, `Batch`: `runs-hang.md`.
+    // If that ever stops being so, say it instead of waiting for ever: the
+    // job another run of this copy would need is what `wide`'s own drain runs.)
+    if pages_mine() == self.id {
+        // (The deadlock run27 froze in, said instead: `runs-hang.md`.)
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if said <= 8 || said.is_power_of_two() {
+            tracing::error!(
+                copy = self.id,
+                span = format_args!("{from:#x}..{to:#x}"),
+                "a refresh of a copy re-enters the copy's own page notes on the one thread: a second job of that copy is in the air (VICTORY_REFRESH_RUNS hands one job per copy; runs-hang.md)"
+            );
+        }
+    }
+    let mut copied = Pages::new(self.copied.lock().unwrap_or_else(|e| e.into_inner()), self.id);
+    let mut writes = written.iter().peekable();
         // Pages the range holds in part are never noted in `copied`, and
         // were copied again at every refresh of the range, written or not:
         // of the heap's buffer views alone two ends for each of 4,400
@@ -4744,6 +4860,7 @@ impl Shadow {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
             ranged.add(from, to, now);
+            self.took.fetch_add(1, Ordering::Relaxed);
         }
         bytes
     }
@@ -4779,6 +4896,23 @@ impl Shadow {
             }
         }
         let this = std::ptr::from_ref(self) as usize;
+        // The confirmation of run27's fix (`runs-hang.md`): this thread holds
+        // the copy's page notes while the work goes to the kept threads, and
+        // `wide`'s own drain runs whatever job is in front of that queue. Safe
+        // only while a flush hands **one job a copy** (`Batch::flush_all`,
+        // `Batch::refresh_spans`): a second job of this copy in the air would
+        // come back to the notes held here, on the thread holding them, and
+        // wait for ever. Said once, so a run's log carries it.
+        if pages_mine() == self.id {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::error!(
+                    copy = self.id,
+                    bytes,
+                    "a copy's refresh goes wide with its own page notes held: one job a copy is what makes that safe (VICTORY_REFRESH_RUNS; runs-hang.md)"
+                );
+            });
+        }
         wide_each(parts.len(), move |i| {
             // SAFETY: `wide_each` returns when every part is done, before
             // the borrow of `self` ends. The parts lie apart.
@@ -6555,4 +6689,28 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod dirty_at_tests {
+    use super::{dirty_known, dirty_remember};
+
+    /// The "not untouched" a span is given is kept for that one span, of that
+    /// one copy, at the one count of takes it was asked at: no other span is
+    /// answered by it, and a copy that takes a range again is asked again
+    /// (`VICTORY_REFRESH_EPOCH=1`: `nothing_new` asks and `update`, right after
+    /// it for the same span, does not).
+    #[test]
+    fn a_span_answered_not_clean_is_asked_once_a_take() {
+        dirty_remember(9, 4, 0x1000, 0x2000);
+        assert!(dirty_known(9, 4, 0x1000, 0x2000));
+        assert!(!dirty_known(9, 5, 0x1000, 0x2000), "the copy took a range again");
+        assert!(!dirty_known(8, 4, 0x1000, 0x2000), "another copy");
+        assert!(!dirty_known(9, 4, 0x1000, 0x3000), "another span");
+        assert!(!dirty_known(9, 4, 0x0800, 0x2000));
+        assert!(dirty_known(9, 4, 0x1000, 0x2000) || true);
+        // (This thread is the test's own: leave nothing behind for the next.)
+        dirty_remember(0, 0, 0, 0);
+        assert!(!dirty_known(9, 4, 0x1000, 0x2000));
+    }
 }

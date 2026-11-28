@@ -59,12 +59,20 @@ const KERNEL_PAGE: usize = 4096;
 /// ([`untouched_since`]).
 const REGION: usize = 64 << 20;
 
-/// The regions and 64 KiB blocks whose last write the journal summarises:
-/// 8 MB of each (64 TiB and 64 GiB of address space), grown in steps as
-/// writes come (R6: 8 bytes a region and a block, far under the windows
+/// The unit of the summary between the two, the 4 MiB piece of address space:
+/// 64 of the journal's pages. A 64 MiB region that has had a write says
+/// nothing about the 182 MB envelope that lies in it, and asking its 2,912
+/// blocks one by one cost more than the walk the answer saves; the pieces of
+/// it say which 64 blocks are worth looking at, and usually none are.
+const PIECE: usize = 4 << 20;
+
+/// The regions, pieces and 64 KiB blocks whose last write the journal
+/// summarises: 8 MB of each (64 TiB, 4 TiB and 64 GiB of address space),
+/// grown in steps as writes come (R6: 8 bytes each, far under the windows
 /// alive). A write beyond them is not summarised, and a span that reaches
 /// there is never answered from the summary.
 const REGIONS_MAX: usize = 1 << 20;
+const PIECES_MAX: usize = 1 << 20;
 const BLOCKS_MAX: usize = 1 << 20;
 /// How many entries are made at a time: a note at one far address makes
 /// this much and no more.
@@ -115,25 +123,46 @@ impl Journal {
     /// read ([`summarised`]).
     fn summarise(&mut self, page: usize, now: u64) {
         raise(&mut self.region_last, page / (REGION / PAGE), REGIONS_MAX, now);
+        raise(&mut self.piece_last, page / (PIECE / PAGE), PIECES_MAX, now);
         raise(&mut self.block_last, page, BLOCKS_MAX, now);
     }
 
     /// Whether nothing of `[start, end)` was noted written after the asking
-    /// `since`: every 64 MiB region of it, and every 64 KiB block of it, was
-    /// last written at or before `since` (see [`untouched_since`]).
+    /// `since`: every 64 MiB region of it, every 4 MiB piece of it, and every
+    /// 64 KiB block of it was last written at or before `since` (see
+    /// [`untouched_since`]).
+    ///
+    /// Asked from the coarsest down, and a level only read where the one
+    /// above it had a write: three loads for a span whose regions are quiet
+    /// (most of them), and for the 182 MB envelope in a region the heap
+    /// writes elsewhere in, 46 piece loads and the 64 blocks of the pieces
+    /// that had — where its 2,912 blocks were read one by one before.
     fn untouched(&self, start: usize, end: usize, since: u64) -> bool {
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         let (from, to) = (first / (REGION / PAGE), last.div_ceil(REGION / PAGE));
-        // The regions first: most spans are a few of them, and most of those
-        // have had nothing written since the copy took them.
         let Some(regions) = self.region_last.get(from..to) else {
             return false;
         };
         if regions.iter().all(|&at| at <= since) {
             return true;
         }
-        // Another part of one of its regions was: its own blocks say.
-        self.block_last.get(first..last).is_some_and(|blocks| blocks.iter().all(|&at| at <= since))
+        let (of, ot) = (first / (PIECE / PAGE), last.div_ceil(PIECE / PAGE));
+        let Some(pieces) = self.piece_last.get(of..ot) else {
+            return false;
+        };
+        if pieces.iter().all(|&at| at <= since) {
+            return true;
+        }
+        // The blocks of the pieces that had a write, only: the others' are
+        // as clean as the piece.
+        pieces.iter().enumerate().all(|(k, &at)| {
+            if at <= since {
+                return true;
+            }
+            let piece = (of + k) * (PIECE / PAGE);
+            let (lo, hi) = (piece.max(first), (piece + PIECE / PAGE).min(last));
+            self.block_last.get(lo..hi).is_some_and(|blocks| blocks.iter().all(|&at| at <= since))
+        })
     }
 
     /// The first page of `[start, end)` the journal has written after asking
@@ -227,8 +256,11 @@ struct Journal {
     /// of them its span lies in instead of walking its pages
     /// ([`untouched_since`]). Grown as writes come, to [`REGIONS_MAX`].
     region_last: Vec<u64>,
+    /// The same for each 4 MiB piece: what says a span is untouched when
+    /// another part of its region was written.
+    piece_last: Vec<u64>,
     /// The same for each 64 KiB block: what says a span is untouched when
-    /// another block of its region was.
+    /// another block of its piece was.
     block_last: Vec<u64>,
 }
 
@@ -245,6 +277,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead_asked: 0,
     kept: false,
     region_last: Vec::new(),
+    piece_last: Vec::new(),
     block_last: Vec::new(),
 });
 
@@ -2094,10 +2127,15 @@ pub(crate) fn untouched_since(start: usize, end: usize, since: u64) -> bool {
     if since == 0 || start >= end {
         return false;
     }
-    if !published(start, end) {
+    // The journal's summaries first and the published bits after, though
+    // both must hold: a span one of whose regions, pieces or blocks had a
+    // write noted is answered without the bits being read at all, and those
+    // are the spans a frame walks (`published` reads a word a 64 blocks, but
+    // over the whole span: 92 loads of a 182 MB envelope).
+    if !journal().untouched(start, end, since) {
         return false;
     }
-    journal().untouched(start, end, since)
+    published(start, end)
 }
 
 /// A span was answered from the summary: counted for the epoch line.
@@ -2171,15 +2209,17 @@ pub(crate) fn epoch_line(frames: f64) -> String {
 }
 
 /// What the journal's summaries hold now, for the memory line (R6): the
-/// bytes of the regions' and of the blocks' summaries, and the address
-/// space each reaches.
+/// bytes of the regions', the pieces' and the blocks' summaries, and the
+/// address space each reaches.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn epoch_memory() -> [u64; 4] {
+pub(crate) fn epoch_memory() -> [u64; 6] {
     let j = journal();
     [
         (j.region_last.len() * 8) as u64,
+        (j.piece_last.len() * 8) as u64,
         (j.block_last.len() * 8) as u64,
         (j.region_last.len() as u64) * REGION as u64,
+        (j.piece_last.len() as u64) * PIECE as u64,
         (j.block_last.len() as u64) * PAGE as u64,
     ]
 }
@@ -4873,6 +4913,7 @@ mod parts_tests {
             ahead_asked: 0,
             kept: false,
             region_last: Vec::new(),
+            piece_last: Vec::new(),
             block_last: Vec::new(),
         };
         assert_eq!(j.parts_since(7, 0), WHOLE);
@@ -6885,6 +6926,7 @@ mod epoch_tests {
             ahead_asked: 0,
             kept: false,
             region_last: Vec::new(),
+            piece_last: Vec::new(),
             block_last: Vec::new(),
         }
     }
@@ -6928,6 +6970,60 @@ mod epoch_tests {
         assert!(j.untouched(AT, AT + 2 * PAGE, 7));
         // A span that reaches the block that was written is not.
         assert!(!j.untouched(AT, AT + 101 * PAGE, 7));
+    }
+
+    /// A 64 MiB region that has had a write elsewhere says nothing of the
+    /// 32 MB envelope in it: the 4 MiB pieces do, and only the blocks of the
+    /// pieces that had are read (a span's region that had sent every one of
+    /// its 512 blocks to be read, at 8 bytes each, to answer a question about
+    /// three loads' worth of address space).
+    #[test]
+    fn a_write_elsewhere_in_the_region_is_told_apart_by_the_pieces() {
+        let mut j = journal();
+        // (The start of a 64 MiB region of its own, so the writes below stay
+        // in one.)
+        let first = (AT / PAGE / (REGION / PAGE) + 1) * (REGION / PAGE);
+        let at = first * PAGE;
+        let piece = PIECE / PAGE; // 64 blocks
+        j.summarise(first, 7);
+        // Another heap's block, in the region's twelfth piece (48 MB on): no
+        // part of a span of its first eight pieces.
+        j.summarise(first + 12 * piece, 9);
+        assert_eq!(j.region_last[first / (REGION / PAGE)], 9);
+        assert_eq!(j.piece_last[(first + 12 * piece) / piece], 9);
+        // The region says something was written, the span's pieces say not in
+        // it — and no block of it is read to find that out.
+        assert!(j.untouched(at, at + 8 * PIECE, 7));
+        // A write in the span's fourth piece at 11, past its first block.
+        j.summarise(first + 3 * piece + 5, 11);
+        assert!(!j.untouched(at, at + 8 * PIECE, 7));
+        // (The pieces after it have nothing newer: their blocks are not read
+        // either.)
+        assert!(j.untouched(at + 4 * PIECE, at + 8 * PIECE, 7));
+        // A span of the piece that had, past the block that had: its own
+        // blocks say, and they are read.
+        assert!(j.untouched(at + 3 * PIECE + 6 * PAGE, at + 4 * PIECE, 7));
+        assert!(!j.untouched(at + 3 * PIECE + 5 * PAGE, at + 4 * PIECE, 7));
+        assert!(
+            !j.untouched(at + 3 * PIECE + 5 * PAGE, at + 3 * PIECE + 6 * PAGE, 6),
+            "and at the asking before it"
+        );
+    }
+
+    /// The summaries are asked before the published bits, though both must
+    /// hold: a span the journal has seen written is answered without the bits
+    /// being walked over it (`published` reads a word a 64 blocks: 46 of them
+    /// over a 182 MB envelope, on every ask).
+    #[test]
+    fn a_span_the_journal_has_seen_written_is_answered_without_the_bits() {
+        let mut j = journal();
+        let first = AT / PAGE;
+        j.summarise(first, 7);
+        j.summarise(first + 1, 9);
+        assert!(!j.untouched(AT, AT + 2 * PAGE, 7));
+        // (And `untouched_since` says no for it whatever the bits say: the
+        // memory here is nobody's view, so no block of it is published.)
+        assert!(!untouched_since(AT, AT + 2 * PAGE, 7));
     }
 
     #[test]

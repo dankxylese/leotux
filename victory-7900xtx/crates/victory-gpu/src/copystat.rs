@@ -976,7 +976,8 @@ fn log_memory() {
          textures: {} alive {:.0} MB, {} kept by their texture; host textures: {} alive {:.0} MB, \
          {} placed in title memory; made so far: {} upload buffers {:.0} MB, {} shared buffers \
          {:.0} MB, {} card buffers {:.0} MB; the refreshes' epoch summaries: {:.0} KB of 64 MiB \
-         regions and {:.0} KB of 64 KiB blocks (reaching {:#x} and {:#x})",
+         regions, {:.0} KB of 4 MiB pieces and {:.0} KB of 64 KiB blocks (reaching {:#x}, {:#x} \
+         and {:#x})",
         mb(private),
         mb(working),
         mb(free),
@@ -1001,8 +1002,10 @@ fn log_memory() {
         mb(made[5]),
         epochs[0] as f64 / 1024.0,
         epochs[1] as f64 / 1024.0,
-        epochs[2],
+        epochs[2] as f64 / 1024.0,
         epochs[3],
+        epochs[4],
+        epochs[5],
     );
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
