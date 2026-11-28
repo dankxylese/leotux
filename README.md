@@ -16,7 +16,7 @@ real world content and is 1-to-1 comparable between runs).
 |---|---|
 | Boot, menus, intro video | 30 fps, the title's own cap (no rubber-banding: joins are world-only) |
 | From the start to the world | about 20-30 s |
-| Prologue, in-world | 14-15 fps, 67-69 ms a frame median (p90 ~79), frame-time stdev ~11 |
+| Prologue, in-world | 14-24 fps - consistent 14-18 with high peaks in lighter scenes, 67-69 ms a frame median (p90 ~79), frame-time stdev ~11 |
 | Faces and mouths | **working** — skin on every run, lips follow the dialogue |
 | Shaders and pipelines | pre-computed before the title starts (`warm-up.sh`: every shader translated once, every pipeline earlier runs drew with made ahead, with a progress window — the title does not stall on them) |
 
