@@ -573,7 +573,8 @@ pub(crate) fn sync_heaps() {
                     // ones read and name a view that can be made now; else
                     // it is dropped and counted (`crate::port_descriptors::
                     // refused`), never made.
-                    if !samplers
+                    if check
+                        && !samplers
                         && word(0) == VIEW_TAG
                         && record_dropped(index, start + u64::from(index) * step, [word(0), word(1), word(2)])
                     {
