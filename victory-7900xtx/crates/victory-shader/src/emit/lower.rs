@@ -4716,6 +4716,29 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, z, zero, m)
     }
 
+    /// The sum of a legacy multiply-add: the product `m` ([`Self::legacy_mul`],
+    /// `+0` where a zero factor forced it) and the accumulator, where an
+    /// accumulator of `-0` leaves `+0` and not `-0`. DXIL `fadd` can give
+    /// `-0` for `+0 + -0` on AMD, where the console's add of a zero product
+    /// and a `-0` accumulator is `+0`: the `+0` bits are selected explicitly,
+    /// keeping the add's NaN behavior. (Vice-Tay `4f2f58f`, Fibrak, #308;
+    /// there the zero product is a literal of a single legacy multiply-add,
+    /// here the product is a select over a multiply, so the case is the
+    /// product's bits being `+0` at run time.)
+    fn legacy_sum(&mut self, m: V, acc: V) -> V {
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::Add, m, acc);
+        let (mb, ab) = (self.as_int(m), self.as_int(acc));
+        let zero_bits = self.s.m.i32(0);
+        let neg_zero = self.s.m.i32(0x8000_0000);
+        let product_zero = self.s.m.cmp(c, pred::EQ, mb, zero_bits);
+        let acc_neg_zero = self.s.m.cmp(c, pred::EQ, ab, neg_zero);
+        let forced = self.s.m.bin(c, Bin::And, product_zero, acc_neg_zero);
+        let sum_bits = self.as_int(sum);
+        let fixed = self.s.m.select(c, forced, zero_bits, sum_bits);
+        self.as_float(fixed)
+    }
+
     // ---- lane booleans ----
 
     fn boolean(&mut self, b: Bool, at: usize) -> Result<V, Why> {
@@ -6720,8 +6743,8 @@ impl<'a> Lower<'a> {
                     "s_min_i32" => pred::SLT,
                     _ => pred::SGT,
                 };
-                let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                let first_wins = self.s.m.cmp(c, p, a, b);
+                (self.s.m.select(c, first_wins, a, b), Some(first_wins))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -9251,19 +9274,20 @@ impl<'a> Lower<'a> {
                     }
                     _ => {
                         let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
+                        self.legacy_sum(m, acc)
                     }
                 };
                 float(self, r)
             }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
+                let r = if name == "v_mad_legacy_f32" {
+                    let m = self.legacy_mul(a, bb);
+                    self.legacy_sum(m, cc)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                    self.s.m.bin(c, Bin::Add, m, cc)
                 };
-                let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
