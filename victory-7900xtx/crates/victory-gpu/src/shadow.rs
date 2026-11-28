@@ -47,6 +47,10 @@ pub(crate) struct Shadow {
     /// did ([`Ranged`]): the last few and the longest. A page a range holds
     /// in part cannot say so in `copied`. Locked inside `copied`'s lock.
     ranged: Mutex<Ranged>,
+    /// Raised with every take recorded in `ranged`: what says a span whose
+    /// summaries said "not untouched" need not be asked again until the copy
+    /// takes something ([`DIRTY_AT`]).
+    took: std::sync::atomic::AtomicU64,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -3545,6 +3549,32 @@ thread_local! {
     static PAGES_MINE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// The last span the journal's summaries were asked about and said **not**
+    /// untouched — by copy, by the copy's count of takes, and the span — so
+    /// the span is asked once, not once by `nothing_new` and again by
+    /// `update` right after it (`VICTORY_REFRESH_EPOCH=1`). `took` changing,
+    /// or the copy taking the span again, is a new answer's chance; a stale
+    /// entry can only say "not clean" where clean was possible, which costs
+    /// the walk it would have made anyway, never a stale copy.
+    static DIRTY_AT: std::cell::Cell<(u64, u64, usize, usize)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
+/// Whether the journal's summaries have already been asked about this span,
+/// of this copy as of its `took` count, and said "not untouched" ([`DIRTY_AT`]).
+fn dirty_known(id: u64, took: u64, from: usize, to: usize) -> bool {
+    DIRTY_AT.with(|d| {
+        let d = d.get();
+        d.0 == id && d.1 == took && d.2 == from && d.3 == to
+    })
+}
+
+/// [`dirty_known`]'s record (a stale entry can only cost the walk it would
+/// have made anyway).
+fn dirty_remember(id: u64, took: u64, from: usize, to: usize) {
+    let _ = DIRTY_AT.try_with(|d| d.set((id, took, from, to)));
+}
+
 /// The copy whose page notes this thread holds now (0: none).
 fn pages_mine() -> u64 {
     PAGES_MINE.try_with(std::cell::Cell::get).unwrap_or(0)
@@ -3684,6 +3714,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            took: Default::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             card_owned: Mutex::default(),
@@ -4545,6 +4576,7 @@ impl Shadow {
             for (from, to, now) in later.ranged {
                 ranged.add(from, to, now);
             }
+            self.took.fetch_add(1, Ordering::Relaxed);
         }
         for (from, to) in later.checks {
             self.refresh_check(from, to);
@@ -4572,12 +4604,17 @@ impl Shadow {
         }
         // First, the journal's summaries (`VICTORY_REFRESH_EPOCH=1`): nothing
         // noted written in the span since the copy last took it whole, and
-        // every block of it published, is clean without walking a page.
-        if self.epoch_clean(from, to) {
+        // every block of it published, is clean without walking a page. The
+        // asking taken for it is the walk's too — one take of that lock, not
+        // two — and a span the summaries said not clean is not asked again
+        // ([`DIRTY_AT`]).
+        let took = self.took.load(Ordering::Relaxed);
+        let since = self.ranged(from, to);
+        if !dirty_known(self.id, took, from, to) && self.epoch_clean_at(from, to, since, took) {
             return true;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, since);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4588,7 +4625,7 @@ impl Shadow {
     }
 
     /// Whether `[from, to)` of the copy is provably untouched by the
-    /// journal's region and block summaries, which answer without walking it
+    /// journal's region, piece and block summaries, which answer without walking it
     /// (`crate::watch::untouched_since`, `VICTORY_REFRESH_EPOCH=1`).
     ///
     /// `since` is the asking after which a range holding the span was last
@@ -4600,11 +4637,28 @@ impl Shadow {
         if !crate::watch::summarised() {
             return false;
         }
+        // Asked once a span (see [`DIRTY_AT`]): no lock taken for the answer
+        // `nothing_new` has just given for it.
+        let took = self.took.load(Ordering::Relaxed);
+        if dirty_known(self.id, took, from, to) {
+            return false;
+        }
         let since = self.ranged(from, to);
+        self.epoch_clean_at(from, to, since, took)
+    }
+
+    /// [`Shadow::epoch_clean`] at the asking `since` the caller has already
+    /// taken ([`Shadow::nothing_new`] takes it for the walk anyway), with
+    /// `took` as it was read before it.
+    fn epoch_clean_at(&self, from: usize, to: usize, since: u64, took: u64) -> bool {
         if since == 0 {
+            dirty_remember(self.id, took, from, to);
             return false;
         }
         let clean = crate::watch::untouched_since(from, to, since);
+        if !clean {
+            dirty_remember(self.id, took, from, to);
+        }
         if crate::watch::epoch_sample(from, to) {
             let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             let walk = crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied, since);
@@ -4806,6 +4860,7 @@ fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)],
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
             ranged.add(from, to, now);
+            self.took.fetch_add(1, Ordering::Relaxed);
         }
         bytes
     }
@@ -6634,4 +6689,28 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod dirty_at_tests {
+    use super::{dirty_known, dirty_remember};
+
+    /// The "not untouched" a span is given is kept for that one span, of that
+    /// one copy, at the one count of takes it was asked at: no other span is
+    /// answered by it, and a copy that takes a range again is asked again
+    /// (`VICTORY_REFRESH_EPOCH=1`: `nothing_new` asks and `update`, right after
+    /// it for the same span, does not).
+    #[test]
+    fn a_span_answered_not_clean_is_asked_once_a_take() {
+        dirty_remember(9, 4, 0x1000, 0x2000);
+        assert!(dirty_known(9, 4, 0x1000, 0x2000));
+        assert!(!dirty_known(9, 5, 0x1000, 0x2000), "the copy took a range again");
+        assert!(!dirty_known(8, 4, 0x1000, 0x2000), "another copy");
+        assert!(!dirty_known(9, 4, 0x1000, 0x3000), "another span");
+        assert!(!dirty_known(9, 4, 0x0800, 0x2000));
+        assert!(dirty_known(9, 4, 0x1000, 0x2000) || true);
+        // (This thread is the test's own: leave nothing behind for the next.)
+        dirty_remember(0, 0, 0, 0);
+        assert!(!dirty_known(9, 4, 0x1000, 0x2000));
+    }
 }
