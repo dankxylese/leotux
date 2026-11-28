@@ -4599,6 +4599,10 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// threads may write through that part before we are told of it
 /// ([`views_mapped`]). What is guarded of its pages at other views is opened,
 /// and not guarded again before the change is done ([`Remapping`]).
+///
+/// (For a view the title takes away in part, the runtime tells
+/// [`title_memory_cut`] instead: what stays of it keeps what the guards know
+/// of its blocks, instead of every copy of them being taken again.)
 pub fn title_memory_splitting(at: usize, len: usize) {
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {

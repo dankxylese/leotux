@@ -819,8 +819,10 @@ const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
 /// whole view instead ([`Section::window`]), views unmapped, views mapped
 /// again around an unmapped part, views mapped as one with a neighbour
 /// ([`join_views`]), and the entries of `XMemMapPhysicalPagesScatter` calls
-/// and the runs they were mapped or unmapped as ([`scatter_runs`]).
-static MAPPED: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// and the runs they were mapped or unmapped as ([`scatter_runs`]), and the
+/// views taken away in part, cut at the ends of the call's range with what
+/// stays mapped back from its own placeholder ([`unmap`]).
+static MAPPED: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 /// What the mapping calls asked of the host and what they cost, since the
 /// start, for [`count`]'s line. By kind of host call, how many and their
@@ -916,6 +918,7 @@ fn count(slot: usize, n: u64, views: usize) {
             joined = m[7],
             scatter_entries = m[8],
             scatter_runs = m[9],
+            views_cut = m[10],
             views_alive = ALIVE.load(Ordering::Relaxed),
             faults_retried = victory_gpu::remap_retries(),
             host_maps = c[cost::MAP],
@@ -1114,27 +1117,32 @@ fn switched(on: &LazyLock<bool>) -> bool {
 }
 
 /// Whether a view mapped beside one that shows the section's slices just
-/// before or after its own is made one view with it (`VICTORY_JOIN_VIEWS`,
-/// on under Wine), within windows of [`JOIN_WINDOW`].
+/// before or after its own is made one view with it (`VICTORY_JOIN_VIEWS=1`;
+/// off unless asked for), within windows of [`JOIN_WINDOW`].
 ///
 /// The title maps its memory a page at a time: 122,880 of the 132,870
 /// views it had mapped when a first world appeared were one page beside
-/// such a neighbour, and 125,000 views were alive. wineserver keeps a
-/// process's views in a list and walks all of it for every view mapped
+/// such a neighbour, and 125,000 views were alive. wineserver kept a
+/// process's views in a list and walked all of it for every view mapped
 /// (looking for an overlap) and up to all of it for every view unmapped,
 /// so each of the 4,000 mapping requests a second while a world streams in
 /// cost a walk of that list, on the server's one thread: the title's
 /// threads slept behind it and a frame took 2-4 s, 0.3 s of it ours.
 ///
-/// A join unmaps the neighbour and maps both as one, so for that moment
-/// the neighbour's pages are not there ([`victory_gpu::title_memory_remapping`]
-/// is held, and a thread of the title's that touches them then is tried
-/// again); what the GPU side knows of the neighbour stays
-/// ([`victory_gpu::title_memory_regrouped`]). So too for what stays of a
-/// view unmapped in part ([`unmap`]), which with views joined is the usual
-/// way a page goes.
+/// What that was written for is gone on both sides: ntdll keeps a
+/// process's views in a red-black tree (`find_view`, `virtual.c`), and the
+/// server this line runs on walks a tree too (`wine-11.21-0001-server-views-rbtree`;
+/// `docs/linux-wine.md`: "Wine's server could keep views in a tree ... With
+/// it, the Windows way would do under Wine as well"). A join costs a view
+/// unmapped and a view mapped for every page the title streams, and what
+/// it takes away is the view *beside* the one the title asked for: a page
+/// the title's own readers are in, unmapped and mapped again on every
+/// mapping call (`title-av.md` §5: the publish-then-read race is stretched
+/// by exactly that). Off, every call maps what it asks for and nothing
+/// else, and a call that replaces part of a view cuts it at its ends
+/// instead ([`unmap`]).
 fn join_views() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| wine_switch("VICTORY_JOIN_VIEWS"));
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_JOIN_VIEWS").is_some_and(|v| v == "1"));
     switched(&ON)
 }
 
@@ -1228,8 +1236,9 @@ struct Slice {
 struct Physical {
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
-    /// Placeholders that are some view's own, left by its unmapping: address
-    /// and length. The title may have joined one with others since.
+    /// Placeholders that are some view's own, left by its unmapping or cut
+    /// off it where a call replaced a part of it ([`unmap`]): address and
+    /// length. The title may have joined one with others since.
     holes: HashMap<usize, usize>,
 }
 
@@ -2047,7 +2056,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = remapping();
-    unmap(&mut physical, base + lo * PAGE, (hi - lo) * PAGE);
+    // True if a view was taken away in part: what stays of it was cut off
+    // its placeholder and mapped back by itself, and the maps below must not
+    // join with it again (`map_quietly`'s `join`).
+    let cut = unmap(&mut physical, base + lo * PAGE, (hi - lo) * PAGE);
     let (Some(pages), Some(slices)) = (pages, slices) else {
         return address;
     };
@@ -2067,7 +2079,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map_quietly(&mut physical, base + i * PAGE, run * PAGE, first, false, !cut) {
             return std::ptr::null_mut();
         }
         count(0, 1, physical.views.len());
@@ -2224,7 +2236,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 fn map_alias_run(physical: &mut Physical, base: usize, slice: Slice, run: usize) -> bool {
     count(1, run as u64, 0);
     if run > 1 {
-        if map_quietly(physical, base, run * PAGE, slice.clone(), true) {
+        if map_quietly(physical, base, run * PAGE, slice.clone(), true, true) {
             count(2, 1, physical.views.len());
             census(physical);
             return true;
@@ -2795,12 +2807,16 @@ mod pool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    map_quietly(physical, base, len, slice, false)
+    map_quietly(physical, base, len, slice, false, true)
 }
 
-/// [`map`]; `quiet` for a caller that has another way if the host refuses.
-fn map_quietly(physical: &mut Physical, base: usize, len: usize, slice: Slice, quiet: bool) -> bool {
-    if join_views()
+/// [`map`]; `quiet` for a caller that has another way if the host refuses,
+/// and `join` false for a caller that has just taken a view away in part
+/// ([`unmap`]): its views are mapped by themselves, where a join with a
+/// neighbour would take away again what was just put back.
+fn map_quietly(physical: &mut Physical, base: usize, len: usize, slice: Slice, quiet: bool, join: bool) -> bool {
+    if join
+        && join_views()
         && let Some(done) = map_joined(physical, base, len, &slice)
     {
         return done;
@@ -3246,14 +3262,28 @@ fn commit_limit_message(
     message
 }
 
-/// Returns `[base, base + len)` to placeholders; views reaching past it
-/// are mapped again outside it.
-fn unmap(physical: &mut Physical, base: usize, len: usize) {
+/// Returns `[base, base + len)` to placeholders. A view reaching past the
+/// range is taken away whole — the host leaves no other way: `MapViewOfFile3`
+/// replaces exactly one placeholder, and only a placeholder can be split or
+/// turned back into one (Wine's `free_pages_preserve_placeholder` refuses a
+/// mapped view, `virtual.c`) — but what stays of it is *not* taken away with
+/// the range any more. The view's placeholder is split at the range's two
+/// ends in one call ([`split`]), so the part before and the part after are
+/// placeholders of exactly their own extent, and they are mapped back at once
+/// from those: no split of theirs, and by themselves ([`map_quietly`] with
+/// `join` false — a join would take away again what was just put back). The
+/// guards keep what they know of them (`victory_gpu::title_memory_cut`, then
+/// `title_memory_regrouped`), where they were told of them taken again
+/// before.
+///
+/// True if a view was taken away in part: the call that asked for it must
+/// not join its own maps with what stays ([`map_joined`]).
+fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
     if len == 0 {
-        return;
+        return false;
     }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
@@ -3294,21 +3324,28 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             told_before.extend(run.iter().map(|view| view.0));
         }
     }
+    let mut cut_any = false;
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        let view_end = at + size;
         // What goes of the view, and what stays before and after it.
-        let (cut, cut_end) = (at.max(base), (at + size).min(end));
-        let stays = [(at, cut - at, slice.index), (cut_end, at + size - cut_end, slice.index + (cut_end - at) / PAGE)];
-        let whole = cut == at && cut_end == at + size;
-        // With views joined, a page unmapped is most often one of a view of
-        // many: what stays of it shows what it showed, and the GPU side
-        // keeps what it knows of that (`title_memory_cut`, then
-        // `title_memory_regrouped`), where otherwise every copy of it is
-        // taken again.
-        let keep = !whole && join_views();
-        if keep {
+        let (cut, cut_end) = (at.max(base), view_end.min(end));
+        let stays = [(at, cut - at, slice.index), (cut_end, view_end - cut_end, slice.index + (cut_end - at) / PAGE)];
+        let whole = cut == at && cut_end == view_end;
+        if whole {
+            if told_before.binary_search(&at).is_err() {
+                shown_mut().forget(at, size, &slice);
+                told(|| victory_gpu::title_memory_unmapping(at, size));
+            }
+        } else {
+            cut_any = true;
+            count(10, 1, 0);
+            // What stays of the view shows what it showed, and the GPU side
+            // keeps what it knows of that (`title_memory_cut`, then
+            // `title_memory_regrouped`), where otherwise every copy of it is
+            // taken again.
             {
                 // In one step: who asks where a page is shown
                 // ([`pages_written`]) finds what stays all the while.
@@ -3335,24 +3372,42 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                     cut_end - cut,
                 )
             });
-        } else if told_before.binary_search(&at).is_err() {
-            shown_mut().forget(at, size, &slice);
-            told(|| {
-                if !whole {
-                    // Parts of it stay, and are mapped again below.
-                    victory_gpu::title_memory_splitting(at, size);
-                }
-                victory_gpu::title_memory_unmapping(at, size);
-            });
         }
         recent(b'U', at, 0, 0);
         // (Under Wine, with the pages shown by the host's `mmap`: taken away
-        // there, [`wine_map`].)
-        let gone = counted(Call::Unmap, || hide(at, size));
+        // there, [`wine_map`]. With the `mmap` the range goes by itself: what
+        // stays is not touched at all.)
+        let mmap = !whole && wine_map::holds(at);
+        let gone = if mmap {
+            counted(Call::Unmap, || hide(cut, cut_end - cut))
+        } else {
+            counted(Call::Unmap, || hide(at, size))
+        };
         count(5, 1, physical.views.len());
         census(physical);
-        if gone && at >= base && at + size <= end {
+        if gone && at >= base && view_end <= end {
             physical.holes.insert(at, size);
+        }
+        if mmap {
+            // Nothing to split (the reservation is plain) and nothing to map
+            // again: what stays was never taken away.
+            for (part, bytes, index) in stays {
+                if bytes != 0 {
+                    physical.views.insert(part, (bytes, Slice { index, section: slice.section.clone() }));
+                }
+            }
+            if gone {
+                physical.holes.insert(cut, cut_end - cut);
+            }
+            continue;
+        }
+        if !whole && gone {
+            // The view's placeholder, split at the range's two ends: what
+            // stays before and after is a placeholder of exactly its own
+            // extent now, and so is the range itself (one call: the host
+            // takes a piece out of the middle of a placeholder, and splits a
+            // prefix or a suffix off it, as [`split`] asks).
+            split(cut, cut_end - cut);
         }
         let mut back = gone;
         for (part, bytes, index) in stays {
@@ -3360,11 +3415,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 continue;
             }
             let part_slice = Slice { index, section: slice.section.clone() };
-            if !keep {
-                map(physical, part, bytes, part_slice);
-            } else if show(part, bytes, &part_slice, false, false) {
-                // (By itself, not joined with what is beside it: it shows
-                // what it showed.)
+            // (Its own placeholder, from the split above: no split of its
+            // own to ask for, and by itself: not joined with what is beside
+            // it, which would take it away again.)
+            if show(part, bytes, &part_slice, true, false) {
                 told(|| {
                     victory_gpu::title_memory_regrouped(
                         part,
@@ -3383,12 +3437,14 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
             count(6, 1, physical.views.len());
         }
-        if keep && back {
-            // What stays was cut off the view's placeholder: the rest is
-            // the unmapped part's own.
+        if !whole && back {
+            // What stays was cut off the view's placeholder: the rest is the
+            // unmapped part's own, exact, and the call's map of it needs no
+            // split of its own.
             physical.holes.insert(cut, cut_end - cut);
         }
     }
+    cut_any
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
