@@ -34,8 +34,14 @@ pub mod structure;
 /// carries worked out dword by dword, fxceless 1506 and 1507. 0x4c00_0005,
 /// one bump for the merge of the two lines: the scalar rules and fxceless
 /// 1506/1507 together, and always-true/always-false float compares lowered
-/// as constants — no cached translation is trusted across that.)
-pub const TRANSLATOR_VERSION: u32 = 0x4c00_0005;
+/// as constants — no cached translation is trusted across that. 0x4c00_0006:
+/// the mirror's translator v2 (`avatarmanz` #469 and #405) — a helper lane's
+/// `v_readfirstlane` reads its own value, `image_sample_*_g16` gradients
+/// packed as 16-bit pairs, `annotateHandle` kept block-local, export target 16
+/// as `pos4`, and a scalar written in a lane-divergent compute branch reaching
+/// every lane after the join (`VICTORY_SCALAR_SPLITS`, on) — composed with
+/// 0x4c00_0005's rules above, all of which stay.)
+pub const TRANSLATOR_VERSION: u32 = 0x4c00_0006;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
