@@ -33,6 +33,9 @@ fn images() -> std::sync::MutexGuard<'static, Vec<Mapped>> {
 pub(crate) fn mapped(image: &LoadedImage) {
     // SAFETY: reads our own static, so the linker keeps it (and its section).
     unsafe { std::ptr::from_ref(&ON_THREAD).read_volatile() };
+    // The null-chain guard skips only in the title's own code: it needs
+    // where each of the title's images lies, before any of it runs.
+    crate::crash::title_image(image.base(), image.info().size_of_image as usize);
     let image = Arc::new(image.clone());
     let mut images = images();
     images.retain(|m| m.image.base() != image.base());
@@ -227,6 +230,7 @@ fn end_other_threads(keep: &[u32]) {
 }
 
 pub(crate) fn unmapped(base: usize) {
+    crate::crash::title_image_unmapped(base);
     images().retain(|m| m.image.base() != base);
 }
 

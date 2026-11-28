@@ -12,7 +12,8 @@
 
 use std::ptr::null_mut;
 use std::sync::atomic::{
-    AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed,
+    AtomicBool, AtomicU32, AtomicU64, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
 };
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
@@ -126,8 +127,11 @@ fn switch(name: &str) -> bool {
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     // Read here, not in the handler: a faulting thread may hold any lock,
-    // the heap's included.
+    // the heap's included. Two switches: a title can have one race without
+    // the other, and a run that turns one off must still be guarded by the
+    // other.
     SKIP_NULL_VTABLE.store(switch("VICTORY_SKIP_NULL_VTABLE"), Relaxed);
+    SKIP_NULL_CHAIN.store(switch("VICTORY_SKIP_NULL_CHAIN"), Relaxed);
     static AT_EXIT: std::sync::Once = std::sync::Once::new();
     // SAFETY: registers a function with the host CRT's exit table; it reads
     // our counters and logs, nothing else.
@@ -496,9 +500,95 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 /// reads no environment on a thread that may hold the heap's lock.
 static SKIP_NULL_VTABLE: AtomicBool = AtomicBool::new(true);
 
+/// `VICTORY_SKIP_NULL_CHAIN` (on unless it is `0`): a load through a null
+/// pointer in a chain of them is skipped instead of ending the process (see
+/// [`skip_null_chain`]). Its own switch, on its own: the two faults are
+/// different shapes of the title's lifecycle races, and a run may want one
+/// skipped and the other reported. Read once by [`report_crashes`], as
+/// above.
+static SKIP_NULL_CHAIN: AtomicBool = AtomicBool::new(true);
+
 /// The skips the guard made, printed at exit and put in crash reports: a
 /// title that limps must not read like one that never faltered.
 static NULL_VTABLE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// The loads [`skip_null_chain`] skipped, counted with the vtable skips in
+/// the same accounting (at exit, and in every crash report).
+static NULL_CHAIN_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Title images the loader mapped, that [`skip_null_chain`] may skip in: a
+/// fixed table, so that the handler reads it without a lock (the faulting
+/// thread may hold any of the title's, ours or the heap's). More images than
+/// a title ships; one that does not fit is not skipped in, which is the safe
+/// way to be wrong.
+const TITLE_IMAGES: usize = 32;
+
+/// Where one title image lies: `base` is 0 until an image takes the entry.
+struct ImageSpan {
+    base: AtomicUsize,
+    /// Bytes from `base`, the image's `SizeOfImage`.
+    len: AtomicUsize,
+}
+
+impl ImageSpan {
+    const fn new() -> Self {
+        Self {
+            base: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
+        }
+    }
+}
+
+static SPANS: [ImageSpan; TITLE_IMAGES] = [const { ImageSpan::new() }; TITLE_IMAGES];
+
+/// Notes the title image the loader just mapped at `base`, `len` bytes long.
+/// [`skip_null_chain`] skips nothing outside one: the host's code (the
+/// runtime's, the C runtime's, the graphics driver's) reads a null pointer
+/// for its own reasons, and hiding that would hide our bugs as the title's.
+pub(crate) fn title_image(base: usize, len: usize) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    for span in &SPANS {
+        if span.base.load(Relaxed) == base {
+            span.len.store(len, Relaxed);
+            return;
+        }
+    }
+    for span in &SPANS {
+        if span.base.load(Acquire) != 0 {
+            continue;
+        }
+        // The length first, then the base that publishes the entry.
+        span.len.store(len, Relaxed);
+        if span.base.compare_exchange(0, base, Release, Relaxed).is_ok() {
+            return;
+        }
+    }
+    tracing::warn!(
+        base = format_args!("{base:#x}"),
+        "no room left in the title image table: the null guards skip nothing in it"
+    );
+}
+
+/// The image at `base` is unmapped: no code there is the title's any more.
+pub(crate) fn title_image_unmapped(base: usize) {
+    for span in &SPANS {
+        if span.base.load(Acquire) == base {
+            span.base.store(0, Release);
+            span.len.store(0, Relaxed);
+        }
+    }
+}
+
+/// Whether `at` is inside a title image the loader mapped.
+fn in_title_image(at: usize) -> bool {
+    SPANS.iter().any(|span| {
+        let base = span.base.load(Acquire);
+        let len = span.len.load(Acquire);
+        base != 0 && at.wrapping_sub(base) < len
+    })
+}
 
 /// Below any object the title could have: a read here is a null pointer's.
 const NULL_LIMIT: usize = 0x1_0000;
@@ -737,6 +827,152 @@ fn skip_null_vtable(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
     true
 }
 
+/// A load of a field through a base register: `mov reg, [base + disp]`.
+struct ChainLoad {
+    /// Bytes from the load to the instruction after it.
+    len: usize,
+    /// The register loaded, as instructions encode it.
+    dst: u8,
+    /// The register read through, the one that is null at the title's sites.
+    base: u8,
+    /// The offset read, which is the address that faults through a null base.
+    disp: u64,
+}
+
+/// The `mov reg, [base + disp]` at `at` in `code`, if it is exactly the load
+/// of a chain: `REX.W 8B /r` with REX.B and REX.X clear (so the base is one
+/// of the first eight registers and no index is in play), `modrm` mod 00, 01
+/// or 10, `rm` neither 100 (a SIB) nor, at mod 00, 101 (RIP-relative: no
+/// base register at all), and a displacement from 0 up to [`NULL_LIMIT`].
+/// The chain the title builds offsets forward from the object it should have
+/// had; a negative displacement is not that shape.
+fn chain_load(code: &[u8], at: usize) -> Option<ChainLoad> {
+    let rex = *code.get(at)?;
+    // W set, X and B clear: `48` (and `4c`, REX.R, for a register above r7).
+    if rex & 0x0b != 0x08 {
+        return None;
+    }
+    if *code.get(at + 1)? != 0x8b {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
+    let (mode, rm) = (modrm >> 6, modrm & 7);
+    if mode == 3 || rm == 4 || (mode == 0 && rm == 5) {
+        return None;
+    }
+    let i = at + 3;
+    let (disp, size) = match mode {
+        0 => (0i64, 0usize),
+        1 => (i64::from(*code.get(i)? as i8), 1),
+        _ => (
+            i64::from(i32::from_le_bytes(code.get(i..i + 4)?.try_into().ok()?)),
+            4,
+        ),
+    };
+    if !(0..NULL_LIMIT as i64).contains(&disp) {
+        return None;
+    }
+    Some(ChainLoad {
+        len: i + size - at,
+        dst: (modrm >> 3) & 7 | (rex & 4) << 1,
+        base: rm | (rex & 1) << 3,
+        disp: disp as u64,
+    })
+}
+
+/// The guard for the title's other null race: a chain of loads in which a
+/// middle pointer is null. In the run30 crash the title's own
+/// `movq 0x1a8(%rcx),%rax; movq 0x18(%rax),%rdx; movq 0x20(%rax),%rcx;
+/// movq 0x18(%rdx),%r8` faulted reading `0x18` with `rdx` exactly 0: a field
+/// consumed before the object that should hold it exists (a null object's
+/// field was loaded, and its own field is null too). The load is skipped
+/// with its destination register set to 0, so the chain goes on as a null
+/// pointer, which is the value the title's null tests after it expect
+/// (`testq %r14,%r14; jne`) and the value the race would have left had it
+/// gone the other way. Nothing else is emulated, because nothing else is
+/// known.
+///
+/// Fail-closed, all of: a read (not a write, not an execute); an address
+/// below [`NULL_LIMIT`]; an instruction of exactly the shape [`chain_load`]
+/// decodes; a base register that is exactly 0; a fault address that is
+/// exactly the load's displacement; and `rip` inside a title image the
+/// loader mapped. Anything else returns `false` and is reported as before:
+/// a guard that guesses is worse than a crash that says where it was.
+///
+/// The site table and its loop breaker are the vtable guard's, keyed by
+/// `rip`: a faulting site is a faulting site, whatever shape it has, and one
+/// that repeats forever must stop being skipped just the same.
+fn skip_null_chain(context: &mut CONTEXT, record: &EXCEPTION_RECORD) -> bool {
+    let p = record.ExceptionInformation;
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
+        || record.NumberParameters < 2
+        || p[0] != 0
+        || p[1] >= NULL_LIMIT
+    {
+        return false;
+    }
+    let rip = context.Rip as usize;
+    if !in_title_image(rip) {
+        return false;
+    }
+    // The longest such load is 7 bytes, and none of them past the faulting
+    // instruction's page: the next page may not be mapped.
+    let room = (0x1000 - (rip & 0xfff)).min(7);
+    let mut code = [0u8; 7];
+    // SAFETY: reads the title's code at `rip` through the system, which
+    // faults nothing of ours; the buffer is ours.
+    if !unsafe { read_into(rip, &mut code[..room]) } {
+        return false;
+    }
+    let Some(load) = chain_load(&code[..room], 0) else {
+        return false;
+    };
+    // The state as well as the bytes: the base is null, and the access was
+    // to the very offset the load reads.
+    if *gpr(context, load.base) != 0 || p[1] != load.disp as usize {
+        return false;
+    }
+    let Some(n) = count_skip(rip) else {
+        tracing::warn!(
+            site = %locate(rip),
+            "null chain load not skipped: too many at this site"
+        );
+        return false;
+    };
+    *gpr(context, load.dst) = 0;
+    context.Rip = context.Rip.wrapping_add(load.len as u64);
+    let total = NULL_CHAIN_SKIPS.fetch_add(1, Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(4) {
+        tracing::warn!(
+            site = %locate(rip),
+            disp = format_args!("{:#x}", load.disp),
+            dst = load.dst,
+            skip = n,
+            total,
+            "null chain load skipped"
+        );
+    }
+    true
+}
+
+/// The null-pointer guards, in the order the handler runs them; `vtable` and
+/// `chain` are their switches as [`report_crashes`] read them. Their own
+/// switches, not each other's: a run that turns one off keeps the other.
+fn skip_null_faults(
+    context: &mut CONTEXT,
+    record: &EXCEPTION_RECORD,
+    vtable: bool,
+    chain: bool,
+) -> bool {
+    if vtable && skip_null_vtable(context, record) {
+        return true;
+    }
+    if chain && skip_null_chain(context, record) {
+        return true;
+    }
+    false
+}
+
 /// `n` bytes at `at` if all of them are readable, without allocating: the
 /// handler may run on a thread that holds the heap's lock.
 ///
@@ -764,18 +1000,21 @@ unsafe extern "C" {
     fn atexit(f: extern "C" fn()) -> i32;
 }
 
-/// Process exit: how many calls the guard skipped, so that a run which
-/// limped through them is not read as one that did not.
+/// Process exit: how many calls and loads the guards skipped, so that a run
+/// which limped through them is not read as one that did not.
 extern "C" fn skips_at_exit() {
-    let skips = NULL_VTABLE_SKIPS.load(Relaxed);
-    if skips == 0 {
-        return;
-    }
     let sites = SITES_SEEN
         .iter()
         .filter(|site| site.rip.load(Relaxed) != 0)
         .count();
-    tracing::info!(skips, sites, "null vtable calls skipped (at exit)");
+    let vtable = NULL_VTABLE_SKIPS.load(Relaxed);
+    if vtable != 0 {
+        tracing::info!(skips = vtable, sites, "null vtable calls skipped (at exit)");
+    }
+    let chain = NULL_CHAIN_SKIPS.load(Relaxed);
+    if chain != 0 {
+        tracing::info!(skips = chain, sites, "null chain loads skipped (at exit)");
+    }
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -820,21 +1059,24 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
     }
-    // `VICTORY_SKIP_NULL_VTABLE` (on unless `0`): a virtual call through a
-    // null vtable pointer is the title's own lifecycle race, and is skipped
-    // rather than ending the process (see [`skip_null_vtable`]).
-    if SKIP_NULL_VTABLE.load(Relaxed) {
+    // `VICTORY_SKIP_NULL_VTABLE` / `VICTORY_SKIP_NULL_CHAIN` (each on unless
+    // `0`): a virtual call through a null vtable pointer, or a load through
+    // a null pointer in a chain of them, is the title's own lifecycle race,
+    // and is skipped rather than ending the process (see [`skip_null_faults`]).
+    let skipped = {
         // SAFETY: the system passes the exception being dispatched, and
-        // `skip_null_vtable` reports the exception it could not skip.
-        let skipped = unsafe {
-            skip_null_vtable(
+        // `skip_null_faults` reports the exception it could not skip.
+        unsafe {
+            skip_null_faults(
                 &mut *(*info).ContextRecord,
                 &*(*info).ExceptionRecord,
+                SKIP_NULL_VTABLE.load(Relaxed),
+                SKIP_NULL_CHAIN.load(Relaxed),
             )
-        };
-        if skipped {
-            return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
+    };
+    if skipped {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
@@ -1050,11 +1292,19 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
-    let skips = NULL_VTABLE_SKIPS.load(Relaxed);
-    if skips != 0 {
-        line(format!(
-            "  null vtable calls skipped before this: {skips}"
-        ));
+    for (skips, what) in [
+        (
+            NULL_VTABLE_SKIPS.load(Relaxed),
+            "null vtable calls skipped before this",
+        ),
+        (
+            NULL_CHAIN_SKIPS.load(Relaxed),
+            "null chain loads skipped before this",
+        ),
+    ] {
+        if skips != 0 {
+            line(format!("  {what}: {skips}"));
+        }
     }
     // Once for a crash (the first-chance report; the unhandled one repeats
     // the registers only).
@@ -2049,5 +2299,224 @@ mod tests {
         assert_eq!(count_skip(rip), None, "past the limit, inside the window");
         // Another site still has its own allowance.
         assert_eq!(count_skip(rip + 0x100), Some(1));
+    }
+
+    /// The chain guard skips nothing outside a title image, so its code
+    /// lives in a page registered as one. The page is leaked: its address
+    /// stays out of every other test's allocations, so no other test's code
+    /// can land inside the span, and the span stays good for the process.
+    fn title_code(slot: usize, code: &[u8]) -> usize {
+        assert!(slot < 30, "slot {slot} is past the page's 30");
+        assert!(code.len() <= 0x20, "{} bytes is past a slot", code.len());
+        static BASE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(|| {
+            #[repr(align(4096))]
+            struct Page([u8; 4096]);
+            let page = Box::leak(Box::new(Page([0xcc; 4096])));
+            let base = page.0.as_ptr() as usize;
+            title_image(base, page.0.len());
+            base
+        });
+        // SAFETY: `base` is a leaked page of ours, and each slot is written
+        // by one test only (the slot numbers are the tests').
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                code.as_ptr(),
+                (base + 0x40 * slot) as *mut u8,
+                code.len(),
+            );
+        }
+        base + 0x40 * slot
+    }
+
+    /// The record of an access violation of `kind` (0 read, 1 write) at
+    /// `fault`.
+    fn access_violation(fault: usize, kind: usize) -> EXCEPTION_RECORD {
+        // SAFETY: an all-zero record is valid.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        record.NumberParameters = 2;
+        record.ExceptionInformation[0] = kind;
+        record.ExceptionInformation[1] = fault;
+        record
+    }
+
+    /// As if a thread whose `base` register holds `value` faulted reading
+    /// `fault` at `code`, at `slot` of the title page: how far the chain
+    /// guard advanced `rip`, and the state after.
+    fn chain_skip(
+        slot: usize,
+        (base, value): (u8, u64),
+        code: &[u8],
+        fault: usize,
+        kind: usize,
+    ) -> (Option<usize>, CONTEXT) {
+        let start = title_code(slot, code);
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = start as u64;
+        context.EFlags = 0x202 | CMP_FLAGS;
+        *gpr(&mut context, base) = value;
+        let record = access_violation(fault, kind);
+        let skipped = skip_null_chain(&mut context, &record);
+        (skipped.then(|| context.Rip as usize - start), context)
+    }
+
+    #[test]
+    fn a_chain_load_is_a_rex_w_load_through_one_base_register() {
+        let load = |code: &[u8]| chain_load(code, 0).map(|l| (l.len, l.dst, l.base, l.disp));
+        // The title's own loads: movq 0x18(%rdx),%r8, movq 0x1a8(%rcx),%rax,
+        // and the same shape with no displacement, through rbp, and with a
+        // disp32.
+        assert_eq!(load(&[0x4c, 0x8b, 0x42, 0x18]), Some((4, 8, 2, 0x18)));
+        assert_eq!(
+            load(&[0x48, 0x8b, 0x81, 0xa8, 0x01, 0x00, 0x00]),
+            Some((7, 0, 1, 0x1a8))
+        );
+        assert_eq!(load(&[0x48, 0x8b, 0x07]), Some((3, 0, 7, 0)));
+        assert_eq!(load(&[0x48, 0x8b, 0x4d, 0x20]), Some((4, 1, 5, 0x20)));
+        // Not one: a register as the source, a SIB's index, RIP-relative (no
+        // base at all), a store, a 32-bit load, a base above the first eight
+        // registers, displacements out of range, and a cut-off instruction.
+        assert_eq!(load(&[0x48, 0x8b, 0xc2]), None);
+        assert_eq!(load(&[0x48, 0x8b, 0x04, 0x10]), None);
+        assert_eq!(load(&[0x48, 0x8b, 0x05, 0x18, 0x00, 0x00, 0x00]), None);
+        assert_eq!(load(&[0x48, 0x89, 0x42, 0x18]), None);
+        assert_eq!(load(&[0x44, 0x8b, 0x42, 0x18]), None);
+        assert_eq!(load(&[0x49, 0x8b, 0x42, 0x18]), None);
+        assert_eq!(load(&[0x48, 0x8b, 0x87, 0x00, 0x00, 0x01, 0x00]), None);
+        assert_eq!(load(&[0x48, 0x8b, 0x47, 0x80]), None);
+        assert_eq!(load(&[0x48, 0x8b, 0x87, 0xf0, 0xff, 0xff, 0xff]), None);
+        assert_eq!(load(&[0x48, 0x8b, 0x81, 0xa8, 0x01]), None);
+        assert_eq!(load(&[0x4c, 0x8b]), None);
+        assert_eq!(load(&[]), None);
+    }
+
+    #[test]
+    fn a_null_chain_load_is_skipped_as_a_load_of_zero() {
+        let before = NULL_CHAIN_SKIPS.load(Relaxed);
+        // The title's own site: movq 0x18(%rdx),%r8 with rdx = 0, which
+        // faults reading 0x18 (run30's 0x1400381f0: 4c 8b 42 18). The load
+        // is skipped with r8 = 0, the value a null object's field has and
+        // the one the title's testq after it expects; a load leaves the
+        // flags as they were.
+        let (skipped, context) = chain_skip(0, (2, 0), &[0x4c, 0x8b, 0x42, 0x18], 0x18, 0);
+        assert_eq!(skipped, Some(4));
+        assert_eq!(context.R8, 0);
+        assert_eq!(context.EFlags, 0x202 | CMP_FLAGS);
+        assert!(NULL_CHAIN_SKIPS.load(Relaxed) > before, "skips are counted");
+        // The same shape at the chain's other loads: no displacement, and a
+        // disp32.
+        assert_eq!(chain_skip(1, (7, 0), &[0x48, 0x8b, 0x07], 0, 0).0, Some(3));
+        assert_eq!(
+            chain_skip(
+                2,
+                (1, 0),
+                &[0x48, 0x8b, 0x81, 0xa8, 0x01, 0x00, 0x00],
+                0x1a8,
+                0
+            )
+            .0,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn anything_but_a_null_base_at_its_own_displacement_is_not_skipped() {
+        let observed = [0x4c, 0x8b, 0x42, 0x18];
+        let skip =
+            |slot, base, code: &[u8], fault, kind| chain_skip(slot, base, code, fault, kind).0;
+        // A base that is not null: the object the chain wanted is there, so
+        // a fault is something else.
+        assert_eq!(skip(4, (2, 0x1000), &observed, 0x1018, 0), None);
+        // Another fault address than the displacement, a write, and one
+        // above the null page.
+        assert_eq!(skip(5, (2, 0), &observed, 0x20, 0), None);
+        assert_eq!(skip(6, (2, 0), &observed, 0x18, 1), None);
+        assert_eq!(skip(7, (2, 0), &observed, 0x1_0000, 0), None);
+        // Displacements the shape does not have: 0x10000 and up, and
+        // negative ones.
+        assert_eq!(
+            skip(8, (7, 0), &[0x48, 0x8b, 0x87, 0x00, 0x00, 0x01, 0x00], 0x18, 0),
+            None
+        );
+        assert_eq!(skip(9, (7, 0), &[0x48, 0x8b, 0x47, 0x80], 0x18, 0), None);
+        assert_eq!(
+            skip(
+                10,
+                (7, 0),
+                &[0x48, 0x8b, 0x87, 0xf0, 0xff, 0xff, 0xff],
+                0x18,
+                0
+            ),
+            None
+        );
+        // A SIB (an index is no base), RIP-relative (no base register at
+        // all), and a register form (no memory read at all).
+        assert_eq!(skip(11, (0, 0), &[0x48, 0x8b, 0x04, 0x10], 0, 0), None);
+        assert_eq!(
+            skip(12, (5, 0), &[0x48, 0x8b, 0x05, 0x18, 0x00, 0x00, 0x00], 0x18, 0),
+            None
+        );
+        assert_eq!(skip(13, (2, 0), &[0x48, 0x8b, 0xc2], 0x18, 0), None);
+        // Not a 64-bit load, and not a load.
+        assert_eq!(skip(14, (2, 0), &[0x44, 0x8b, 0x42, 0x18], 0x18, 0), None);
+        assert_eq!(skip(15, (2, 0), &[0x48, 0x89, 0x42, 0x18], 0x18, 0), None);
+        // Not an access violation.
+        let at = title_code(16, &observed);
+        // SAFETY: an all-zero record and context are valid.
+        let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+        record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+        // SAFETY: as above.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rip = at as u64;
+        assert!(!skip_null_chain(&mut context, &record));
+        // SAFETY: as above.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        // Code outside every title image, the host's: the guard leaves it to
+        // be reported.
+        #[repr(align(4096))]
+        struct Outside([u8; 4096]);
+        let page = Box::leak(Box::new(Outside([0xcc; 4096])));
+        page.0[0x800..0x804].copy_from_slice(&observed);
+        context.Rip = page.0.as_ptr() as u64 + 0x800;
+        assert!(!skip_null_chain(&mut context, &access_violation(0x18, 0)));
+    }
+
+    #[test]
+    fn a_chain_site_skipped_too_often_is_reported_instead() {
+        // A site of its own, so the other tests' skips do not count: the
+        // vtable guard's table and its breaker are the chain guard's too.
+        let code = [0x4c, 0x8b, 0x42, 0x18];
+        for n in 1..=SKIP_LIMIT {
+            assert_eq!(chain_skip(20, (2, 0), &code, 0x18, 0).0, Some(4), "skip {n}");
+        }
+        assert_eq!(
+            chain_skip(20, (2, 0), &code, 0x18, 0).0,
+            None,
+            "past the limit, inside the window"
+        );
+    }
+
+    #[test]
+    fn the_two_null_guards_keep_their_own_switch() {
+        // mov (%rdi),%r15; call *0x8(%r15) at one site, the chain's load at
+        // another, both registers null as at the title's own sites.
+        let call = title_code(21, &[0x4c, 0x8b, 0x3f, 0x41, 0xff, 0x57, 0x08]) + 3;
+        let load = title_code(22, &[0x4c, 0x8b, 0x42, 0x18]);
+        let attempt = |at: usize, fault: usize, vtable: bool, chain: bool| {
+            // SAFETY: an all-zero context is valid.
+            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+            context.Rip = at as u64;
+            skip_null_faults(&mut context, &access_violation(fault, 0), vtable, chain)
+        };
+        // Each guard skips its own shape with its own switch on, whatever
+        // the other's says, and neither with its switch off.
+        assert!(attempt(call, 0x8, true, true));
+        assert!(attempt(call, 0x8, true, false));
+        assert!(!attempt(call, 0x8, false, true));
+        assert!(attempt(load, 0x18, true, true));
+        assert!(attempt(load, 0x18, false, true));
+        assert!(!attempt(load, 0x18, true, false));
     }
 }
