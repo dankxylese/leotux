@@ -151,6 +151,9 @@ variable set in the environment wins. Our `run-victory-direct.sh` takes the same
 | `VICTORY_CARD_BUFFERS_MIN_KB` | `1024` | buffers under 1 MiB do not get a VRAM copy (prologue A/B: p90 95.4 -> 78.8 ms, the world-load dip ~2 s shorter, no VRAM pressure); `64` restores the old floor |
 | `VICTORY_REFRESH_EPOCH` | `1` | epoch summaries answer provably-clean refresh spans in O(1) instead of walking them (verified 0 disagreements against full walks; `0` walks); pairs with `VICTORY_EPOCH_VERIFY=1` to watch agreement live |
 | `VICTORY_REFRESH_RUNS` | `1` | refreshes track up to 8 disjoint runs per copy instead of one min-max envelope (stdev 26.9 -> 10.6 with the verifier off; `0` restores the single envelope) |
+| `VICTORY_QUICK_ASK` | `1` | a refresh's "nothing changed" ask reads the copy's mirrored whole-range notes and a pending hint instead of taking the notes' and the writes' locks (VIctory-Fast's ranged seqlock + pending count; `0`: both locks, as before) |
+| `VICTORY_QUICK_FIND` | `1` | thread-local answers of which copy holds a range, 8,192 a thread, kept until the tables change (`0`: every ask through the registry's lock) |
+| `VICTORY_DEAD_COPIES` | `1` | copies whose title memory is gone (buffer released, in-place window let go) are left out of the asks and the refreshes (`0`: asked about as before) |
 | `VICTORY_THIN_THREADS` | `14` | thin worker threads (neutral A/B in the prologue; kept for denser scenes) |
 | `VICTORY_WARM_FIRST` | `1` | `0`: start the title without compiling shaders first |
 | `VICTORY_FORK_SETTINGS` | `1` | `0`: none of the tree's speed switches (to tell whether one of them is at fault) |

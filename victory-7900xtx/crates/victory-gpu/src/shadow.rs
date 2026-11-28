@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -45,6 +45,31 @@ impl CopyNotes {
     }
 }
 
+/// One whole-copied range as the lock-free mirror holds it ([`Shadow::ranged`],
+/// `VICTORY_QUICK_ASK`).
+#[derive(Default)]
+struct RangedMirror {
+    from: AtomicU64,
+    to: AtomicU64,
+    at: AtomicU64,
+}
+
+impl RangedMirror {
+    /// The asking after which it was taken, if its range holds `[from, to)`
+    /// and the reader's snapshot of the mirror is the published one.
+    fn holding(&self, from: usize, to: usize) -> u64 {
+        let (lo, hi) = (self.from.load(Ordering::Relaxed), self.to.load(Ordering::Relaxed));
+        let at = self.at.load(Ordering::Relaxed);
+        if hi != 0 && lo <= from as u64 && (to as u64) <= hi { at } else { 0 }
+    }
+
+    fn set(&self, (from, to, at): (usize, usize, u64)) {
+        self.from.store(from as u64, Ordering::Relaxed);
+        self.to.store(to as u64, Ordering::Relaxed);
+        self.at.store(at, Ordering::Relaxed);
+    }
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -67,11 +92,27 @@ pub(crate) struct Shadow {
     /// whose summaries said "not untouched" need not be asked again until the
     /// copy takes something ([`DIRTY_AT`]).
     took: std::sync::atomic::AtomicU64,
+    /// The two range notes of `copied` a refresh asks about most (the longest
+    /// taken whole and the last), mirrored without its lock and published
+    /// under a seqlock: `ranged_seq` even, and unchanged around the reads,
+    /// means they are one consistent set (`VICTORY_QUICK_ASK`).
+    ranged_seq: AtomicU64,
+    ranged: [RangedMirror; 2],
+    /// The title's memory behind the copy is gone (the title released the
+    /// buffer, or an in-place window there was let go): nothing can be
+    /// brought up to date from it any more, and asking about it is left out
+    /// (`VICTORY_DEAD_COPIES=0`: asked about as before).
+    dead: AtomicBool,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// How many `pending` holds, as a hint for readers
+    /// (`VICTORY_QUICK_ASK`): an ask that finds none skips that lock, which
+    /// every refresh of every copy took (a frame asked about view memory
+    /// some 1,500 times, on up to seven threads).
+    pending_count: AtomicU64,
     /// With `VICTORY_WC_NO_BACK=1`: ranges shaders wrote and that were not
     /// copied back ([`crate::wc::no_back`]): title memory there is older
     /// than the copy for good, so a refresh that cannot tell what the CPU
@@ -200,6 +241,80 @@ impl Ranged {
             .map(|r| r.2)
             .max()
             .unwrap_or(0)
+    }
+
+    /// The two ranges [`Shadow::ranged`] mirrors without the notes' lock: the
+    /// longest taken whole (it covers the most of whatever comes next) and
+    /// the last (the one a frame's next ask is usually about). Both are of
+    /// this set, so an answer off them is never newer than `holding`'s.
+    fn mirrored(&self) -> [(usize, usize, u64); 2] {
+        [self.longest, self.at[(self.next + Self::KEPT - 1) % Self::KEPT]]
+    }
+}
+
+#[cfg(test)]
+mod ranged_tests {
+    use super::{PAGE, Ranged, RangedMirror};
+
+    /// The mirror holds two ranges of the notes, and only answers inside one:
+    /// an ask it answers is never newer than the notes' own answer, which is
+    /// all `copy_stale` needs (a lower asking copies more, never less).
+    #[test]
+    fn the_mirror_never_answers_newer_than_the_notes() {
+        let mut ranges = Ranged::default();
+        let taken = [
+            (0, 4 * PAGE, 3),
+            (PAGE, 3 * PAGE, 7),
+            (2 * PAGE, 9 * PAGE, 11),
+            (0, PAGE, 13),
+            (PAGE / 2, 2 * PAGE, 17),
+        ];
+        for &(from, to, at) in &taken {
+            ranges.add(from, to, at);
+            let [longest, newest] = ranges.mirrored();
+            let mirrored = |from: usize, to: usize| {
+                [longest, newest]
+                    .iter()
+                    .filter(|r| r.0 < r.1 && r.0 <= from && to <= r.1)
+                    .map(|r| r.2)
+                    .max()
+                    .unwrap_or(0)
+            };
+            for from in [0, PAGE / 2, PAGE, 2 * PAGE, 3 * PAGE] {
+                for to in [PAGE, 2 * PAGE, 3 * PAGE, 4 * PAGE, 9 * PAGE] {
+                    if to <= from {
+                        continue;
+                    }
+                    let notes = ranges.holding(from, to);
+                    let mirror = mirrored(from, to);
+                    assert!(mirror == 0 || mirror <= notes, "{from:#x}..{to:#x}: mirror {mirror} > notes {notes}");
+                }
+            }
+        }
+    }
+
+    /// The range a frame asks about next is usually the one just taken: it is
+    /// always of the two mirrored.
+    #[test]
+    fn the_last_range_taken_is_mirrored() {
+        let mut ranges = Ranged::default();
+        ranges.add(0, 4 * PAGE, 3);
+        ranges.add(2 * PAGE, 9 * PAGE, 11);
+        let [_, newest] = ranges.mirrored();
+        assert_eq!(newest, (2 * PAGE, 9 * PAGE, 11));
+        assert_eq!(ranges.holding(2 * PAGE, 9 * PAGE), 11);
+    }
+
+    /// A mirrored range answers for the spans inside it, and for no other.
+    #[test]
+    fn a_mirrored_range_answers_only_inside_it() {
+        let mirror = RangedMirror::default();
+        assert_eq!(mirror.holding(0, 1), 0);
+        mirror.set((0x1000, 0x2000, 9));
+        assert_eq!(mirror.holding(0x1000, 0x2000), 9);
+        assert_eq!(mirror.holding(0x1800, 0x2000), 9);
+        assert_eq!(mirror.holding(0x0fff, 0x2000), 0);
+        assert_eq!(mirror.holding(0x1000, 0x2001), 0);
     }
 }
 
@@ -3672,6 +3787,21 @@ fn dirty_remember(id: u64, took: u64, from: usize, to: usize) {
     let _ = DIRTY_AT.try_with(|d| d.set((id, took, from, to)));
 }
 
+/// Whether a refresh's asks are answered without the copies' notes lock where
+/// the journal's summaries can answer: the pending hint and the mirrored
+/// range notes (`VICTORY_QUICK_ASK=0`: both locks, as before). The copy the
+/// answers lead to is the same either way: the mirror is only ever a lower
+/// bound of what the notes hold, so an ask it cannot answer is walked.
+fn quick_ask() -> bool {
+    crate::toggled!("VICTORY_QUICK_ASK")
+}
+
+/// Whether copies whose title memory is gone are left out of the asks
+/// (`VICTORY_DEAD_COPIES=0`: asked about as before).
+fn dead_copies() -> bool {
+    crate::toggled!("VICTORY_DEAD_COPIES")
+}
+
 /// The copy whose page notes this thread holds now (0: none).
 fn pages_mine() -> u64 {
     PAGES_MINE.try_with(std::cell::Cell::get).unwrap_or(0)
@@ -3756,6 +3886,75 @@ impl Shadow {
         self.id
     }
 
+    /// Whether the title's memory behind the copy is gone (the buffer it
+    /// copies was released, or the in-place window there was let go). What
+    /// is in the copy is all there is then: a refresh would copy from
+    /// memory the title no longer owns, and zeros from a freed range were
+    /// put over bytes the card is reading. Said of the copies that are not
+    /// in place: an in-place window is its title memory.
+    pub(crate) fn is_dead(&self) -> bool {
+        dead_copies() && self.dead.load(Ordering::Acquire)
+    }
+
+    /// The title's memory behind the copy went ([`Shadow::is_dead`]): said
+    /// where the tables let the copy go. The copy itself lives on, in the
+    /// lists and slots that hold it.
+    pub(crate) fn mark_dead(&self) {
+        self.dead.store(true, Ordering::Release);
+    }
+
+    /// Whether the copy holds no range a shader may be writing now: the
+    /// hint read (an atomic) instead of the lock, when `VICTORY_QUICK_ASK`
+    /// is on. A hint of none is what the lock would have said to an ask
+    /// made at the same moment: a range declared after it is one a refresh
+    /// that took the lock would have missed just the same.
+    fn no_pending(&self) -> bool {
+        quick_ask() && self.pending_count.load(Ordering::Acquire) == 0
+    }
+
+    /// `pending` with the hint kept: the lock is held by the caller.
+    fn held(&self, pending: &[(usize, usize)]) {
+        self.pending_count.store(pending.len() as u64, Ordering::Release);
+    }
+
+    /// The whole-copied range holding `[from, to)` as the mirrored notes say
+    /// it, without their lock: `Some(at)` for the asking after which it was
+    /// taken whole, `None` if the mirror holds none for the span (the notes
+    /// themselves then answer, [`Shadow::ranged`]).
+    fn ranged_quick(&self, from: usize, to: usize) -> Option<u64> {
+        if !quick_ask() {
+            return None;
+        }
+        let s1 = self.ranged_seq.load(Ordering::Acquire);
+        // (0: nothing published yet; odd: being published.)
+        if s1 == 0 || s1 & 1 == 1 {
+            return None;
+        }
+        let held = [self.ranged[0].holding(from, to), self.ranged[1].holding(from, to)];
+        std::sync::atomic::fence(Ordering::Acquire);
+        if self.ranged_seq.load(Ordering::Relaxed) != s1 {
+            return None;
+        }
+        let at = held[0].max(held[1]);
+        (at != 0).then_some(at)
+    }
+
+    /// Publishes the notes' two mirrored ranges: called with `copied`'s lock
+    /// held, after a range was added (a seqlock: odd while it is written,
+    /// even and stable when the pair is one set).
+    fn publish_ranged(&self, notes: &CopyNotes) {
+        if !quick_ask() {
+            return;
+        }
+        let seq = self.ranged_seq.load(Ordering::Relaxed);
+        self.ranged_seq.store(seq.wrapping_add(1), Ordering::Release);
+        for (slot, range) in self.ranged.iter().zip(notes.ranges.mirrored()) {
+            slot.set(range);
+        }
+        std::sync::atomic::fence(Ordering::Release);
+        self.ranged_seq.store(seq.wrapping_add(2), Ordering::Release);
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -3811,8 +4010,12 @@ impl Shadow {
             len,
             copied: Mutex::new(CopyNotes { pages: vec![0; pages as usize], ranges: Ranged::default() }),
             took: Default::default(),
+            ranged_seq: AtomicU64::new(0),
+            ranged: Default::default(),
+            dead: AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_count: AtomicU64::new(0),
             card_owned: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3892,6 +4095,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.held(&pending);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3916,6 +4120,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.held(&pending);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -4206,6 +4411,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.held(&pending);
         // (Under the lock: who finds a range gone finds this counted.)
         DONE_WITH[1].fetch_add(1, Ordering::SeqCst);
         if !pending.is_empty() || self.card.is_some() {
@@ -4265,12 +4471,18 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
+        if self.no_pending() {
+            return false;
+        }
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
+        if self.no_pending() {
+            return false;
+        }
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
@@ -4288,7 +4500,7 @@ impl Shadow {
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
+        if from >= to || self.no_pending() {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -4601,6 +4813,12 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        // The title's memory behind it is gone: what the copy holds is all
+        // there is, and a copy from a freed range would put its zeros over
+        // bytes the card reads ([`Shadow::is_dead`]).
+        if self.is_dead() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4613,14 +4831,17 @@ impl Shadow {
         if matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) && self.epoch_clean(from, to) {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let mut busy: Vec<(usize, usize)> = if self.no_pending() {
+            Vec::new()
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        };
         // Ranges the card keeps (`VICTORY_WC_NO_BACK`): left out where the
         // write watch cannot say which pages the CPU wrote, so a whole copy
         // would put the title's old bytes over what shaders wrote.
@@ -4672,6 +4893,8 @@ impl Shadow {
             for (from, to, now) in later.ranged {
                 copied.ranges.add(from, to, now);
             }
+            // (Under the notes' lock: the mirror is published with them.)
+            self.publish_ranged(&copied);
             drop(copied);
             self.took.fetch_add(1, Ordering::Relaxed);
         }
@@ -4684,34 +4907,47 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
-        if self.place.is_some() {
+        let Some((from, to)) = self.asks(address, len) else {
             return true;
-        }
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
-            return true;
-        }
+        };
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if !self.no_pending()
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         // First, the journal's summaries (`VICTORY_REFRESH_EPOCH=1`): nothing
         // noted written in the span since the copy last took it whole, and
         // every block of it published, is clean without walking a page. The
-        // asking taken for it is the walk's too — one take of that lock, not
-        // two — and a span the summaries said not clean is not asked again
+        // asking it needs is the copy's own mirrored notes when they cover
+        // the span (`VICTORY_QUICK_ASK`, no lock at all), the notes' lock
+        // otherwise; a span the summaries said not clean is not asked again
         // ([`DIRTY_AT`]).
+        //
+        // (A span the verifier samples takes the notes' path whatever the
+        // mirror says: it is walked as well and the two answers compared,
+        // `VICTORY_EPOCH_VERIFY=1`.)
         let took = self.took.load(Ordering::Relaxed);
-        let since = self.ranged(from, to);
-        if !dirty_known(self.id, took, from, to) && self.epoch_clean_at(from, to, since, took) {
+        let known = dirty_known(self.id, took, from, to);
+        let sampled = crate::watch::epoch_sample(from, to);
+        if !known
+            && !sampled
+            && let Some(since) = self.ranged_quick(from, to)
+            && self.epoch_clean_at(from, to, since, took, None)
+        {
             return true;
         }
+        // The notes, one take of their lock: pages and range notes read
+        // together (the mirror may hold a lower asking than they do).
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied.pages, since);
+        let since = copied.ranged(from, to);
+        if !known && since != 0 && self.epoch_clean_at(from, to, since, took, Some(&copied)) {
+            return true;
+        }
+        let same = crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.pages, since);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4719,6 +4955,67 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
+    }
+
+    /// [`Shadow::nothing_new`] answered from the journal's summaries alone,
+    /// with `journal`, a read of it the caller holds for a whole flush of
+    /// spans (`crate::watch::Read`): no lock of the copy is taken, so one
+    /// read answers for every span where a frame asks about view memory some
+    /// 1,500 times, on up to seven threads. `false` if the summaries cannot
+    /// answer (the span is then asked of its notes, [`Shadow::nothing_new`]);
+    /// a span the verifier samples is not answered here, so that its walk is
+    /// compared as it would be.
+    pub(crate) fn nothing_new_fast(&self, journal: &crate::watch::Read<'_>, address: usize, len: usize) -> bool {
+        let Some((from, to)) = self.asks(address, len) else {
+            return true;
+        };
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return false;
+        }
+        if !self.no_pending()
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
+            return false;
+        }
+        if crate::watch::epoch_sample(from, to) {
+            return false;
+        }
+        let took = self.took.load(Ordering::Relaxed);
+        if dirty_known(self.id, took, from, to) {
+            return false;
+        }
+        let Some(since) = self.ranged_quick(from, to) else {
+            return false;
+        };
+        let clean = journal.untouched(from, to, since);
+        if !clean {
+            dirty_remember(self.id, took, from, to);
+            return false;
+        }
+        if crate::watch::epoch() {
+            crate::watch::epoch_answered((to - from) as u64);
+            return true;
+        }
+        false
+    }
+
+    /// The span of the copy an ask of `[address, address + len)` is about, or
+    /// `None` where the copy copies nothing at all (in place, its memory
+    /// gone, or the ask outside it): what is in the copy is all there is.
+    /// Memory that is not write-watched is *not* this: it is copied whole at
+    /// every refresh, which the callers say themselves.
+    fn asks(&self, address: usize, len: usize) -> Option<(usize, usize)> {
+        if self.place.is_some() {
+            return None;
+        }
+        // Nothing can arrive from memory the title no longer owns: what the
+        // copy holds is what the card reads ([`Shadow::is_dead`]).
+        if self.is_dead() {
+            return None;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        (from < to).then_some((from, to))
     }
 
     /// Whether `[from, to)` of the copy is provably untouched by the
@@ -4740,14 +5037,29 @@ impl Shadow {
         if dirty_known(self.id, took, from, to) {
             return false;
         }
-        let since = self.ranged(from, to);
-        self.epoch_clean_at(from, to, since, took)
+        // The mirrored notes answer without their lock (`VICTORY_QUICK_ASK`);
+        // a span no mirrored range covers takes the lock, as before.
+        let since = match self.ranged_quick(from, to) {
+            Some(since) => since,
+            None => self.ranged(from, to),
+        };
+        if since == 0 {
+            return false;
+        }
+        self.epoch_clean_at(from, to, since, took, None)
     }
 
     /// [`Shadow::epoch_clean`] at the asking `since` the caller has already
     /// taken ([`Shadow::nothing_new`] takes it for the walk anyway), with
     /// `took` as it was read before it.
-    fn epoch_clean_at(&self, from: usize, to: usize, since: u64, took: u64) -> bool {
+    ///
+    /// `held`, the copy's notes when the caller holds them, is what the
+    /// verifier's walk reads (`VICTORY_EPOCH_VERIFY=1`): they are not taken
+    /// twice, and where the caller holds none they are taken here and
+    /// released before the journal's read, which is the order every refresh
+    /// keeps — the notes' lock is never held while the journal's is waited
+    /// for, and the journal's is never held while the notes' is taken.
+    fn epoch_clean_at(&self, from: usize, to: usize, since: u64, took: u64, held: Option<&CopyNotes>) -> bool {
         if since == 0 {
             dirty_remember(self.id, took, from, to);
             return false;
@@ -4757,9 +5069,17 @@ impl Shadow {
             dirty_remember(self.id, took, from, to);
         }
         if crate::watch::epoch_sample(from, to) {
-            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            let walk = crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied.pages, since);
-            drop(copied);
+            let mine;
+            let notes = match held {
+                Some(notes) => notes,
+                None => {
+                    mine = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    &mine
+                }
+            };
+            let read = crate::watch::read();
+            let walk = read.nothing_new(from, to, self.start as usize / PAGE, &notes.pages, since);
+            drop(read);
             crate::watch::epoch_compare(from, to, since, clean, walk, self.id);
         }
         if clean && crate::watch::epoch() {
@@ -4960,6 +5280,9 @@ fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)],
             // our `Ranged` adds the last few and the longest, and `took` says
             // a span's summary answer is stale from here on.
             copied.ranges.add(from, to, now);
+            // (Published with the notes, so an ask off the mirror is the
+            // answer this thread would have given.)
+            self.publish_ranged(&copied);
             self.took.fetch_add(1, Ordering::Relaxed);
         }
         bytes
@@ -5866,6 +6189,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.held(&[(0, 1)]);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -5933,20 +6257,32 @@ struct Entry {
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
-    // What threads remember of it ([`FOUND`]) is of before.
-    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-    map
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How often [`BUFFERS`] was taken to be changed.
-static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+/// How often the tables of copies were changed for good ([`BUFFERS`], and the
+/// in-place windows beside them): the epoch a thread's remembered answers
+/// ([`FOUND`]) are of. Raised where a table changes for good, not where one is
+/// merely taken: answers stayed valid while a buffer came and went about
+/// (`VICTORY_QUICK_FIND`), and the cache is wide enough to keep a world
+/// frame's asks ([`FOUND_MOST`]).
+static SHADOW_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-/// Answers a thread remembers.
-const FOUND_MOST: usize = 1024;
+/// [`SHADOW_EPOCH`] now: the [`FOUND`] answers of a thread are of it.
+pub(crate) fn epoch() -> u64 {
+    SHADOW_EPOCH.load(Ordering::Acquire)
+}
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
+/// Says a table changed for good: no remembered answer is of after it.
+fn changed() {
+    SHADOW_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// Answers a thread remembers: the asks of a frame's views and root
+/// descriptors, a few thousand, without conflict thrashing.
+const FOUND_MOST: usize = 8192;
+
+/// An ask (address, bytes), the epoch it was answered at, and the answer.
 type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
 
 thread_local! {
@@ -5964,25 +6300,33 @@ fn quick_find() -> bool {
 
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+    (h >> 51) as usize & (FOUND_MOST - 1)
 }
 
-/// What this thread remembers of an ask, if nothing changed since.
+/// What this thread remembers of an ask, if [`SHADOW_EPOCH`] did not advance
+/// and the copy it found still has the title's memory behind it
+/// ([`Shadow::is_dead`]: a copy let go there must not be handed out again).
 fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+    let changed = epoch();
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
         let (a, n, at, shadow) = f.get(found_at(address, len))?;
         ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
     })?;
+    if shadow.is_dead() {
+        return None;
+    }
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    (epoch() == changed).then_some(shadow)
 }
 
-/// Remembers an answer given while `changed` was the count.
+/// Remembers an answer given while `changed` was the epoch.
 fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+    if !same_epoch(changed) {
+        return;
+    }
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
@@ -5990,6 +6334,11 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
         }
         f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
     });
+}
+
+/// Whether no table changed since `changed` was read.
+fn same_epoch(changed: u64) -> bool {
+    SHADOW_EPOCH.load(Ordering::Acquire) == changed
 }
 
 fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
@@ -6005,18 +6354,30 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // A buffer a thread's remembered answers did not know of may be the
+    // innermost holding what it asked about.
+    changed();
 }
 
-/// The title released it; lists that still hold its copy keep it alive.
+/// The title released it; lists that still hold its copy keep it alive. What
+/// the copy holds is all there is of it from here on ([`Shadow::is_dead`]):
+/// it is left out of the asks, and copying from the memory the title has
+/// given up would put its zeros over the copy's bytes.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let gone = buffers().remove(&(start, resource));
+    if let Some(shadow) = gone.and_then(|entry| entry.shadow) {
+        shadow.mark_dead();
+        // (The entry is gone: nothing finds it again, and what was
+        // remembered of it is of another epoch.)
+        changed();
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -6051,7 +6412,13 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     let n = gone.len() as u64;
     for shadow in gone {
+        // The title's memory there is going: what such a copy holds is all
+        // there is, so a refresh of it is left out ([`Shadow::is_dead`]).
+        shadow.mark_dead();
         crate::host::retire(shadow);
+    }
+    if n != 0 {
+        changed();
     }
     n
 }
@@ -6117,7 +6484,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
                     // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, epoch(), shadow);
                 }
                 return Some(shadow.clone());
             }

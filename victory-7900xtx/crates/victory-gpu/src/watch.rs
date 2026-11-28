@@ -308,6 +308,32 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
     waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// A read of the journal held by a caller across a whole flush of spans
+/// ([`crate::host`], `Shadow::nothing_new_with`): a frame asks about view
+/// memory some 1,500 times on up to seven threads, and each take of this lock
+/// is one the recording threads wait for. Nothing of the journal changes
+/// under a reader (only [`journal_mut`] writes it), so one read answers for
+/// every span it is held across — the answers are those [`nothing_new`] would
+/// give one at a time, up to a write of the title's noted after it.
+pub(crate) struct Read<'a>(std::sync::RwLockReadGuard<'a, Journal>);
+
+/// The journal held for reading, for a whole flush of spans ([`Read`]).
+pub(crate) fn read() -> Read<'static> {
+    Read(journal())
+}
+
+impl Read<'_> {
+    /// [`nothing_new`] for `[start, end)` with this read of the journal.
+    pub(crate) fn nothing_new(&self, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+        nothing_new_in(&self.0, start, end, base, copied, ranged)
+    }
+
+    /// [`untouched_since`] with this read of the journal.
+    pub(crate) fn untouched(&self, start: usize, end: usize, since: u64) -> bool {
+        untouched_in(&self.0, start, end, since)
+    }
+}
+
 /// Since the last line: waits and nanoseconds of waiting, of all threads, for
 /// the ranges held ([`ASKING`]), the journal to read it, the journal to note
 /// in it, and the guards (faults of the title's among them).
@@ -1329,7 +1355,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+    nothing_new_in(&journal(), start, end, base, copied, ranged)
+}
+
+/// [`nothing_new`] with the journal already held for reading ([`Read`]).
+fn nothing_new_in(j: &Journal, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -1337,7 +1369,6 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
-    let j = journal();
     if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return false;
     }
@@ -2238,7 +2269,13 @@ static EPOCH: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::At
 /// being published): what is left is clean (R1). `false` if either summary
 /// does not reach the span, which it never does while the summaries are not
 /// kept ([`summarised`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn untouched_since(start: usize, end: usize, since: u64) -> bool {
+    untouched_in(&journal(), start, end, since)
+}
+
+/// [`untouched_since`] with the journal already held for reading ([`Read`]).
+fn untouched_in(j: &Journal, start: usize, end: usize, since: u64) -> bool {
     if since == 0 || start >= end {
         return false;
     }
@@ -2247,7 +2284,7 @@ pub(crate) fn untouched_since(start: usize, end: usize, since: u64) -> bool {
     // write noted is answered without the bits being read at all, and those
     // are the spans a frame walks (`published` reads a word a 64 blocks, but
     // over the whole span: 92 loads of a 182 MB envelope).
-    if !journal().untouched(start, end, since) {
+    if !j.untouched(start, end, since) {
         return false;
     }
     published(start, end)
