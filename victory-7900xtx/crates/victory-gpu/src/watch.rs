@@ -25,21 +25,6 @@
 //! page shown in more than [`MANY_VIEWS`] places (what the title shows where
 //! it has nothing). `VICTORY_VIEW_GUARD=0`: each address for itself, as
 //! before.
-//!
-//! The sets above are the guards' state, and it can be sharded by address:
-//! one [`Guards`] and one mutex for each hash of the 64 MiB region a block
-//! lies in (8 of them, `VICTORY_GUARDS_SHARDED=1`; unset or `0` keeps the one
-//! mutex, which is the default — see [`sharded`]). An asker walks its range in
-//! address order and holds one shard's lock at a time ([`Segments`]), so
-//! askers over different heaps never queue on the same mutex, and no thread
-//! waits for a second shard while holding one — no order between them has to
-//! be kept. What Windows is asked about a range (what is committed there,
-//! where its views end) is asked with no lock held; a change of a block's
-//! protection, and the note of what it means (guarded, clean, open), is made
-//! under its shard's lock, as one step — never with one of the two without
-//! the other, which would either lose a write of the title's or leave a fault
-//! nobody takes. One ask makes one call for each run of blocks that follow one
-//! another, where it made one for each block.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
@@ -1556,12 +1541,7 @@ fn more(what: usize, n: u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn more_asks() -> ([u64; 10], usize) {
     let now = crate::frame::current();
-    let hot = (0..shard_count())
-        .map(|shard| {
-            let g = Guards::lock(shard);
-            g.heat.values().filter(|heat| heat.until > now).count()
-        })
-        .sum();
+    let hot = guards().heat.values().filter(|heat| heat.until > now).count();
     (std::array::from_fn(|i| MORE[i].swap(0, std::sync::atomic::Ordering::Relaxed)), hot)
 }
 
@@ -1605,7 +1585,7 @@ fn known_view(first: usize) -> bool {
     {
         return false;
     }
-    guards_at(first * BLOCK).absent.contains(first)
+    guards().absent.contains(first)
 }
 
 /// Whether the refreshes of host copies go the light way
@@ -1835,23 +1815,22 @@ pub(crate) fn nothing_put(block: usize) -> bool {
 
 /// The title is about to write block by block around `at`: as by a fault.
 pub(crate) fn opened_for_writing(at: usize) {
-    if open(at, at + 1) != 0 {
-        guards_at(at).opened(at / BLOCK);
+    let mut g = guards();
+    if open(&mut g, at, at + 1) != 0 {
+        g.opened(at / BLOCK);
     }
 }
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
 fn publish(pages: &[usize]) {
-    for (shard, blocks) in by_shard(pages.to_vec()) {
-        let g = Guards::lock(shard);
-        for block in blocks {
-            if g.clean.contains(block) || g.held.contains(block) {
-                PUBLISHED.set(block);
-                // (Put there since: whoever did clears the bit after this is
-                // set, or its own bit is found here.)
-                if BESIDE.any(block, block + 1) {
-                    PUBLISHED.clear(block);
-                }
+    let g = guards();
+    for &page in pages {
+        if g.clean.contains(page) || g.held.contains(page) {
+            PUBLISHED.set(page);
+            // (Put there since: whoever did clears the bit after this is
+            // set, or its own bit is found here.)
+            if BESIDE.any(page, page + 1) {
+                PUBLISHED.clear(page);
             }
         }
     }
@@ -1940,13 +1919,11 @@ pub fn title_memory_allocated(at: usize, len: usize) {
     if len == 0 || !known_holes() {
         return;
     }
-    for (shard, from, to) in segments(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK)) {
-        let mut g = Guards::lock(shard);
-        let blocks: Vec<usize> = g.held.range(from..to).collect();
-        for block in blocks {
-            g.held.remove(block);
-            PUBLISHED.clear(block);
-        }
+    let mut g = guards();
+    let blocks: Vec<usize> = g.held.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
+    for block in blocks {
+        g.held.remove(block);
+        PUBLISHED.clear(block);
     }
 }
 
@@ -1960,16 +1937,9 @@ pub(crate) fn look_at_holes() {
     }
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let blocks: Vec<usize> = {
-        // (A part of each shard's: the blocks of one are found in its own
-        // set, and the scan goes on from the last taken there.)
+        let g = guards();
         let from = FROM.load(std::sync::atomic::Ordering::Relaxed);
-        let mut part: Vec<usize> = Vec::new();
-        for shard in 0..shard_count() {
-            let g = Guards::lock(shard);
-            let take = (g.held.len() / PARTS + 1).min(1 << 12);
-            part.extend(g.held.range(from..).take(take));
-        }
-        part.sort_unstable();
+        let part: Vec<usize> = g.held.range(from..).take(g.held.len() / PARTS + 1).collect();
         FROM.store(part.last().map_or(0, |b| b + 1), std::sync::atomic::Ordering::Relaxed);
         part
     };
@@ -1993,7 +1963,7 @@ pub(crate) fn look_at_holes() {
         if block >= until {
             // (Or unmapped memory was mapped since the part was taken: told
             // already, and forgotten.)
-            let mut g = guards_at(block * BLOCK);
+            let mut g = guards();
             if g.held.remove(block) {
                 PUBLISHED.clear(block);
                 static SAID: std::sync::Once = std::sync::Once::new();
@@ -2205,6 +2175,16 @@ pub(crate) fn asks() -> [u64; 13] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// The guards' lock, the wait for it counted.
+fn guards_timed() -> Held {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let g = guards();
+    #[cfg(feature = "diagnostics")]
+    tally(7, started.elapsed().as_nanos() as u64);
+    g
+}
+
 /// A set of blocks, a bit each: a fault, or a look at a range of thousands of
 /// blocks, is a few words of it and no walk through a tree of every guarded
 /// block there is.
@@ -2252,7 +2232,6 @@ impl Blocks {
             self.insert(block);
         }
     }
-
 
     /// Those of `range`, in order.
     fn range(&self, range: impl RangeBounds<usize>) -> impl Iterator<Item = usize> + '_ {
@@ -2383,31 +2362,6 @@ struct Guards {
     /// Those of them that are hot, or were and have not been made read-only
     /// since.
     hot_blocks: usize,
-    /// Blocks whose write access is being given back ([`open`]): noted before
-    /// any of the other views of their pages is told their bytes changed, and
-    /// cleared when the change is done. Nothing claims such a block's page
-    /// covered meanwhile ([`protect_alias`]) — it is about to be writable,
-    /// and a copy told the block is clean would miss what is written there.
-    opening: Blocks,
-}
-
-impl Guards {
-    const fn new() -> Guards {
-        Guards {
-            protected: Blocks::new(),
-            clean: Blocks::new(),
-            absent: Blocks::new(),
-            held: Blocks::new(),
-            foreign: BTreeSet::new(),
-            kernel: Vec::new(),
-            changing: Vec::new(),
-            aliased: Blocks::new(),
-            opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-            heat: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-            hot_blocks: 0,
-            opening: Blocks::new(),
-        }
-    }
 }
 
 /// How a block's write faults follow one another ([`hot_frames`]).
@@ -2519,7 +2473,7 @@ impl Guards {
     fn left_alone(&self, block: usize) -> bool {
         // (What a change that is done left in `changing` counts no more:
         // [`changing_now`].)
-        let changing: &[(usize, usize)] = if changing_now(shard_of(block)) { &self.changing } else { &[] };
+        let changing: &[(usize, usize)] = if changing_now() { &self.changing } else { &[] };
         self.kernel.iter().chain(changing).any(|&(first, last)| (first..last).contains(&block))
     }
 
@@ -2673,129 +2627,29 @@ impl Guards {
     }
 }
 
-/// The guard state, one shard per hash of the 64 MiB region a block lies in
-/// (`VICTORY_GUARDS_SHARDED`: `0` restores the one mutex, as before).
-///
-/// One mutex over all of it was taken by every asker of a frame — the
-/// submitting thread, the beside-refresh's and the four landing threads' —
-/// and held across the `VirtualProtect` calls of `guard` and `open`: 265
-/// waits and 71.67 ms of thread-time a frame at 13.3 fps (prologue, 7800 XT),
-/// 13.6 ms of them changing protections. The sets it holds are all keyed by
-/// block, so they split cleanly where [`Blocks`] already splits its words:
-/// by region. Nothing is shared between the shards but the atomics below
-/// (`PROTECTED`, `BESIDE`, `PUBLISHED`, `ASKED`), which were taken without
-/// this lock before.
-static GUARDS: [Mutex<Guards>; SHARDS] = [const { Mutex::new(Guards::new()) }; SHARDS];
-
-/// The region the state is sharded by: 64 MiB, the unit the title's heaps
-/// and views lie in — and the unit a region's blocks are looked up by.
-const SHARD_REGION_BLOCKS: usize = (64 << 20) / BLOCK;
-
-/// Shards: a power of two, so a region's shard is a mask of its hash.
-const SHARDS: usize = 1 << SHARD_BITS;
-
-/// See [`SHARDS`].
-const SHARD_BITS: usize = 3;
-
-/// The sharding in use (`VICTORY_GUARDS_SHARDED=1`: [`SHARDS`]; unset or `0`:
-/// one, the mutex of before).
-///
-/// **Default: one mutex, the state sharded only behind the switch.** The
-/// sharded path is not trusted yet: with it on, two of the asker tests that
-/// pit writes against askings through several views of one page
-/// (`watch::many_askers_tests`, view memory) lose a write now and then — a
-/// page made clean at one view while another is writable, which the aliased
-/// cover of [`cover_here`] has to keep from happening and does not, in a
-/// window this change opened (the one mutex of before held the cover and the
-/// protection in one step). What is safe and stays on either way: the runs of
-/// one ask are one `VirtualProtect` each, and what Windows is asked about a
-/// range is asked with no lock held.
-///
-/// Read once: which shard a block's state lives in cannot change while any of
-/// it is noted. (So not [`crate::toggled!`], which [`crate::ab`] may turn
-/// while the title runs.)
-fn sharded() -> bool {
-    static ON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        if std::env::var_os("VICTORY_GUARDS_SHARDED").is_some_and(|v| v == "1") { SHARDS } else { 1 }
-    }) > 1
-}
-
-/// The shards in use.
-fn shard_count() -> usize {
-    if sharded() { SHARDS } else { 1 }
-}
-
-/// [`shard_of`] for a region's index: the spread of one shard of `count`, or
-/// none.
-///
-/// The region is hashed (the multiplier is the usual odd 64-bit one): the
-/// title's big heaps lie in a few regions with no order between them
-/// (0x6fae0000 is region 27, 0xe22210000 region 56, the 0x101f…/0x106f…
-/// ones 64 and 65), so neither address order nor the region itself spreads
-/// them; the top bits of the product do.
-fn shard_for(region: usize, count: usize) -> usize {
-    if count <= 1 {
-        return 0;
-    }
-    let mixed = (region as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    (mixed >> (64 - SHARD_BITS)) as usize & (count - 1)
-}
-
-/// The shard the state of `block` is in.
-fn shard_of(block: usize) -> usize {
-    shard_for(block / SHARD_REGION_BLOCKS, shard_count())
-}
-
-/// The shards' parts of blocks `[first, last)`, in address order: `(shard,
-/// from, past the last)`.
-///
-/// One lock is held at a time (see [`Held`]): a segment is looked at, its
-/// lock given back, and only then the next taken. (Two regions that hash to
-/// one shard come as two segments; only the lock is taken twice.)
-struct Segments {
-    at: usize,
-    last: usize,
-    shards: usize,
-}
-
-impl Iterator for Segments {
-    type Item = (usize, usize, usize);
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.at >= self.last {
-            return None;
-        }
-        let from = self.at;
-        let end = if self.shards == 1 {
-            self.last
-        } else {
-            ((from / SHARD_REGION_BLOCKS + 1) * SHARD_REGION_BLOCKS).min(self.last)
-        };
-        self.at = end;
-        Some((shard_for(from / SHARD_REGION_BLOCKS, self.shards), from, end))
-    }
-}
-
-/// See [`Segments`], of the shards in use.
-fn segments(first: usize, last: usize) -> Segments {
-    segments_with(first, last, shard_count())
-}
-
-/// See [`Segments`], of `shards` (`1`: one segment for the whole range, as
-/// with the one mutex).
-fn segments_with(first: usize, last: usize, shards: usize) -> Segments {
-    Segments { at: first, last: last.max(first), shards }
-}
+static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+    protected: Blocks::new(),
+    clean: Blocks::new(),
+    absent: Blocks::new(),
+    held: Blocks::new(),
+    foreign: BTreeSet::new(),
+    kernel: Vec::new(),
+    changing: Vec::new(),
+    aliased: Blocks::new(),
+    opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    heat: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    hot_blocks: 0,
+});
 
 thread_local! {
-    /// Which shard of [`GUARDS`] this thread holds, if one ([`Held`]).
-    static GUARDS_HELD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    /// Blocks this thread's own writes faulted in while it held a shard,
+    /// Whether this thread holds [`GUARDS`] ([`Held`]).
+    static GUARDS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Blocks this thread's own writes faulted in while it held [`GUARDS`],
     /// how many, and how often one of them faulted again: opened by the
     /// handler without the lock ([`opened_held`]), noted when the lock is
     /// given back.
     static OPENED_HELD: std::cell::Cell<([usize; 32], usize, u32)> = const { std::cell::Cell::new(([0; 32], 0, 0)) };
-    /// Whether [`OPENED_HELD`] holds anything (asked each time a lock is
+    /// Whether [`OPENED_HELD`] holds anything (asked each time the lock is
     /// given back).
     static OPENED_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -2832,9 +2686,9 @@ fn opened_held(block: usize) -> bool {
     unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 }
 }
 
-/// One shard of the guards, locked. While a thread holds it, a write of its
-/// own that faults on a guarded block (the handler, [`install`]) is let
-/// through without the lock; see [`Drop`].
+/// The guards, locked. While a thread holds it, a write of its own that
+/// faults on a guarded block (the handler, [`install`]) is let through
+/// without the lock; see [`Drop`].
 ///
 /// A guarded range can come to cover memory of the layer's own (a range
 /// asked about by raw address, a window whose cell reaches past the
@@ -2843,25 +2697,18 @@ fn opened_held(block: usize) -> bool {
 /// there under this lock (a set's node, the handler's own record) faulted
 /// into the handler, which waited for the lock its own thread held: every
 /// thread then stood still.
-///
-/// A thread holds at most one of them at a time (see [`Segments`] and
-/// [`Held::give_back`]): no order between the shards has to be argued for,
-/// and none can be got wrong.
-struct Held {
-    shard: usize,
-    guard: Option<std::sync::MutexGuard<'static, Guards>>,
-}
+struct Held(std::sync::MutexGuard<'static, Guards>);
 
 impl std::ops::Deref for Held {
     type Target = Guards;
     fn deref(&self) -> &Guards {
-        self.guard.as_deref().expect("the shard is held")
+        &self.0
     }
 }
 
 impl std::ops::DerefMut for Held {
     fn deref_mut(&mut self) -> &mut Guards {
-        self.guard.as_deref_mut().expect("the shard is held")
+        &mut self.0
     }
 }
 
@@ -2871,74 +2718,26 @@ impl Drop for Held {
         // so (never guarded again, `Guards::foreign`), and opened in the
         // sets too (which may fault again and add to the list: until it
         // stays empty).
-        let mut mine: Vec<usize> = Vec::new();
-        let mut others: Vec<usize> = Vec::new();
-        while self.guard.is_some() && OPENED_ANY.try_with(|any| any.replace(false)).unwrap_or(false) {
+        while OPENED_ANY.try_with(|any| any.replace(false)).unwrap_or(false) {
             let Ok((blocks, n, _)) = OPENED_HELD.try_with(|o| o.replace(([0; 32], 0, 0))) else {
                 break;
             };
             for &block in &blocks[..n] {
-                if shard_of(block) == self.shard {
-                    self.foreign.insert(block);
-                    mine.push(block);
-                } else {
-                    // (Memory of ours elsewhere: opened with that shard's
-                    // lock, once this one is given back.)
-                    others.push(block);
-                }
+                self.0.foreign.insert(block);
+                open(&mut self.0, block * BLOCK, block * BLOCK + 1);
             }
         }
-        // All of them told as not ours before the first may be written.
-        for &block in &mine {
-            self.protected.remove(block);
-            self.clean.remove(block);
-            self.aliased.remove(block);
-            PUBLISHED.clear(block);
-            PROTECTED.clear(block);
-        }
-        let _ = GUARDS_HELD.try_with(|h| h.set(None));
-        drop(self.guard.take());
-        // Outside it (the handler's own writes, and nothing to wait for).
-        if !mine.is_empty() {
-            mine.sort_unstable();
-            mine.dedup();
-            make_writable(&runs_of(&mine));
-        }
-        for block in others {
-            unguard_blocks(&[block]);
-        }
+        let _ = GUARDS_HELD.try_with(|h| h.set(false));
     }
 }
 
-impl Guards {
-    /// Holds this shard's lock: tried at once, waited for counted.
-    fn lock(shard: usize) -> Held {
-        // (One shard at a time, and never the one this thread holds: a
-        // second would wait for itself. Nothing takes two at once.)
-        debug_assert_ne!(GUARDS_HELD.try_with(|h| h.get()).unwrap_or(None), Some(shard), "a shard taken twice");
-        let slot = &GUARDS[shard];
-        let guard = match slot.try_lock() {
-            Ok(g) => g,
-            Err(_) => waited(3, || slot.lock().unwrap_or_else(|e| e.into_inner())),
-        };
-        let _ = GUARDS_HELD.try_with(|h| h.set(Some(shard)));
-        Held { shard, guard: Some(guard) }
-    }
-}
-
-/// The guards of the shard `at` (an address) lies in, locked.
-fn guards_at(at: usize) -> Held {
-    Guards::lock(shard_of(at / BLOCK))
-}
-
-/// [`guards_at`], the wait for the lock counted.
-fn guards_timed_at(at: usize) -> Held {
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    let g = guards_at(at);
-    #[cfg(feature = "diagnostics")]
-    tally(7, started.elapsed().as_nanos() as u64);
-    g
+fn guards() -> Held {
+    let held = Held(match GUARDS.try_lock() {
+        Ok(g) => g,
+        Err(_) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+    });
+    let _ = GUARDS_HELD.try_with(|h| h.set(true));
+    held
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -3134,12 +2933,9 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     if len == 0 {
         return false;
     }
-    let first = at / BLOCK;
-    let last = (at + len - 1) / BLOCK + 1;
-    segments(first, last).all(|(shard, from, to)| {
-        let g = Guards::lock(shard);
-        (from..to).all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
-    })
+    let g = guards();
+    (at / BLOCK..=(at + len - 1) / BLOCK)
+        .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -3161,158 +2957,133 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // where what is there is a view or a hole: no lock for it.)
             || holes_told() && arena_holds(first * BLOCK, (first + 1) * BLOCK)
             || {
-                let g = guards_timed_at(first * BLOCK);
+                let g = guards_timed();
                 g.protected.contains(first) || g.absent.contains(first)
             });
     if !known && !is_view(start, end) {
         return None;
     }
     install();
-    // The range's blocks of each shard, in address order: the state is
-    // looked at under that shard's lock, and Windows is asked with none held
-    // ([`apply_runs`]). One shard's lock at a time, so no two askers of
-    // different heaps meet, and none holds one while it waits for another.
-    let mut written: Vec<usize> = Vec::new();
-    for (shard, from, to) in segments(first, last) {
-        // The holes that an ordinary commit may have filled, with no word of
-        // the runtime's. Windows is asked with the lock not held (the range
-        // is, no other thread asks about it: `ASKING`); what the runtime
-        // tells meanwhile takes the block out of the set, and it is looked at
-        // as any other.
-        let unsure: Vec<usize> = {
-            let g = Guards::lock(shard);
-            if g.clean.range(from..to).count() == to - from && !BESIDE.any(from, to) {
-                // Nothing written, mapped or new since the range was last
-                // taken.
+    // The holes that an ordinary commit may have filled, with no word of the
+    // runtime's. Windows is asked with the lock not held (the range is, no
+    // other thread asks about it: `ASKING`); what the runtime tells meanwhile
+    // takes the block out of the set, and it is looked at as any other.
+    let mut g = guards_timed();
+    if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+        // Nothing written, mapped or new since the range was last taken.
+        #[cfg(feature = "diagnostics")]
+        tally(3, 1);
+        return Some(Vec::new());
+    }
+    let unsure: Vec<usize> = g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect();
+    let rest = rest();
+    let hot_ok = HOT_ASKER.get() && hot_frames() != 0;
+    // (No hole to ask about, as when all of them are known for
+    // placeholders: the lock is kept, not given back and taken again.)
+    if !unsure.is_empty() {
+        drop(g);
+        let mut came: Vec<(usize, bool)> = Vec::new();
+        let mut uncommitted_until = first;
+        for block in unsure {
+            // One question for the blocks of a region.
+            if block >= uncommitted_until {
+                uncommitted_until = uncommitted_end(block);
                 #[cfg(feature = "diagnostics")]
-                tally(3, 1);
+                tally(9, 1);
+            }
+            if block >= uncommitted_until {
+                // The hole may have been given up, and its address be the
+                // title's heap's, or code's, now: not ours to guard.
+                came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
+            }
+        }
+        g = guards_timed();
+        for &(block, view) in &came {
+            if g.absent.remove(block) && !view {
+                g.foreign.insert(block);
+            }
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    tally(4, 1);
+    // The range's blocks that are neither clean nor known to be holes. A
+    // frame asks about some 10 GB of view memory, 150,000 blocks, nearly all
+    // clean.
+    let mut written = Vec::new();
+    for word in first / 64..last.div_ceil(64) {
+        let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
+        written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
+    }
+    let mut run: Option<(usize, usize)> = None;
+    // Hot blocks the kernel says were not written (in order, as `written`).
+    let mut quiet: Vec<usize> = Vec::new();
+    let kernel_hot = hot_frames() != 0 && views_hot();
+    for &block in &written {
+        if let Some((from, to)) = run
+            && to != block
+        {
+            protect(&mut g, from, to);
+            run = None;
+            // Faults of the title's wait for the lock: each block is done on
+            // its own, and looked at anew below.
+            drop(g);
+            g = guards_timed();
+        }
+        // Told as written by this, and read by the caller after.
+        let beside = BESIDE.take(block);
+        if beside {
+            put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        if g.protected.contains(block) {
+            // Read-only by way of another view of its page, or not clean
+            // because one could not be made so. (Or clean, and bytes were put
+            // in beside the guard: it stays.)
+            if let Some((from, to)) = run.take() {
+                protect(&mut g, from, to);
+            }
+            if g.clean.contains(block) {
                 continue;
             }
-            g.absent.range(from..to).filter(|block| !g.held.contains(*block)).collect()
-        };
-        let rest = rest();
-        let hot_ok = HOT_ASKER.get() && hot_frames() != 0;
-        // (No hole to ask about, as when all of them are known for
-        // placeholders: no lock is taken for it.)
-        if !unsure.is_empty() {
-            let mut came: Vec<(usize, bool)> = Vec::new();
-            let mut uncommitted_until = from;
-            for block in unsure {
-                // One question for the blocks of a region.
-                if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
-                    #[cfg(feature = "diagnostics")]
-                    tally(9, 1);
-                }
-                if block >= uncommitted_until {
-                    // The hole may have been given up, and its address be the
-                    // title's heap's, or code's, now: not ours to guard.
-                    came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
-                }
+            if cover(&mut g, block, block + 1) {
+                g.clean.insert(block);
             }
-            if !came.is_empty() {
-                let mut g = Guards::lock(shard);
-                for &(block, view) in &came {
-                    if g.absent.remove(block) && !view {
-                        g.foreign.insert(block);
-                    }
-                }
+        } else if g.foreign.contains(&block) || g.left_alone(block) || g.rests(block, rest) {
+            if let Some((from, to)) = run.take() {
+                protect(&mut g, from, to);
             }
-        }
-        #[cfg(feature = "diagnostics")]
-        tally(4, 1);
-        // The segment's blocks that are neither clean nor known to be holes,
-        // and the decision on each: made here, with the protection asked of
-        // Windows afterwards ([`apply_runs`]), so the lock is not held across
-        // a call that takes 35 microseconds under Wine.
-        let mut blocks: Vec<usize> = Vec::new();
-        // Runs to make read-only, and guarded runs to cover
-        // ([`cover_runs`]).
-        let mut plan: Vec<(usize, usize)> = Vec::new();
-        let mut covers: Vec<(usize, usize)> = Vec::new();
-        // Hot blocks the kernel says were not written (in order, as
-        // `blocks`).
-        let mut quiet: Vec<usize> = Vec::new();
-        {
-            let mut g = Guards::lock(shard);
-            // A frame asks about some 10 GB of view memory, 150,000 blocks,
-            // nearly all clean.
-            for word in from / 64..to.div_ceil(64) {
-                let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
-                blocks.extend(BitsOf(!known & in_word(word * 64, from, to)).map(|bit| word * 64 + bit));
+        } else {
+            // Hot: for a buffer's refresh, or for any asking where the
+            // kernel says whether the block was written ([`views_hot`]: the
+            // heaps' records and the textures were left out because a block
+            // told as written unasked is made again whole; by the kernel's
+            // word it is told only when it was. Not a block bytes were put
+            // into beside its guard, which no write of the title's tells of.)
+            let hot = (hot_ok || kernel_hot) && g.stays_hot(block);
+            let word = if hot && kernel_hot && !beside { hot_written(block) } else { None };
+            if !(hot && (hot_ok || word.is_some())) {
+                g.cooled(block);
+                run = Some((run.map_or(block, |r| r.0), block + 1));
+                continue;
             }
-            let mut run: Option<(usize, usize)> = None;
-            let kernel_hot = hot_frames() != 0 && views_hot();
-            for &block in &blocks {
-                // (A plan's run ends where the blocks stop following one
-                // another.)
-                if let Some((_, last)) = run
-                    && last != block
-                    && let Some(run) = run.take()
-                {
-                    plan.push(run);
-                }
-                // Told as written by this, and read by the caller after.
-                let beside = BESIDE.take(block);
-                if beside {
-                    put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
-                }
-                if g.protected.contains(block) {
-                    // Read-only by way of another view of its page, or not
-                    // clean because one could not be made so. (Or clean, and
-                    // bytes were put in beside the guard: it stays.)
-                    if let Some(run) = run.take() {
-                        plan.push(run);
-                    }
-                    if g.clean.contains(block) {
-                        continue;
-                    }
-                    covers.push((block, block + 1));
-                } else if g.foreign.contains(&block) || g.left_alone(block) || g.rests(block, rest) {
-                    if let Some(run) = run.take() {
-                        plan.push(run);
-                    }
-                } else {
-                    // Hot: for a buffer's refresh, or for any asking where the
-                    // kernel says whether the block was written ([`views_hot`]:
-                    // the heaps' records and the textures were left out because
-                    // a block told as written unasked is made again whole; by
-                    // the kernel's word it is told only when it was. Not a
-                    // block bytes were put into beside its guard, which no
-                    // write of the title's tells of.)
-                    let hot = (hot_ok || kernel_hot) && g.stays_hot(block);
-                    let word = if hot && kernel_hot && !beside { hot_written(block) } else { None };
-                    if !(hot && (hot_ok || word.is_some())) {
-                        g.cooled(block);
-                        run = Some((run.map_or(block, |r| r.0), block + 1));
-                        continue;
-                    }
-                    // Open, and told as written by this unless the kernel says
-                    // no.
-                    #[cfg(feature = "diagnostics")]
-                    more(5, 1);
-                    if let Some(run) = run.take() {
-                        plan.push(run);
-                    }
-                    match word {
-                        Some(false) => quiet.push(block),
-                        Some(true) => g.stays_hot_longer(block),
-                        None => {}
-                    }
-                }
+            // Open, and told as written by this unless the kernel says no.
+            #[cfg(feature = "diagnostics")]
+            more(5, 1);
+            if let Some((from, to)) = run.take() {
+                protect(&mut g, from, to);
             }
-            if let Some(run) = run {
-                plan.push(run);
+            match word {
+                Some(false) => quiet.push(block),
+                Some(true) => g.stays_hot_longer(block),
+                None => {}
             }
         }
-        // Windows is asked here, under the shard's lock, once for each run of
-        // blocks that follow one another ([`apply_runs`]); the other views of
-        // their pages are made read-only in the same step.
-        apply_runs(shard, &plan, &covers);
-        if !quiet.is_empty() {
-            blocks.retain(|block| quiet.binary_search(block).is_err());
-        }
-        written.extend(blocks);
+    }
+    if let Some((from, to)) = run {
+        protect(&mut g, from, to);
+    }
+    drop(g);
+    if !quiet.is_empty() {
+        written.retain(|block| quiet.binary_search(block).is_err());
     }
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
@@ -3376,260 +3147,17 @@ fn is_view(start: usize, end: usize) -> bool {
     }
 }
 
-/// Blocks that follow one another, as runs `(first, past the last)`: one ask
-/// of Windows for a run where there was one for each block. `blocks` in
-/// order, without repeats.
-fn runs_of(blocks: &[usize]) -> Vec<(usize, usize)> {
-    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(blocks.len());
-    for &block in blocks {
-        match runs.last_mut() {
-            Some((_, to)) if *to == block => *to = block + 1,
-            _ => runs.push((block, block + 1)),
-        }
-    }
-    runs
-}
-
-/// `blocks` grouped by the shard their state is in, the shards in order: one
-/// lock for a group, and none held while another's is. (Ordered by shard and
-/// not by address, so that a shard's blocks are one group however the
-/// addresses fall across it.)
-fn by_shard(blocks: Vec<usize>) -> Vec<(usize, Vec<usize>)> {
-    let mut keyed: Vec<(usize, usize)> = blocks.into_iter().map(|block| (shard_of(block), block)).collect();
-    keyed.sort_unstable();
-    keyed.dedup();
-    let mut out: Vec<(usize, Vec<usize>)> = Vec::new();
-    for (shard, block) in keyed {
-        match out.last_mut() {
-            Some((had, group)) if *had == shard => group.push(block),
-            _ => out.push((shard, vec![block])),
-        }
-    }
-    out
-}
-
-/// The end (past the last block) of the committed view memory at `block`:
-/// as far as one `VirtualProtect` may be asked for around it. `None` where
-/// what is there is no view (private memory, code, a hole) — as
-/// `protect_here` asked it, and for the same reason: `VirtualProtect` takes
-/// memory of the layer's own as readily, and our own writes to it would then
-/// fault into the handler.
-fn view_until(block: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
-    (n != 0 && info.State == MEM_COMMIT && info.Type == MEM_MAPPED)
-        .then(|| (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK)
-}
-
-/// What Windows says of the blocks of a run, asked with no shard's lock held:
-/// it changes nothing. The protection itself is asked under the lock
-/// ([`apply_runs`]) — a block must not be writable, and taken for clean, at
-/// any moment in between.
-#[derive(Default)]
-struct Surveyed {
-    /// Committed view memory: runs of blocks, none of them across two views.
-    view: Vec<(usize, usize)>,
-    /// Not committed: a hole of a view, or a placeholder with nothing in it
-    /// yet. Noted absent, and copied as zeros.
-    absent: Vec<(usize, usize)>,
-    /// Of those, the blocks in placeholders ([`known_holes`]).
-    held: Vec<usize>,
-    /// Committed and no view (private memory, code): left as they are.
-    foreign: Vec<(usize, usize)>,
-}
-
-/// The end (exclusive) of the whole uncommitted blocks starting at `block`.
-fn uncommitted_end(block: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
-    };
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
-    if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
-    } else {
-        block
-    }
-}
-
-/// Walks the blocks of a run, asking Windows what is there: the view each
-/// lies in, or that it is a hole or no view at all. One question for a run of
-/// blocks that share an answer.
-fn survey(from: usize, to: usize) -> Surveyed {
-    let mut out = Surveyed::default();
-    let (mut uncommitted_until, mut view_end, mut told_until) = (from, from, from);
-    let mut block = from;
-    while block < to {
-        let fresh = block >= view_end;
-        let mut view = !fresh;
-        if fresh && let Some(end) = view_until(block) {
-            view_end = end.max(block + 1);
-            view = true;
-        }
-        if view && block >= uncommitted_until {
-            // One call for the blocks of one view: a run never crosses into
-            // the next (its protection, and what Windows says it was, are
-            // the next one's).
-            match out.view.last_mut() {
-                Some((_, last)) if *last == block && !fresh => *last = block + 1,
-                _ => out.view.push((block, block + 1)),
-            }
-            block += 1;
-            continue;
-        }
-        if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
-            #[cfg(feature = "diagnostics")]
-            tally(9, 1);
-        }
-        if block < uncommitted_until {
-            let until = uncommitted_until.min(to);
-            out.absent.push((block, until));
-            for b in block..until {
-                if known_holes() && (b < told_until || placeholder(b)) {
-                    out.held.push(b);
-                    #[cfg(feature = "diagnostics")]
-                    more(7, u64::from(b < told_until));
-                } else if known_holes() {
-                    told_until = told_hole_end(b);
-                    if b < told_until {
-                        out.held.push(b);
-                        #[cfg(feature = "diagnostics")]
-                        more(7, 1);
-                    }
-                }
-            }
-            block = until;
-            continue;
-        }
-        // Committed, and no view: someone's own memory.
-        match out.foreign.last_mut() {
-            Some((_, last)) if *last == block => *last = block + 1,
-            _ => out.foreign.push((block, block + 1)),
-        }
-        block += 1;
-    }
-    out
-}
-
-/// Makes one run of blocks read-only, with the shard's lock held: `Ok` if
-/// Windows did it, `Err` if it would not (not ours to guard, or not there).
-///
-/// The lock stays held across the call, as it was before the state was
-/// sharded, and the run is one `VirtualProtect` where it used to be one for
-/// each block. Both matter: a block that is writable and taken for clean is a
-/// write lost for every asker whose copy came before — and a store of the
-/// title's to a block that is read-only and taken for nothing of ours is an
-/// access violation nobody takes. Each of those is only excluded while the
-/// change of protection and its note are one step under the lock.
-fn set_read_only(from: usize, to: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    let mut old = 0;
+/// Makes blocks `[from, to)` read-only and notes them guarded and clean;
+/// block by block if they span views, leaving out any that fail, and
+/// noting those not committed (unmapped) absent. The same physical pages
+/// at every other view of them are made read-only too: a write through
+/// one of those is this memory written, and only a fault can say so.
+/// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
+fn protect(g: &mut Guards, from: usize, to: usize) {
     #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    // SAFETY: title view memory; only its protection changes.
-    let mut done = unsafe {
-        VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) != 0
-    };
-    if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
-        // What is there is not for us to guard (code, or memory the title
-        // protects itself): as it was.
-        // SAFETY: as above.
-        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
-        done = false;
-    }
-    #[cfg(feature = "diagnostics")]
-    {
-        tally(5, (to - from) as u64);
-        tally(8, started.elapsed().as_nanos() as u64);
-        more(3, 1);
-    }
-    done
-}
-
-/// Makes the runs of one shard read-only and notes them guarded and clean,
-/// leaving out any that fail and noting those not committed (unmapped)
-/// absent. The same physical pages at every other view of them are made
-/// read-only too ([`cover_runs`]): a write through one of those is this
-/// memory written, and only a fault can say so.
-///
-/// The questions are asked with no lock held ([`survey`], which changes
-/// nothing); the answer is noted, and Windows asked, under the shard's lock.
-/// One call for each run of blocks one view holds, where there was one for
-/// each block.
-/// Makes the runs of one shard read-only and notes them guarded and clean,
-/// leaving out any that fail and noting those not committed (unmapped)
-/// absent; and covers them ([`cover_here`]): the same physical pages at every
-/// other view of them are made read-only too, a write through one of those
-/// being this memory written. `covers`: blocks of the same shard that are
-/// read-only by our hand already and not clean — guarded by way of another
-/// view of their page, or not clean because one could not be made so — looked
-/// at again.
-///
-/// The questions are asked with no lock held ([`survey`], which changes
-/// nothing); the answer is noted, and Windows asked, under the shard's lock —
-/// one step with the cover, as it was before the state was sharded, so that
-/// nothing is seen half done: a block read-only and taken for clean while
-/// another view of its page is writable is a write lost, and one read-only
-/// and taken for nothing of ours is a fault nobody takes. One call for each
-/// run of blocks one view holds, where there was one for each block.
-fn apply_runs(shard: usize, runs: &[(usize, usize)], covers: &[(usize, usize)]) {
-    if runs.is_empty() && covers.is_empty() {
-        return;
-    }
-    #[cfg(feature = "diagnostics")]
-    for &(from, to) in runs {
-        crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
-    }
-    let surveyed: Vec<Surveyed> = runs.iter().map(|&(from, to)| survey(from, to)).collect();
-    let mut g = Guards::lock(shard);
-    for said in &surveyed {
-        // Not committed: a hole, and nothing to protect.
-        for &(from, to) in &said.absent {
-            for block in from..to {
-                g.protected.remove(block);
-                g.clean.remove(block);
-                PROTECTED.clear(block);
-            }
-            g.absent.insert_all(from..to);
-        }
-        for &block in &said.held {
-            g.held.insert(block);
-        }
-        // Committed and no view: someone else's memory, left as it is.
-        for &(from, to) in &said.foreign {
-            for block in from..to {
-                PROTECTED.clear(block);
-            }
-        }
-        for &(from, to) in &said.view {
-            // Ahead of the protection (`PROTECTED`), as it was before: a
-            // fault that comes once the page is read-only waits for this
-            // shard's lock, and finds the block noted.
-            for block in from..to {
-                PROTECTED.set(block);
-            }
-            if set_read_only(from, to) {
-                // (After the call, not before: a store of the title's that
-                // lands while Windows is asked — the page writable until the
-                // last moment of it — would be taken for clean otherwise.)
-                g.protected.insert_all(from..to);
-                g.clean.insert_all(from..to);
-            } else {
-                for block in from..to {
-                    PROTECTED.clear(block);
-                }
-            }
-        }
-    }
-    let mut all = runs.to_vec();
-    all.extend_from_slice(covers);
-    cover_here(&mut g, shard, &all);
+    crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
+    protect_here(g, from, to);
+    cover(g, from, to);
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -3648,48 +3176,31 @@ fn view_guard() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Of the blocks of `runs`, those read-only by our hand: every other view of
-/// their pages is made read-only too, and the block is told clean. Where one
-/// cannot be (the kernel writes through it now, the runtime is changing it, or
-/// it is another shard's state — not this lock's to take), a write through it
-/// would not be seen: the block is not clean, and told as written at every
-/// asking, until it can.
-///
-/// Under the shard's lock, `g`, with the census of views read under it as it
-/// was before the state was sharded (the census takes no lock of ours).
-fn cover_here(g: &mut Guards, shard: usize, runs: &[(usize, usize)]) {
-    for &(from, to) in runs {
-        for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
-            let block = page / BLOCK;
-            if !g.protected.contains(block) {
-                continue; // not there, or not ours to guard
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            g.aliased.insert(block);
-            let others: Vec<usize> = others.into_iter().map(|other| other / BLOCK).collect();
-            let mut covered = true;
-            for &other in &others {
-                covered &= protect_alias(g, shard, other);
-            }
-            // (The copy about to be taken is what makes it clean again, and
-            // it reads the block after this.)
-            let covered = covered && others.iter().all(|other| g.protected.contains(*other));
-            if covered {
-                g.clean.insert(block);
-            } else {
-                g.clean.remove(block);
-            }
+/// Of the blocks `[from, to)`, which are read-only by our hand where they
+/// can be: every other view of their pages is made read-only too. Where one
+/// cannot be (the kernel writes through it now, or the runtime is changing
+/// it), a write through it would not be seen: that block is not clean, and
+/// told as written at every asking, until it can. Whether all are covered.
+fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
+    let mut all = true;
+    for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
+        let block = page / BLOCK;
+        if !g.protected.contains(block) {
+            continue; // not there, or not ours to guard
+        }
+        #[cfg(feature = "diagnostics")]
+        ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        g.aliased.insert(block);
+        let mut covered = true;
+        for other in others {
+            covered &= protect_alias(g, other / BLOCK);
+        }
+        if !covered {
+            all = false;
+            g.clean.remove(block);
         }
     }
-    // (The rest are shown nowhere else: clean, if they are ours still.)
-    for &(from, to) in runs {
-        for block in from..to {
-            if g.protected.contains(block) && !g.aliased.contains(block) {
-                g.clean.insert(block);
-            }
-        }
-    }
+    all
 }
 
 /// Makes `block` read-only: another view of a page a copy is about to take
@@ -3698,13 +3209,8 @@ fn cover_here(g: &mut Guards, shard: usize, runs: &[(usize, usize)]) {
 /// page ([`guard`] tells such a block as written, then notes it clean).
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
-fn protect_alias(g: &mut Guards, shard: usize, block: usize) -> bool {
+fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    if shard_of(block) != shard {
-        // (Another shard's state, and not this lock's to take: not covered
-        // here, and the block is told as written until it is.)
-        return false;
-    }
     g.aliased.insert(block);
     if g.protected.contains(block) {
         return true;
@@ -3734,7 +3240,6 @@ fn protect_alias(g: &mut Guards, shard: usize, block: usize) -> bool {
     }
     if done {
         // Not for us to guard: as it was.
-        let mut old = old;
         // SAFETY: as above.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old) };
     }
@@ -3742,212 +3247,194 @@ fn protect_alias(g: &mut Guards, shard: usize, block: usize) -> bool {
     false
 }
 
-/// Gives write access back to `blocks`, guarded ones.
-///
-/// One lock at a time, and only that shard's blocks: their state is cleared
-/// before the first may be written (a write through one is a write of the
-/// others' bytes), and Windows is asked for one run of blocks that follow one
-/// another where it was asked for each.
-fn unguard_blocks(blocks: &[usize]) {
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    if blocks.is_empty() {
+/// [`protect`] for one range, without the other views of its pages.
+fn protect_here(g: &mut Guards, from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: title view memory; only its protection changes.
+        let mut done = unsafe {
+            VirtualProtect(
+                (from * BLOCK) as *const _,
+                (to - from) * BLOCK,
+                PAGE_READONLY,
+                &mut old,
+            ) != 0
+        };
+        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+            // What is there is not for us to guard (code, or memory the
+            // title protects itself): as it was.
+            // SAFETY: as above.
+            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+            done = false;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            tally(5, (to - from) as u64);
+            tally(8, started.elapsed().as_nanos() as u64);
+            more(3, 1);
+        }
+        done
+    };
+    let note = |g: &mut Guards, from: usize, to: usize| {
+        g.protected.insert_all(from..to);
+        g.clean.insert_all(from..to);
+    };
+    // Only views of a section (the title's physical pages) are made
+    // read-only. A range asked about by raw address, or a window whose
+    // cell reaches past the title's memory, can cover committed private
+    // memory too, the layer's own heap among it, and `VirtualProtect`
+    // takes that as readily. Our own writes then fault: in the handler
+    // itself (its timing record), which faults again in handling that,
+    // until the thread's stack is gone (run "av1": "stack overflow ... in
+    // watch::install::on_write", then SIGSEGV as the world loaded), or
+    // under a lock the handler then waits for.
+    // `Some(end)`: committed view memory at `block`, to block `end`.
+    let view_until = |block: usize| -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        (n != 0 && info.State == MEM_COMMIT && info.Type == MEM_MAPPED)
+            .then(|| (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK)
+    };
+    let whole = view_until(from).is_some_and(|end| end >= to);
+    // Ahead of the protection (`PROTECTED`).
+    (from..to).for_each(|block| PROTECTED.set(block));
+    if whole && set(from, to) {
+        note(g, from, to);
         return;
     }
-    let mut all = blocks.to_vec();
-    all.sort_unstable();
-    all.dedup();
-    for (shard, group) in by_shard(all) {
-        let mut g = Guards::lock(shard);
-        for &block in &group {
-            g.protected.remove(block);
-            g.clean.remove(block);
-            PUBLISHED.clear(block);
+    let mut uncommitted_until = from;
+    let mut view_end = from;
+    // Blocks below it are a hole by the runtime's word ([`told_hole_end`]).
+    let mut told_until = from;
+    for block in from..to {
+        // What is committed and no view is someone's own memory: left as
+        // it is (a copy over it takes the block at every refresh).
+        let mut view = block < view_end;
+        if !view && let Some(end) = view_until(block) {
+            view_end = end.max(block + 1);
+            view = true;
         }
-        make_writable(&runs_of(&group));
-    }
-    #[cfg(feature = "diagnostics")]
-    {
-        tally(8, started.elapsed().as_nanos() as u64);
-        more(4, blocks.len() as u64);
-    }
-}
-
-/// Asks Windows for the runs of blocks writable again: one call for each run
-/// of blocks that follow one another inside one committed view. Called with
-/// the shard's lock held, as the protection of a block we guard is.
-fn make_writable(runs: &[(usize, usize)]) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    for &(from, to) in runs {
-        let mut block = from;
-        while block < to {
-            // As far as the view at `block` goes: a page of code or of
-            // someone's own memory among them is not ours to open, and keeps
-            // its protection.
-            let ahead = view_until(block).map_or(block + 1, |end| end.clamp(block + 1, to));
-            let mut old = 0;
-            // SAFETY: blocks we made read-only; only their protection changes.
-            unsafe {
-                if VirtualProtect((block * BLOCK) as *const _, (ahead - block) * BLOCK, PAGE_READWRITE, &mut old) != 0
-                    && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-                {
-                    // Not what we left there: the address is other memory's
-                    // (code's, say), which keeps its protection.
-                    VirtualProtect((block * BLOCK) as *const _, (ahead - block) * BLOCK, old, &mut old);
+        // (Not one question a block of a region that is not there.)
+        if view && block >= uncommitted_until && set(block, block + 1) {
+            note(g, block, block + 1);
+            continue;
+        }
+        PROTECTED.clear(block);
+        if block >= uncommitted_until {
+            uncommitted_until = uncommitted_end(block);
+            #[cfg(feature = "diagnostics")]
+            tally(9, 1);
+        }
+        if block < uncommitted_until {
+            g.absent.insert(block);
+            if known_holes() && (block < told_until || placeholder(block)) {
+                g.held.insert(block);
+                #[cfg(feature = "diagnostics")]
+                more(7, u64::from(block < told_until));
+            } else if known_holes() {
+                told_until = told_hole_end(block);
+                if block < told_until {
+                    g.held.insert(block);
+                    #[cfg(feature = "diagnostics")]
+                    more(7, 1);
                 }
             }
-            for b in block..ahead {
-                PROTECTED.clear(b);
-            }
-            block = ahead;
         }
     }
 }
 
-/// Gives write access back to the guarded blocks of `[at, end)` and notes
-/// them written; how many there were. The same physical pages at
+/// The end (exclusive) of the whole uncommitted blocks starting at `block`.
+fn uncommitted_end(block: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
+        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+    } else {
+        block
+    }
+}
+
+/// Gives write access back to the guarded blocks of `[start, end)` and
+/// notes them written; how many there were. The same physical pages at
 /// every other view of them are written by that too (the write that faulted,
 /// or is ours, `crate::host::copy_mapped`, goes through one view): they are
 /// clean no longer, whether they are opened as well ([`open_one_view`]) or
 /// not.
-fn open(at: usize, end: usize) -> usize {
-    open_fault(at, end, None, false).0
-}
-
-/// [`open`]; `fault`: the block a write of the title's faulted on. It is noted
-/// opened ([`Guards::opened`]) under the same lock as the open where the block
-/// and its page's other views are one shard's, as it was before the state was
-/// sharded: a block open and not yet noted does not rest, and is guarded again
-/// by the next asking — a change of protection each way for a write that
-/// faults again. Whether it was noted here.
-fn open_fault(at: usize, end: usize, fault: Option<usize>, kernel: bool) -> (usize, bool, Vec<(usize, usize, usize)>) {
-    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+fn open(g: &mut Guards, start: usize, end: usize) -> usize {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
-        return (0, false, Vec::new());
+        return 0;
     }
-    let mut here = 0;
-    let mut blocks: Vec<usize> = Vec::new();
-    let mut aliased: Vec<usize> = Vec::new();
-    for (shard, from, to) in segments(first, last) {
-        let mut g = Guards::lock(shard);
-        let mine: Vec<usize> = g.protected.range(from..to).collect();
-        here += mine.len();
-        for &block in &mine {
-            // (Noted before any other view is told, and cleared when this is
-            // done: nothing claims the pages covered meanwhile.)
-            g.opening.insert(block);
-        }
-        blocks.extend(mine);
-        let noted: Vec<usize> = g.aliased.range(from..to).collect();
-        for block in noted {
+    let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
+    let here = blocks.len();
+    let aliased: Vec<usize> = g.aliased.range(first..last).collect();
+    if !aliased.is_empty() {
+        let one = open_one_view();
+        for block in aliased {
             g.aliased.remove(block);
-            aliased.push(block);
-        }
-    }
-    let one = open_one_view();
-    let mut clear_clean: Vec<usize> = Vec::new();
-    let mut also: Vec<usize> = Vec::new();
-    for block in aliased {
-        for other in crate::inplace::pages_of(block * BLOCK) {
-            let other = other / BLOCK;
-            if one {
-                // (Before the first can be written: its bytes change.)
-                clear_clean.push(other);
-                continue;
-            }
-            also.push(other);
-        }
-    }
-    // (The other views of the pages: their `aliased` note goes, and a block
-    // read-only by our hand there is opened too.)
-    for (shard, group) in by_shard(also) {
-        let mut g = Guards::lock(shard);
-        for other in group {
-            g.aliased.remove(other);
-            if !(first..last).contains(&other) && g.protected.contains(other) {
-                blocks.push(other);
-            }
-        }
-    }
-    #[cfg(feature = "diagnostics")]
-    ALIASES[1].fetch_add((blocks.len() - here) as u64, std::sync::atomic::Ordering::Relaxed);
-    let mut all = blocks.clone();
-    all.extend(clear_clean.iter().copied());
-    all.sort_unstable();
-    all.dedup();
-    // One shard's, which is the whole of what a title's write touches: every
-    // view of a page lies in it but by the hash of two regions. Then the
-    // other views are told, and the block is made writable, under the one
-    // lock — as it was before the state was sharded: a copy told a block is
-    // clean must not find a view of its page writable.
-    let shards = by_shard(all).into_iter().map(|(shard, _)| shard).collect::<Vec<_>>();
-    if shards.len() <= 1 {
-        let shard = shards.first().copied().unwrap_or(shard_of(first * BLOCK));
-        let mut g = Guards::lock(shard);
-        for &other in &clear_clean {
-            g.clean.remove(other);
-            PUBLISHED.clear(other);
-        }
-        let mut theirs = blocks.clone();
-        theirs.sort_unstable();
-        theirs.dedup();
-        for &block in &theirs {
-            g.protected.remove(block);
-            g.clean.remove(block);
-            PUBLISHED.clear(block);
-        }
-        make_writable(&runs_of(&theirs));
-        for &block in &theirs {
-            g.opening.remove(block);
-        }
-        // (The runtime's own kernel write, under this same lock and after the
-        // write access is back: Windows takes a `PAGE_GUARD` off with
-        // `PAGE_READWRITE`, so a page still read-only by our hand would be
-        // left open and taken for clean — and one guarded again before the
-        // kernel is let in would make its write fail.)
-        let mut kernel_noted: Vec<(usize, usize, usize)> = Vec::new();
-        if kernel {
-            let parts: Vec<(usize, usize, usize)> = segments(first, last).collect();
-            if parts.iter().all(|&(part, _, _)| part == shard) {
-                for (part, from, to) in parts {
-                    let (from_at, to_at) = ((from * BLOCK).max(at), (to * BLOCK).min(end));
-                    crate::census::disarm(from_at, to_at - from_at);
-                    let absent: Vec<usize> = g.absent.range(from..to).collect();
-                    for block in absent {
-                        g.absent.remove(block);
-                        if g.held.remove(block) {
-                            PUBLISHED.clear(block);
-                        }
-                    }
-                    g.kernel.push((from, to));
-                    kernel_noted.push((part, from, to));
+            for other in crate::inplace::pages_of(block * BLOCK) {
+                let other = other / BLOCK;
+                if one {
+                    // Before the first can be written.
+                    g.clean.remove(other);
+                    PUBLISHED.clear(other);
+                    continue;
+                }
+                g.aliased.remove(other);
+                if !(first..last).contains(&other) && g.protected.contains(other) {
+                    blocks.push(other);
                 }
             }
         }
-        let noted = fault.is_some_and(|block| theirs.contains(&block));
-        if let Some(block) = fault.filter(|_| noted) {
-            g.opened(block);
-        }
-        return (here, noted, kernel_noted);
+        #[cfg(feature = "diagnostics")]
+        ALIASES[1].fetch_add((blocks.len() - here) as u64, std::sync::atomic::Ordering::Relaxed);
     }
-    // Views of one page in more than one shard: one lock at a time still, and
-    // the other views told first, so that nothing is claimed clean while
-    // another is open.
-    for (shard, group) in by_shard(clear_clean) {
-        let mut g = Guards::lock(shard);
-        for other in group {
-            g.clean.remove(other);
-            PUBLISHED.clear(other);
-        }
+    unguard(g, &blocks);
+    here
+}
+
+/// Gives write access back to `blocks`, guarded ones.
+fn unguard(g: &mut Guards, blocks: &[usize]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // All of them before the first can be written: a write through one is a
+    // write of the others' bytes.
+    for &block in blocks {
+        g.protected.remove(block);
+        g.clean.remove(block);
+        PUBLISHED.clear(block);
     }
-    unguard_blocks(&blocks);
-    for (shard, group) in by_shard(blocks) {
-        let mut g = Guards::lock(shard);
-        for block in group {
-            g.opening.remove(block);
+    for &block in blocks {
+        let mut old = 0;
+        // SAFETY: a block we made read-only.
+        unsafe {
+            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+            {
+                // Not what we left there: the address is other memory's
+                // (code's, say), which keeps its protection.
+                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+            }
         }
+        PROTECTED.clear(block);
     }
-    (here, false, Vec::new())
+    #[cfg(feature = "diagnostics")]
+    if !blocks.is_empty() {
+        tally(8, started.elapsed().as_nanos() as u64);
+        more(4, blocks.len() as u64);
+    }
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -3958,7 +3445,8 @@ pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
-        let opened = open(at, at.saturating_add(len));
+        let mut g = guards_timed();
+        let opened = open(&mut g, at, at.saturating_add(len));
         #[cfg(feature = "diagnostics")]
         {
             tally(6, opened as u64);
@@ -3972,7 +3460,7 @@ pub fn writing(at: usize, len: usize) {
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
 /// is dropped ([`kernel_writing`]).
-pub struct KernelWrite(Vec<(usize, usize, usize)>);
+pub struct KernelWrite(usize, usize);
 
 /// The runtime is about to have the kernel write title memory
 /// `[at, at + len)` (a file read): its guarded blocks are opened, as by
@@ -3982,32 +3470,24 @@ pub struct KernelWrite(Vec<(usize, usize, usize)>);
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    let end = at.saturating_add(len);
-    // ([`open_fault`] notes the range as the kernel's, and takes the census'
-    // guards off, under the one shard's lock where the range is one shard's —
-    // after its write access is back, before the kernel is let in.)
-    let (_, _, mut noted) = open_fault(at, end, None, len != 0);
-    if len != 0 && noted.is_empty() {
-        // (Parts of more than one shard's: one at a time, after the write
-        // access is back.)
-        for (shard, from, to) in segments(first, last) {
-            let mut g = Guards::lock(shard);
-            let (from_at, to_at) = ((from * BLOCK).max(at), (to * BLOCK).min(end));
-            crate::census::disarm(from_at, to_at - from_at);
+    {
+        let mut g = guards_timed();
+        open(&mut g, at, at.saturating_add(len));
+        crate::census::disarm(at, len);
+        if len != 0 {
             // Nothing known of them stands while they are left alone.
-            let absent: Vec<usize> = g.absent.range(from..to).collect();
+            let absent: Vec<usize> = g.absent.range(first..last).collect();
             for block in absent {
                 g.absent.remove(block);
                 if g.held.remove(block) {
                     PUBLISHED.clear(block);
                 }
             }
-            g.kernel.push((from, to));
-            noted.push((shard, from, to));
+            g.kernel.push((first, last));
         }
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(noted)
+    KernelWrite(first, if len == 0 { first } else { last })
 }
 
 /// For the census ([`crate::census::arm`]): runs `f` holding the guards
@@ -4015,16 +3495,9 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
 /// whether the block of an address is ours to leave alone (read-only by our
 /// hand, or about to be, or being written by the kernel for the title).
 pub(crate) fn census_arm(f: impl FnOnce(&dyn Fn(usize) -> bool)) {
-    // Every shard's lock, taken in ascending order and held while `f` runs:
-    // what `f` does, putting `PAGE_GUARD` on 4 KiB pages of title memory,
-    // must not run beside a change of a block's protection — in any shard, a
-    // page's address being its own. This is the only place that holds more
-    // than one, and everything else holds one at a time and never waits for a
-    // second while holding it, so the order cannot be got wrong.
-    let held: Vec<Held> = (0..shard_count()).map(Guards::lock).collect();
+    let g = guards();
     let busy = |at: usize| {
         let block = at / BLOCK;
-        let g = &*held[shard_of(block)];
         PROTECTED.any(block, block + 1)
             || g.protected.contains(block)
             || g.kernel.iter().any(|&(first, last)| (first..last).contains(&block))
@@ -4034,11 +3507,12 @@ pub(crate) fn census_arm(f: impl FnOnce(&dyn Fn(usize) -> bool)) {
 
 impl Drop for KernelWrite {
     fn drop(&mut self) {
-        for &(shard, from, to) in &self.0 {
-            let mut g = Guards::lock(shard);
-            if let Some(i) = g.kernel.iter().position(|&r| r == (from, to)) {
-                g.kernel.swap_remove(i);
-            }
+        if self.0 == self.1 {
+            return;
+        }
+        let mut g = guards();
+        if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
+            g.kernel.swap_remove(i);
         }
     }
 }
@@ -4105,16 +3579,15 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             return;
         }
     }
-    let mut guarded = 0;
-    for (shard, from, to) in segments(at / BLOCK, end.div_ceil(BLOCK)) {
-        let g = Guards::lock(shard);
-        guarded += g.protected.range(from..to).count() as u64;
-    }
-    if pages {
-        WRITTEN[2].fetch_add(guarded, Relaxed);
-    }
-    if mode & 1 != 0 && guarded != 0 {
-        open(at, end);
+    {
+        let mut g = guards();
+        let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
+        if pages {
+            WRITTEN[2].fetch_add(guarded, Relaxed);
+        }
+        if mode & 1 != 0 && guarded != 0 {
+            open(&mut g, at, end);
+        }
     }
     // A placed texture there changed with no descriptor written.
     crate::descriptor::host::page_written(at, len);
@@ -4139,18 +3612,12 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     // since that look, relying on those that are opened here. And all
     // together: none may be writable while another is clean (who asks about
     // that one by its bits takes no lock).
-    let mut blocks: Vec<usize> = Vec::new();
-    for &(at, n) in &ranges {
-        for (shard, from, to) in segments(at / BLOCK, (at + n).div_ceil(BLOCK)) {
-            let g = Guards::lock(shard);
-            blocks.extend(g.protected.range(from..to));
-        }
-    }
+    let mut g = guards();
+    let blocks: Vec<usize> =
+        ranges.iter().flat_map(|&(at, n)| g.protected.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect::<Vec<_>>()).collect();
     #[cfg(feature = "diagnostics")]
     ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    // All of them before the first may be written: one shard's lock at a
-    // time, and Windows asked with none held.
-    unguard_blocks(&blocks);
+    unguard(&mut g, &blocks);
 }
 
 /// The runtime is about to unmap a view of which it maps a part again at
@@ -4163,20 +3630,18 @@ pub fn title_memory_splitting(at: usize, len: usize) {
     if others.is_empty() {
         return;
     }
+    let mut g = guards();
     // (The view itself too: the part that stays is read-only until then. And
     // all of them told as written before the first is writable.)
-    for (shard, group) in by_shard(others.iter().map(|other| other / BLOCK).collect()) {
-        let mut g = Guards::lock(shard);
-        for block in group {
-            g.clean.remove(block);
-            PUBLISHED.clear(block);
-        }
+    for &other in &others {
+        g.clean.remove(other / BLOCK);
+        PUBLISHED.clear(other / BLOCK);
     }
-    open(at, at.saturating_add(len));
+    open(&mut g, at, at.saturating_add(len));
     for other in others {
-        open(other, other + BLOCK);
+        open(&mut g, other, other + BLOCK);
         if CHANGING.get().0 {
-            note_changing(shard_of(other / BLOCK), other / BLOCK, other / BLOCK + 1, false);
+            note_changing(&mut g, other / BLOCK, other / BLOCK + 1, false);
         }
     }
 }
@@ -4207,9 +3672,7 @@ impl Drop for Remapping {
         // [`remap_lean`] the count of changes says so by itself,
         // [`changing_now`], and the guards' lock is not waited for.)
         if CHANGING.replace((false, false)).1 && !remap_lean() {
-            for shard in 0..shard_count() {
-                Guards::lock(shard).changing.clear();
-            }
+            guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -4246,32 +3709,26 @@ thread_local! {
     static LEAN_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// [`CHANGES`] as it was when the blocks now in a shard's
-/// [`Guards::changing`] were put there (odd: during a change); written under
-/// that shard's lock. One for each shard: a change that notes blocks of one
-/// shard does not make another's stale ones count.
-static CHANGING_AT: [std::sync::atomic::AtomicU64; SHARDS] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; SHARDS];
+/// [`CHANGES`] as it was when the blocks now in [`Guards::changing`] were
+/// put there (odd: during a change); written under the guards' lock.
+static CHANGING_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Whether the change of mapping that put blocks in `shard`'s
-/// [`Guards::changing`] is still under way: only then are they left alone
+/// Whether the change of mapping that put blocks in [`Guards::changing`] is
+/// still under way: only then are they left alone
 /// ([`Guards::left_alone`]).
-fn changing_now(shard: usize) -> bool {
+fn changing_now() -> bool {
     use std::sync::atomic::Ordering::SeqCst;
-    CHANGING_AT[shard].load(SeqCst) == CHANGES.load(SeqCst)
+    CHANGING_AT.load(SeqCst) == CHANGES.load(SeqCst)
 }
 
 /// Notes blocks `[first, last)` as changing until this thread's change of
 /// mapping is done ([`Remapping`], which it holds); `grow`: as one range with
 /// the last noted where they follow it. What an earlier change left goes
 /// first.
-fn note_changing(shard: usize, first: usize, last: usize, grow: bool) {
+fn note_changing(g: &mut Guards, first: usize, last: usize, grow: bool) {
     use std::sync::atomic::Ordering::SeqCst;
     let now = CHANGES.load(SeqCst);
-    let mut g = Guards::lock(shard);
-    if CHANGING_AT[shard].swap(now, SeqCst) != now {
-        // (What an earlier change left here goes; another shard's goes when
-        // it is next noted, [`changing_now`].)
+    if CHANGING_AT.swap(now, SeqCst) != now {
         g.changing.clear();
     }
     CHANGING.set((true, true));
@@ -4383,7 +3840,7 @@ fn came_back(at: usize, write: bool) -> bool {
             return readable_view(at);
         }
         // (A refresh may have guarded the page that came back.)
-        open(at, at + 1) != 0 || writable(at)
+        open(&mut guards(), at, at + 1) != 0 || writable(at)
     };
     let before = changes();
     if there() || again_after_change(before, there) {
@@ -4478,8 +3935,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     views_changed(at, len);
     crate::texback::remapped(at, len);
-    title_memory_changed(at, len);
-    open(at, at.saturating_add(len));
+    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -4490,22 +3946,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 pub fn title_memory_unmapping(at: usize, len: usize) {
     views_changed(at, len);
     crate::texback::remapped(at, len);
-    title_memory_changed(at, len);
-    if len == 0 {
-        return;
+    let mut g = title_memory_changed(at, len);
+    if CHANGING.get().0 && len != 0 {
+        note_changing(&mut g, at / BLOCK, at.saturating_add(len).div_ceil(BLOCK), true);
     }
-    for (shard, from, to) in segments(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK)) {
-        if CHANGING.get().0 {
-            note_changing(shard, from, to, true);
-        }
-        let mut g = Guards::lock(shard);
-        let blocks: Vec<usize> = g.protected.range(from..to).collect();
-        for block in blocks {
-            g.protected.remove(block);
-            g.clean.remove(block);
-            PUBLISHED.clear(block);
-            PROTECTED.clear(block);
-        }
+    let blocks: Vec<usize> = g.protected.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
+    for block in blocks {
+        g.protected.remove(block);
+        g.clean.remove(block);
+        PUBLISHED.clear(block);
+        PROTECTED.clear(block);
     }
 }
 
@@ -4530,15 +3980,11 @@ pub fn title_memory_regrouping(at: usize, len: usize) -> bool {
         return true;
     }
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    for (shard, from, to) in segments(first, last) {
-        let g = Guards::lock(shard);
-        if g.kernel.iter().any(|&(a, b)| a < to && from < b) {
-            return false;
-        }
+    let mut g = guards();
+    if g.kernel.iter().any(|&(from, to)| from < last && first < to) {
+        return false;
     }
-    for (shard, from, to) in segments(first, last) {
-        note_changing(shard, from, to, true);
-    }
+    note_changing(&mut g, first, last, true);
     true
 }
 
@@ -4565,11 +4011,10 @@ pub fn title_memory_cut(at: usize, len: usize, section: usize, offset: u64, cut:
     );
     // (Whatever the kernel writes there now: the title unmaps the view.)
     if CHANGING.get().0 {
+        let mut g = guards();
         for (from, to) in [(at, cut), (cut_end, end)] {
             if from < to {
-                for (shard, first, last) in segments(from / BLOCK, to.div_ceil(BLOCK)) {
-                    note_changing(shard, first, last, false);
-                }
+                note_changing(&mut g, from / BLOCK, to.div_ceil(BLOCK), false);
             }
         }
     }
@@ -4594,60 +4039,64 @@ pub fn title_memory_cut(at: usize, len: usize, section: usize, offset: u64, cut:
 // is that of a few protection calls. Noting those blocks written instead
 // would close it at the price of every copy there being taken again.
 pub fn title_memory_regrouped(at: usize, len: usize, section: usize, offset: u64, fresh: usize, fresh_len: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     views_changed(at, len);
     let end = at.saturating_add(len);
     let (fresh, fresh_end) = (fresh.clamp(at, end), fresh.saturating_add(fresh_len).clamp(at, end));
-    // (The new part as [`title_memory_remapped`]; no shard's lock is held
-    // from one part to the other — the census' lock is taken under a
-    // shard's elsewhere too, [`open`], and the order is the same.)
+    // With [`remap_lean`] the guards are held from what is done for the new
+    // part to what is done for the rest, in the same order (the census'
+    // lock is taken under the guards' elsewhere too, [`open`]).
+    let mut held = None;
     if fresh_end > fresh {
         if remap_lean() {
             // As [`title_memory_remapped`].
             crate::texback::remapped(fresh, fresh_end - fresh);
-            title_memory_changed(fresh, fresh_end - fresh);
-            open(fresh, fresh_end);
+            let mut g = title_memory_changed(fresh, fresh_end - fresh);
+            open(&mut g, fresh, fresh_end);
+            held = Some(g);
         } else {
             title_memory_remapped(fresh, fresh_end - fresh);
         }
     }
     // The views the census has there are those of before; in one step.
     crate::inplace::views_regrouped(at, len, &[(at, len, section, offset)]);
-    for (from, to) in [(at, fresh), (fresh_end, end)] {
-        if from >= to {
-            continue;
-        }
-        // (Read-only again, under the shard's lock as any change of a
-        // block's protection here: they were read-write again only because
-        // the view was mapped anew, and the guards still hold them, clean.)
-        let mut refused: Vec<usize> = Vec::new();
-        for (shard, first, last) in segments(from / BLOCK, to.div_ceil(BLOCK)) {
-            let mut g = Guards::lock(shard);
-            // (Nothing there is a hole, whatever was noted in the moment it
-            // was one.)
-            let absent: Vec<usize> = g.absent.range(first..last).collect();
+    {
+        let mut g = held.unwrap_or_else(guards);
+        for (from, to) in [(at, fresh), (fresh_end, end)] {
+            if from >= to {
+                continue;
+            }
+            let range = from / BLOCK..to.div_ceil(BLOCK);
+            // (Nothing there is a hole, whatever was noted in the moment
+            // it was one.)
+            let absent: Vec<usize> = g.absent.range(range.clone()).collect();
             for block in absent {
                 g.absent.remove(block);
                 if g.held.remove(block) {
                     PUBLISHED.clear(block);
                 }
             }
-            let blocks: Vec<usize> = g.protected.range(first..last).collect();
+            let blocks: Vec<usize> = g.protected.range(range).collect();
             // One call for each run of blocks that follow one another.
-            for (first, last) in runs_of(&blocks) {
-                if !set_read_only(first, last) {
-                    refused.extend(first..last);
-                    for block in first..last {
-                        g.protected.remove(block);
-                        g.clean.remove(block);
-                    }
+            for run in blocks.chunk_by(|a, b| a + 1 == *b) {
+                let mut old = 0;
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                // SAFETY: blocks of the view just mapped; a failure leaves
+                // them read-write, which the guards are told.
+                let done = unsafe { VirtualProtect((run[0] * BLOCK) as *const _, run.len() * BLOCK, PAGE_READONLY, &mut old) } != 0;
+                #[cfg(feature = "diagnostics")]
+                {
+                    tally(5, run.len() as u64);
+                    tally(8, started.elapsed().as_nanos() as u64);
+                    more(3, 1);
+                }
+                if !done {
+                    // As a write would leave them: open, and their pages
+                    // not clean at any other view.
+                    open(&mut g, run[0] * BLOCK, (run[run.len() - 1] + 1) * BLOCK);
                 }
             }
-        }
-        if !refused.is_empty() {
-            // As a write would leave them: open, and their pages not clean at
-            // any other view.
-            refused.sort_unstable();
-            unguard_blocks(&refused);
         }
     }
     if fresh_end > fresh {
@@ -4672,11 +4121,9 @@ pub fn title_memory_freed(at: usize, len: usize) {
         }
         _ => arenas_cut(at, at.saturating_add(len)),
     }
+    let mut g = guards();
     let first = at / BLOCK;
-    let noted = {
-        let g = guards_at(first * BLOCK);
-        [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()]
-    };
+    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
     };
@@ -4688,23 +4135,20 @@ pub fn title_memory_freed(at: usize, len: usize) {
     if noted >= end {
         return;
     }
-    for (shard, from, to) in segments(first, end) {
-        let mut g = Guards::lock(shard);
-        let absent: Vec<usize> = g.absent.range(from..to).collect();
-        for block in absent {
-            g.absent.remove(block);
-            if g.held.remove(block) {
-                PUBLISHED.clear(block);
-            }
+    let absent: Vec<usize> = g.absent.range(first..end).collect();
+    for block in absent {
+        g.absent.remove(block);
+        if g.held.remove(block) {
+            PUBLISHED.clear(block);
         }
-        let foreign: Vec<usize> = g.foreign.range(from..to).copied().collect();
-        for block in foreign {
-            g.foreign.remove(&block);
-        }
+    }
+    let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
+    for block in foreign {
+        g.foreign.remove(&block);
     }
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
-    open(at, end * BLOCK);
+    open(&mut g, at, end * BLOCK);
 }
 
 /// The end of the allocation at `at`, if `inside` lies in it; else `at`.
@@ -4729,7 +4173,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) {
+fn title_memory_changed(at: usize, len: usize) -> Held {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -4737,25 +4181,25 @@ fn title_memory_changed(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    for (shard, from, to) in segments(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK)) {
-        let mut g = Guards::lock(shard);
-        let absent: Vec<usize> = g.absent.range(from..to).collect();
-        for block in absent {
-            g.absent.remove(block);
-            if g.held.remove(block) {
-                PUBLISHED.clear(block);
-            }
+    let mut g = guards();
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let absent: Vec<usize> = g.absent.range(range.clone()).collect();
+    for block in absent {
+        g.absent.remove(block);
+        if g.held.remove(block) {
+            PUBLISHED.clear(block);
         }
-        let foreign: Vec<usize> = g.foreign.range(from..to).copied().collect();
-        for block in foreign {
-            g.foreign.remove(&block);
-        }
-        let aliased: Vec<usize> = g.aliased.range(from..to).collect();
-        for block in aliased {
-            g.aliased.remove(block);
-        }
-        g.unheated(from, to);
     }
+    let foreign: Vec<usize> = g.foreign.range(range.clone()).copied().collect();
+    for block in foreign {
+        g.foreign.remove(&block);
+    }
+    let aliased: Vec<usize> = g.aliased.range(range.clone()).collect();
+    for block in aliased {
+        g.aliased.remove(block);
+    }
+    g.unheated(range.start, range.end);
+    g
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -4775,7 +4219,7 @@ pub(crate) fn install() {
         // ([`Held`]), to a block they hold: opened here and now, without
         // the lock (waiting for it would be waiting for ourselves), and
         // before anything below writes memory of our own.
-        let held = GUARDS_HELD.try_with(|h| h.get()).unwrap_or(None).is_some();
+        let held = GUARDS_HELD.try_with(|h| h.get()).unwrap_or(false);
         if held
             && r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && r.NumberParameters >= 2
@@ -4847,31 +4291,23 @@ pub(crate) fn install() {
             #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             // (Let go again before the next look: the runtime wants the
-            // guards to end a change. [`open`] holds a shard's lock only for
-            // its lookups, and asks Windows with none held.)
-            let (opened, noted, _) = open_fault(at, at + 1, Some(block), false);
+            // guards to end a change.)
+            let mut g = guards();
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
+            let opened = open(&mut g, at, at + 1);
             if opened != 0 {
-                if !noted {
-                    // (Its state is another shard's: noted there.)
-                    guards_at(at).opened(block);
-                }
+                g.opened(block);
                 // Every address of the page: the refreshes ask at another
                 // than the title writes at ([`views_hot`]).
                 if views_hot() {
-                    let others: Vec<usize> = crate::inplace::pages_of(block * BLOCK)
-                        .into_iter()
-                        .map(|other| other / BLOCK)
-                        .filter(|other| *other != block)
-                        .collect();
-                    for (shard, group) in by_shard(others) {
-                        let mut g = Guards::lock(shard);
-                        for other in group {
-                            g.heated(other);
+                    for other in crate::inplace::pages_of(block * BLOCK) {
+                        if other / BLOCK != block {
+                            g.heated(other / BLOCK);
                         }
                     }
                 }
+                drop(g);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -4943,117 +4379,6 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
-    }
-}
-
-#[cfg(test)]
-mod shard_tests {
-    use super::*;
-
-    /// A block of the region `region`, at its first block.
-    fn at(region: usize) -> usize {
-        region * SHARD_REGION_BLOCKS
-    }
-
-    /// The state of a region's blocks is one shard's, and that of the one
-    /// mutex is the only one.
-    #[test]
-    fn a_region_keeps_its_blocks_in_one_shard() {
-        for region in [0, 1, 27, 56, 64, 65, 1023, 4096] {
-            let shard = shard_for(region, SHARDS);
-            assert_eq!(shard, shard_for(region, SHARDS));
-            assert!(shard < SHARDS);
-            // Every block of it, the last one too.
-            for block in [at(region), at(region) + 1, at(region) + SHARD_REGION_BLOCKS - 1] {
-                assert_eq!(shard_for(block / SHARD_REGION_BLOCKS, SHARDS), shard);
-            }
-            // The next region's first block is another's (the hash of two
-            // regions in a row does not collide here, nor near here).
-            assert_eq!(shard_for(region, 1), 0);
-        }
-    }
-
-    /// The title's big heaps lie in a handful of regions: they must not all
-    /// come out in one shard, or nothing is gained.
-    #[test]
-    fn the_title_s_regions_are_spread() {
-        // The prologue's heaps: 0x6fae0000, 0xe22210000, 0x101f600000 and the
-        // 0x106f… ones.
-        let regions = [27, 56, 64, 65, 66, 67];
-        let mut shards: Vec<usize> = regions.iter().map(|&region| shard_for(region, SHARDS)).collect();
-        let before = shards.len();
-        shards.sort_unstable();
-        shards.dedup();
-        assert!(shards.len() >= 3, "regions {regions:?} share {} shards", shards.len());
-        assert_eq!(before, regions.len());
-        // Nothing of the spread is one shard's by accident: 256 regions in a
-        // row fill every shard.
-        let mut per = [0usize; SHARDS];
-        for region in 0..256 {
-            per[shard_for(region, SHARDS)] += 1;
-        }
-        assert!(per.iter().all(|&n| (30..=34).contains(&n)), "{per:?}");
-    }
-
-    /// The parts of a range: in address order, no gap and no overlap, each
-    /// in one region, and each known by the shard of that region.
-    #[test]
-    fn a_range_is_cut_into_its_regions_in_address_order() {
-        let (first, last) = (at(64) + 3, at(67) + 5);
-        let parts: Vec<(usize, usize, usize)> = segments_with(first, last, SHARDS).collect();
-        assert_eq!(parts.first().map(|p| p.1), Some(first));
-        assert_eq!(parts.last().map(|p| p.2), Some(last));
-        let mut block = first;
-        for &(shard, from, to) in &parts {
-            assert_eq!(from, block, "a gap or an overlap at {block}");
-            assert!(from < to);
-            assert_eq!(from / SHARD_REGION_BLOCKS, (to - 1) / SHARD_REGION_BLOCKS, "one region a part");
-            assert_eq!(shard, shard_for(from / SHARD_REGION_BLOCKS, SHARDS));
-            block = to;
-        }
-        assert_eq!(parts.len(), 4, "one part a region: {parts:?}");
-        // One shard, the mutex of before: one part for the whole range.
-        let one: Vec<(usize, usize, usize)> = segments_with(first, last, 1).collect();
-        assert_eq!(one, [(0, first, last)]);
-        // Nothing of a range of no blocks.
-        assert_eq!(segments_with(first, first, SHARDS).count(), 0);
-    }
-
-    /// Blocks that follow one another are one ask of Windows.
-    #[test]
-    fn runs_join_blocks_that_follow() {
-        assert_eq!(runs_of(&[]), Vec::new());
-        assert_eq!(runs_of(&[7]), [(7, 8)]);
-        assert_eq!(runs_of(&[5, 6, 7, 9, 10, 12]), [(5, 8), (9, 11), (12, 13)]);
-        // A whole view's blocks (the 174 MB heap is 2,784 of them): one run,
-        // where there was a call for each.
-        let heap: Vec<usize> = (1000..1000 + 2784).collect();
-        assert_eq!(runs_of(&heap), [(1000, 1000 + 2784)]);
-    }
-
-    /// Blocks are looked at under the lock of the shard they are in, in
-    /// shard order, one group for each.
-    #[test]
-    fn blocks_are_grouped_by_their_shard() {
-        let blocks: Vec<usize> = (0..64).map(|region| at(region) + 2).collect();
-        let groups = by_shard(blocks.clone());
-        let mut seen: Vec<usize> = Vec::new();
-        let mut last = 0;
-        for (shard, group) in &groups {
-            assert!(*shard < shard_count());
-            if !seen.is_empty() {
-                assert!(*shard > last, "shard order");
-            }
-            last = *shard;
-            assert!(group.iter().all(|&block| shard_for(block / SHARD_REGION_BLOCKS, shard_count()) == *shard));
-            seen.extend(group);
-        }
-        seen.sort_unstable();
-        assert_eq!(seen, blocks, "every block once");
-        assert_eq!(by_shard(Vec::new()).len(), 0);
-        // One that is there twice is looked at once.
-        let twice = by_shard(vec![at(3), at(3), at(4)]);
-        assert_eq!(twice.iter().map(|(_, g)| g.len()).sum::<usize>(), 2);
     }
 }
 
@@ -5388,7 +4713,7 @@ mod tests {
             assert!(written.contains(&(p / PAGE + 1, now)));
             assert!(written.iter().all(|w| w.0 == p / PAGE + 1 || w.1 < now));
         }
-        assert!(!guards_at(p + BLOCK).held.contains(p / BLOCK + 1));
+        assert!(!guards().held.contains(p / BLOCK + 1));
         drop(writing);
         ask();
         assert!((0..3).all(known) == holes);
@@ -5396,12 +4721,12 @@ mod tests {
             let _changing = title_memory_remapping();
             title_memory_unmapping(p, BLOCK);
             ask();
-            assert!(!known(0) && !guards_at(p).held.contains(p / BLOCK));
+            assert!(!known(0) && !guards().held.contains(p / BLOCK));
         }
         ask();
         assert!((0..3).all(known) == holes);
         title_memory_freed(p, BLOCK);
-        assert!(!known(0) && !guards_at(p).held.contains(p / BLOCK));
+        assert!(!known(0) && !guards().held.contains(p / BLOCK));
         title_memory_unmapping(p, 3 * BLOCK);
         // SAFETY: our placeholders.
         unsafe {
@@ -5430,14 +4755,14 @@ mod tests {
         title_memory_unmapping(at, BLOCK);
         assert!(writes(at, at + BLOCK, true).is_some());
         {
-            let g = guards_at(at);
+            let g = guards();
             assert!(!g.protected.contains(at / BLOCK) && !g.clean.contains(at / BLOCK));
         }
         assert!(!published(at, at + BLOCK));
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(view) };
         drop(changing);
-        assert!(!guards_at(at).left_alone(at / BLOCK));
+        assert!(!guards().left_alone(at / BLOCK));
     }
 
     /// What a change of mapping began to unmap is left alone until the
@@ -5452,18 +4777,18 @@ mod tests {
             {
                 let _changing = title_memory_remapping();
                 title_memory_unmapping(p, BLOCK);
-                assert!(guards_at(p).left_alone(p / BLOCK));
-                assert!(!guards_at(p + BLOCK).left_alone(p / BLOCK + 1));
+                assert!(guards().left_alone(p / BLOCK));
+                assert!(!guards().left_alone(p / BLOCK + 1));
             }
-            assert!(!guards_at(p).left_alone(p / BLOCK));
+            assert!(!guards().left_alone(p / BLOCK));
             {
                 let _changing = title_memory_remapping();
-                assert!(!guards_at(p).left_alone(p / BLOCK));
+                assert!(!guards().left_alone(p / BLOCK));
                 assert!(title_memory_regrouping(p + BLOCK, BLOCK));
-                let g = guards_at(p + BLOCK);
+                let g = guards();
                 assert!(g.left_alone(p / BLOCK + 1) && !g.left_alone(p / BLOCK));
             }
-            assert!(!guards_at(p + BLOCK).left_alone(p / BLOCK + 1));
+            assert!(!guards().left_alone(p / BLOCK + 1));
         }
         LEAN_IN_TEST.set(None);
         // SAFETY: our placeholders.
@@ -5523,10 +4848,8 @@ mod tests {
             let written = guard(p, p + 3 * BLOCK).expect("as a view");
             assert!(holes.iter().all(|page| written.contains(page)), "copied every time");
             as_made();
-            assert!(holes.iter().all(|&block| {
-                let g = guards_at(block * BLOCK);
-                !g.held.contains(block) && !g.absent.contains(block)
-            }));
+            let g = guards();
+            assert!(holes.iter().all(|&block| !g.held.contains(block) && !g.absent.contains(block)));
         }
         writing(p, BLOCK);
         as_made();
@@ -5544,9 +4867,9 @@ mod tests {
     #[test]
     fn freed_memory_leaves_no_notes() {
         let p = placeholder(3);
-        let noted = |at: usize| {
-            let block = p / BLOCK + at;
-            let g = guards_at(block * BLOCK);
+        let noted = |block: usize| {
+            let g = guards();
+            let block = p / BLOCK + block;
             g.protected.contains(block) || g.clean.contains(block) || g.absent.contains(block)
         };
         assert!(guard(p, p + 3 * BLOCK).is_some());
